@@ -44,7 +44,7 @@ int main(int argc, char **argv) {
     assert(c.width == 0 && c.height == 0 && c.render_w == 0 && c.render_h == 0);
     assert(fabsf(c.fov - 1.1f) < 0.001f);
     assert(g_config.width == 900 && fabsf(g_config.fov - 1.6f) < 0.001f);
-    assert(c.hp.quests == 2 && c.language == 0 && c.button_icons == 0);
+    assert(c.hp.quests == 2 && c.language == 2 && c.button_icons == 0);
     assert(!config_restart_required(&c)); // Raw Auto/Desktop survives environment resolution.
     assert(fabsf(config_live_fov()-1.6f)<0.001f && fabsf(config_live_fps()-144.5f)<0.001f);
     Config volume_only=c; volume_only.volume=35;
@@ -112,7 +112,7 @@ int main(int argc, char **argv) {
     bad.menu_scale=201;assert(!config_save(&bad,error,sizeof error));
     bad = c; bad.button_icons = 3;
     assert(!config_save(&bad, error, sizeof error));
-    bad = c; bad.language = 2;
+    bad = c; bad.language = 3;
     assert(!config_save(&bad, error, sizeof error));
     bad = c; bad.fov = NAN;
     assert(!config_save(&bad, error, sizeof error));
@@ -160,6 +160,10 @@ int main(int argc, char **argv) {
     assert(config_save(&loaded, error, sizeof error) && config_language() == 0);
     g_config = initial; config_load();
     assert(config_editable().language == 0 && config_language() == 0 && config_editable().button_icons == 1);
+    loaded.language = 2;
+    assert(config_save(&loaded,error,sizeof error) && config_language()==2);
+    text=read_file(path); assert(strstr(text,"Language = Chinese")); free(text);
+    loaded.language = 0; assert(config_save(&loaded,error,sizeof error));
     bool waiting=true;
     assert(menu_release_buttons(0x41,0xf,&waiting)==0x40 && waiting);
     assert(menu_release_buttons(0x42,0xf,&waiting)==0x40 && waiting);

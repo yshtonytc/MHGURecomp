@@ -1377,7 +1377,7 @@ std::vector<Row> main_rows() {
         break;
     case APP_PAGE:
         header(r, "look.header", tr("Appearance"));
-        add_choice(r, "language", "Language", c.language, {"English", "Español"},
+        add_choice(r, "language", "Language", c.language, {"English", "Español", "简体中文"},
                    [](int v) { c.language = v; }, ini("Language"));
         add_choice(r, "theme", "Menu theme", c.menu_theme, {tr("Gold"), tr("Blue"), tr("Hunter")},
                    [](int v) { c.menu_theme = v; }, ini("Theme"));

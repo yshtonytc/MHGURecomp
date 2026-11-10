@@ -1,0 +1,67 @@
+name: MHGU Chinese Windows
+on:
+  push:
+    branches: [chinese-ui]
+  workflow_dispatch:
+    inputs:
+      publish:
+        type: boolean
+        description: Publish after a successful build
+        default: false
+permissions:
+  contents: write
+concurrency:
+  group: mhgu-chinese-windows
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Python build dependencies
+        run: python -m pip install fonttools
+      - name: Verify translation catalog and download official programs
+        run: |
+          python custom/generate_catalog.py --check
+          python -m unittest discover -s tests -p test_settings_locale.py
+          python custom/stage_release.py fetch
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make git diffutils python
+            mingw-w64-ucrt-x86_64-clang mingw-w64-ucrt-x86_64-lld
+            mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-sdl3
+            mingw-w64-ucrt-x86_64-shaderc mingw-w64-ucrt-x86_64-nasm
+            mingw-w64-ucrt-x86_64-vulkan-headers mingw-w64-ucrt-x86_64-vulkan-loader
+            mingw-w64-ucrt-x86_64-vulkan-memory-allocator
+            mingw-w64-ucrt-x86_64-zstd
+      - name: Compile host runtime and updater, without game code or game data
+        shell: msys2 {0}
+        run: |
+          VERSION=$(python3 -c 'import json; print(json.load(open("custom/upstream.json"))["tag"])')
+          make -j4 build/mhgurecomp.exe build/mhgurecomp-updater.exe VERSION="$VERSION"
+          make test-settings VERSION="$VERSION"
+          make bundle VERSION="$VERSION"
+      - name: Package Chinese runtime with matching official program library
+        run: python custom/stage_release.py package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MHGU-Chinese-Windows
+          path: dist/*
+      - name: Publish tested custom build
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $version = (Get-Content custom/upstream.json | ConvertFrom-Json).tag
+          $commit = git rev-parse HEAD
+          gh release create $version dist/* --target $commit --title "MHGU Recomp $version 简体中文" --notes-file custom/RELEASE-NOTES.md --latest

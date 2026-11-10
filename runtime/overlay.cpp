@@ -17,11 +17,13 @@
 #include <cfloat>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <vector>
 
 #include "imgui.h"
+#include <SDL3/SDL.h>
 #include "imgui_internal.h"  // (the Forge window's Cancel: ImGui's active item, popups and nav window)
 #ifndef MHGU_NULL_BACKEND
 #include "backends/imgui_impl_vulkan.h"
@@ -403,6 +405,36 @@ static void forge_style(ImGuiStyle &style) {  // Forge's own (source/forge/graph
 
 // The context, ImGui's own font and Forge's style at 12 px: from the start (overlay_init_early), Forge's settings
 // once its config is read (overlay_init). (Under g_frame_lock: the loading screen may be drawing.)
+static void merge_chinese_font(ImFontAtlas *atlas, float size) {
+    // Load installed fonts at runtime; never bundle a Microsoft font. The OFL
+    // Noto fallback also makes the language selector readable on non-CJK PCs.
+    ImFont *base = atlas->Fonts.Size ? atlas->Fonts.back() : nullptr;
+    static ImFont *merged_into = nullptr;
+    if (!base || base == merged_into) return;
+    std::vector<std::string> candidates;
+#ifdef _WIN32
+    if (const char *windows = std::getenv("WINDIR")) {
+        candidates.push_back(std::string(windows)+"/Fonts/msyh.ttc");
+        candidates.push_back(std::string(windows)+"/Fonts/msjh.ttc");
+    }
+#endif
+    if (const char *folder = SDL_GetBasePath())
+        candidates.push_back(std::string(folder)+"localization/fonts/NotoSansSC-Regular.ttf");
+    for (const auto &path : candidates) {
+        FILE *test = std::fopen(path.c_str(),"rb");
+        if (!test) continue;
+        std::fclose(test);
+        ImFontConfig chinese;
+        chinese.MergeMode = true;
+        chinese.FontNo = 0;
+        if (atlas->AddFontFromFileTTF(path.c_str(),size,&chinese)) {
+            merged_into = base;
+            LOG("[locale] Chinese glyph font ready: %s\n",path.c_str());
+            break;
+        }
+    }
+}
+
 static void context_init(const char *font_path, float font_size) {
     if (!ImGui::GetCurrentContext()) {
         IMGUI_CHECKVERSION();
@@ -420,6 +452,7 @@ static void context_init(const char *font_path, float font_size) {
     ImFont *font = font_path ? io.Fonts->AddFontFromFileTTF(font_path, g_font_size, &cfg) : nullptr;
     if (font) io.FontDefault = font;
     else if (io.Fonts->Fonts.Size == 0) io.Fonts->AddFontDefaultVector(&cfg);
+    merge_chinese_font(io.Fonts,g_font_size);
     ImGuiStyle style;
     ImGui::StyleColorsDark(&style);
     forge_style(style);

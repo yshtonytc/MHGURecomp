@@ -1,0 +1,7 @@
+MHGU Recomp 简体中文定制版。F1／手柄设置菜单新增 Chinese（简体中文），保留英语、西班牙语；中文菜单、帮助、按键和错误提示来自源码翻译目录。优先使用本机中文字体，附带 SIL OFL 许可的 Noto Sans SC 回退字体，不分发微软字体。
+
+主程序及更新器由源码构建，程序库从匹配版本的官方 Release 校验 SHA-256 后取得，并校验与主程序一致的 GAMELIB_ID。完整构建信息、源码提交及文件 SHA-256 见 CUSTOM-BUILD.json。
+
+不包含用户的游戏 exefs／romfs、存档、模组、缓存或账号配置。安装前完全退出游戏；保留自己的 data、mods、engine_modules、cheats、bonus、cache、mhgurecomp.ini 和存档。已有旧汉化把 Spanish 当中文的配置，需把 Application/Language 改为 Chinese。
+
+源项目：https://github.com/morerokk/MHGURecomp 。本分支仅维护移植版界面，游戏内文本由用户自己的游戏数据决定。
