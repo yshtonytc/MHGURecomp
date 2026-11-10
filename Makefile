@@ -339,11 +339,11 @@ $(O)/rt/%.o: runtime/%.c $(RT_HDRS)
 $(O)/rt/forge_imgui.o: runtime/forge_imgui_thunks.inc $(IMGUI)/cimgui.h
 $(O)/rt/forge_imgui.o: RTFLAGS += -DCIMGUI_NO_EXPORT -Wno-unused-variable
 
-$(O)/rt/overlay.o: runtime/overlay.cpp runtime/overlay.h runtime/forge.h
+$(O)/rt/overlay.o: runtime/overlay.cpp runtime/overlay.h runtime/forge.h runtime/settings_zh.h
 	@mkdir -p $(dir $@)
 	$(CXX) $(IMGUIFLAGS) $(if $(filter 1,$(NULL_GPU)),-DMHGU_NULL_BACKEND) -Wall -Iruntime -c $< -o $@
 
-$(O)/rt/settings_panel.o: runtime/settings_panel.cpp runtime/settings_panel.h runtime/modorder.h runtime/config.h runtime/settings_locale.h runtime/settings_icons.h runtime/app_actions.h runtime/overlay.h runtime/net/net.h
+$(O)/rt/settings_panel.o: runtime/settings_panel.cpp runtime/settings_panel.h runtime/modorder.h runtime/config.h runtime/settings_locale.h runtime/settings_zh.h runtime/settings_icons.h runtime/app_actions.h runtime/overlay.h runtime/net/net.h
 	@mkdir -p $(dir $@)
 	$(CXX) $(IMGUIFLAGS) -Wall -Iruntime -c $< -o $@
 

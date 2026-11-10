@@ -5,5 +5,6 @@
   "asset": "Windows-MHGURecomp.0.16.0.zip",
   "sha256": "sha256:6f7c567b41a4b57c02fafbe4c813f0ee9a90e069c55f9a3c1c85d0d1f7b33c82",
   "custom_repository": "yshtonytc/MHGURecomp",
-  "branch": "chinese-ui"
+  "branch": "chinese-ui",
+  "custom_version": "0.16.0.1"
 }

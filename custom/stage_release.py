@@ -71,7 +71,7 @@ def package():
         'files':{p.relative_to(base).as_posix():sha(p) for p in base.rglob('*') if p.is_file() and p.name!='CUSTOM-BUILD.json'}},indent=2),encoding='utf-8')
     out=ROOT/'dist';out.mkdir(exist_ok=True)
     subprocess.run(['git','archive','--format=zip','--output',str(out/'MHGU-Chinese-Source.zip'),'HEAD'],cwd=ROOT,check=True)
-    archive=out/('Windows-MHGURecomp.'+config['tag']+'.zip')
+    archive=out/('Windows-MHGURecomp.'+config['custom_version']+'.zip')
     with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED) as z:
         for p in base.rglob('*'):
             if p.is_file():z.write(p,'MHGURecomp/'+p.relative_to(base).as_posix())
