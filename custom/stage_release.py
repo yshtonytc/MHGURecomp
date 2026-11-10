@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -21,7 +22,9 @@ def download(url,path,digest):
 
 def fetch():
     config=json.loads((ROOT/'custom/upstream.json').read_text())
-    with urllib.request.urlopen(urllib.request.Request('https://api.github.com/repos/'+config['repository']+'/releases/tags/'+config['tag'],headers={'User-Agent':'MHGU-Chinese'}),timeout=30) as r:release=json.load(r)
+    headers={'User-Agent':'MHGU-Chinese'}
+    if os.environ.get('GH_TOKEN'):headers['Authorization']='Bearer '+os.environ['GH_TOKEN']
+    with urllib.request.urlopen(urllib.request.Request('https://api.github.com/repos/'+config['repository']+'/releases/tags/'+config['tag'],headers=headers),timeout=30) as r:release=json.load(r)
     asset=next(a for a in release['assets'] if a['name']==config['asset'])
     if asset.get('digest')!=config['sha256']:raise ValueError('Upstream release asset changed')
     archive=ROOT/'out/cache'/config['asset'];download(asset['browser_download_url'],archive,config['sha256'].split(':')[1])
