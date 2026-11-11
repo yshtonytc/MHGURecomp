@@ -154,7 +154,7 @@ static inline const char *settings_chinese(const char *english) {
         {"Exit game?", "退出游戏？"},
         {"Exit the game? Unsaved progress will be lost. Save in MHGU before closing.", "退出游戏？未保存的游戏进度将丢失。退出前请在游戏内保存。"},
         {"Exit without saving", "不保存退出"},
-        {"Experimental. Your melee hits count as you saw them land, even if your hunter missed on the screen of the player running the monster. Works when that player has it on too, and has no effect otherwise. Bows and bowguns are not affected.", "实验性功能。按你屏幕上看到的命中判定近战攻击，即使在负责怪物同步的玩家屏幕上没有命中。需要对方也开启，否则无效。不影响弓和弩。"},
+        {"Experimental. Your hits on large monsters (melee, bows and bowguns) count as you saw them land, even if your hunter missed on the screen of the player running the monster. Works when that player has it on too, and has no effect otherwise. Emulator players in a crossplay hub need the Lag Compensation Forge plugin for it.", "实验性功能。按你屏幕上看到的命中判定对大型怪物的攻击（近战、弓和弩），即使在负责怪物同步的玩家屏幕上没有命中。需要对方也开启，否则无效。跨平台集会所里的模拟器玩家需安装 Lag Compensation Forge 插件。"},
         {"Export save", "导出存档"},
         {"Exposure", "曝光"},
         {"FOV multiplier", "视野倍率"},

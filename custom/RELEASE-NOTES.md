@@ -5,3 +5,5 @@ MHGU Recomp 简体中文定制版。F1／手柄设置菜单新增 Chinese（简�
 不包含用户的游戏 exefs／romfs、存档、模组、缓存或账号配置。安装前完全退出游戏；保留自己的 data、mods、engine_modules、cheats、bonus、cache、mhgurecomp.ini 和存档。已有旧汉化把 Spanish 当中文的配置，需把 Application/Language 改为 Chinese。
 
 源项目：https://github.com/morerokk/MHGURecomp 。本分支仅维护移植版界面，游戏内文本由用户自己的游戏数据决定。
+
+本次合并上游 0.16.1：模拟器跨平台联机支持延迟补偿；修复扩展装备镶嵌孔模组引发的装备查看、卸载后崩溃；修复游戏运行时启动更新器的异常；标题界面可按 B 退出。延迟补偿的新帮助已翻译，原有中文选项和字体保留。

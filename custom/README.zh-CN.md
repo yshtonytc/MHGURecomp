@@ -19,6 +19,8 @@ python custom/sync_upstream.py --tag latest --push
 
 构建不需要也不上传游戏 dump：只编译开源主程序、更新器，
 其余公开程序库从对应官方 Release 验证 SHA-256 后取得，并核对 GAMELIB_ID。
+上游标识包含源码换行字节；`align_gamelib.py` 只接受相同 ABI 源码和编译参数的
+LF／CRLF 两种哈希中，同时出现在官方主程序及程序库的那一个。不会取消运行时匹配检查。
 公开包不含个人 exefs／romfs、存档、模组、缓存和配置。
 
 中文字体优先加载系统字体；无系统中文字体时使用随包的 Noto Sans SC，

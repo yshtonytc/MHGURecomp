@@ -70,7 +70,9 @@ def package():
     shutil.copy2(ROOT/'out/cache/OFL.txt',base/'licenses/NotoSansSC-OFL.txt')
     commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
     (base/'CUSTOM-BUILD.json').write_text(json.dumps({'repository':config['custom_repository'],'commit':commit,
-        'upstream':config,'font':font,'gamelib_id':identity,'game_library_sha256':sha(base/'mhgugame.dll'),
+        'upstream':config,'font':font,'gamelib_id':identity,
+        'gamelib_identity_validation':json.loads((ROOT/'out/gamelib-compatible.json').read_text()),
+        'game_library_sha256':sha(base/'mhgugame.dll'),
         'files':{p.relative_to(base).as_posix():sha(p) for p in base.rglob('*') if p.is_file() and p.name!='CUSTOM-BUILD.json'}},indent=2),encoding='utf-8')
     out=ROOT/'dist';out.mkdir(exist_ok=True)
     subprocess.run(['git','archive','--format=zip','--output',str(out/'MHGU-Chinese-Source.zip'),'HEAD'],cwd=ROOT,check=True)

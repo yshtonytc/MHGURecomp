@@ -8,12 +8,30 @@ ROOT=Path(__file__).resolve().parents[1]
 LITERAL=r'"(?:\\.|[^"\\])*"'
 FORMAT=re.compile(r'%(?!APPDATA%)(?:[-+ #0]*\d*(?:\.\d+)?(?:ll|l|z)?[sdiuoxXfFgGcpaAeE])')
 
+def help_keys():
+    # Mirror config_help's wrapping: the previous line includes the single
+    # comment-space. Validate the final paragraphs actually looked up by F1.
+    source=(ROOT/'runtime/config.c').read_text(encoding='utf-8')
+    initializer=source.split('static const char DEFAULT_INI[] =',1)[1].split(';\n',1)[0]
+    ini=''.join(ast.literal_eval(value) for value in re.findall(LITERAL,initializer))
+    result=[];previous=''
+    for raw in ini.splitlines():
+        if not raw.startswith('; '):previous='';continue
+        line=raw[2:]
+        if not line or line.startswith('Default:'):continue
+        listing=',' in line and all(c!=' ' or (i>0 and line[i-1]==',') for i,c in enumerate(line))
+        join=len(previous)>=80 and previous[-1] not in '.!?:)' and not line.startswith('Between ') and not listing
+        if join:result[-1]+=' '+line
+        else:result.append(line)
+        previous=raw[1:]
+    return result
+
 def generate(check=False):
     translations=json.loads((ROOT/'custom/zh-CN.json').read_text(encoding='utf-8'))
     text=(ROOT/'runtime/settings_locale.h').read_text(encoding='utf-8')
     keys=[ast.literal_eval(re.findall(LITERAL,row)[0]) for row in
           re.findall(r'\{\s*'+LITERAL+r'\s*,\s*'+LITERAL+r'\s*\}',text)]
-    missing=set(keys)-translations.keys()
+    missing=(set(keys)|set(help_keys()))-translations.keys()
     if missing:raise ValueError('Missing Chinese labels: '+repr(sorted(missing)))
     for en,zh in translations.items():
         if not zh or '\ufffd' in zh or '\0' in zh:raise ValueError('Invalid Chinese text: '+en)

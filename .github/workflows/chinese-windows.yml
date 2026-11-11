@@ -32,6 +32,7 @@ jobs:
         run: |
           python custom/generate_catalog.py --check
           python -m unittest discover -s tests -p test_settings_locale.py
+          python -m unittest discover -s tests -p test_custom_gamelib_identity.py
           python custom/stage_release.py fetch
       - uses: msys2/setup-msys2@v2
         with:
@@ -49,9 +50,11 @@ jobs:
         shell: msys2 {0}
         run: |
           VERSION=$(python3 -c 'import json; print(json.load(open("custom/upstream.json"))["custom_version"])')
-          make -j4 build/mhgurecomp.exe build/mhgurecomp-updater.exe VERSION="$VERSION"
-          make test-settings VERSION="$VERSION"
-          make bundle VERSION="$VERSION"
+          python3 custom/align_gamelib.py
+          LIBRARY_ID=$(cat out/gamelib-compatible.id)
+          make -j4 build/mhgurecomp.exe build/mhgurecomp-updater.exe VERSION="$VERSION" GAMELIB_ID="$LIBRARY_ID"
+          make test-settings VERSION="$VERSION" GAMELIB_ID="$LIBRARY_ID"
+          make bundle VERSION="$VERSION" GAMELIB_ID="$LIBRARY_ID"
       - name: Package Chinese runtime with matching official program library
         run: python custom/stage_release.py package
       - uses: actions/upload-artifact@v4
