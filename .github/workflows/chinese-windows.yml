@@ -1,9 +1,19 @@
 name: MHGU Chinese Windows
 on:
+  schedule:
+    - cron: "17 */6 * * *"
   push:
     branches: [chinese-ui]
   workflow_dispatch:
     inputs:
+      check_only:
+        description: "Check stable upstream without building or publishing"
+        type: boolean
+        default: false
+      upstream_tag:
+        description: "Optional exact upstream tag; blank builds pinned source"
+        type: string
+        default: ""
       publish:
         type: boolean
         description: Publish after a successful build
@@ -14,7 +24,23 @@ concurrency:
   group: mhgu-chinese-windows
   cancel-in-progress: false
 jobs:
+  plan:
+    if: github.event_name == 'schedule' || inputs.check_only
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+      sync_tag: ${{ steps.plan.outputs.sync_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check latest stable package
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 custom/auto_update.py
   build:
+    needs: plan
+    if: always() && !inputs.check_only && (github.event_name != 'schedule' || needs.plan.outputs.build == 'true')
     runs-on: windows-latest
     timeout-minutes: 55
     steps:
@@ -24,12 +50,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Merge selected upstream without publishing untested source
+        if: (github.event_name == 'schedule' && needs.plan.outputs.sync_tag != '') || (github.event_name == 'workflow_dispatch' && inputs.upstream_tag != '')
+        env:
+          UPSTREAM_TAG: ${{ github.event_name == 'schedule' && needs.plan.outputs.sync_tag || inputs.upstream_tag }}
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          python custom/sync_upstream.py --tag "$env:UPSTREAM_TAG"
       - name: Python build dependencies
         run: python -m pip install fonttools
       - name: Verify translation catalog and download official programs
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          python -m unittest discover -s tests -p test_custom_auto_update.py
           python custom/generate_catalog.py --check
           python -m unittest discover -s tests -p test_settings_locale.py
           python -m unittest discover -s tests -p test_custom_gamelib_identity.py
@@ -61,8 +96,14 @@ jobs:
         with:
           name: MHGU-Chinese-Windows
           path: dist/*
+      - name: Push tested maintenance source
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish)
+        run: |
+          $metadata = Get-Content custom/upstream.json | ConvertFrom-Json
+          git push "https://github.com/$($metadata.custom_repository).git" "HEAD:refs/heads/chinese-ui" "$($metadata.commit):refs/heads/upstream"
+          if ($LASTEXITCODE -ne 0) { throw 'Maintenance source push failed; refusing release' }
       - name: Publish tested custom build
-        if: github.event_name == 'workflow_dispatch' && inputs.publish
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish)
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
