@@ -11,7 +11,13 @@ python custom/sync_upstream.py --tag latest --push
 
 有冲突时先人工解决并提交；新增标签必须补充 `custom/zh-CN.json`，
 再运行 `python custom/generate_catalog.py` 生成 `runtime/settings_zh.h`。
-推送后 Actions 构建检查；手动运行 **MHGU Chinese Windows** 并勾选 publish，验证成功才发布。
+**MHGU Chinese Windows** 每 6 小时自动检查正式版，有新版或缺少成品才合并、验证并发布。
+缺翻译、冲突或构建失败就停止，不推送半成品；无更新时跳过 Windows 构建。
+手动 `check_only` 只检查，人工修复后可勾选 `publish` 发布。
+预发行版只在明确指定标签时处理，保留 prerelease 标记，不自动降级至较旧正式版。
+
+本机双击 `升级中文版.cmd`，或使用血源工作区的 `升级两个游戏.cmd`，直接安装已验证成品。
+已安装相同或更高版本时立即结束，不重复下载、编译或实测游戏。
 
 中文版本号在官方版本后加一位，例如上游 0.16.0 → 0.16.0.1，
 同一上游下的汉化修订可递增末位。这样既不覆盖上游标签，也能让自有更新器识别修订。
