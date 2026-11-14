@@ -857,6 +857,7 @@ static uint64_t ui_pv_present;
 static uint32_t ui_nrecent, ui_pass_recent;  // (quads recorded so far, the slot is the count modulo UI_RECENT; and when
                                              // this pass began)
 static bool ui_loading_pass;  // this pass draws the loading screen (its backdrop, layer 110, came first)
+static unsigned ui_loading_rows;  // the loading backdrop's rows seen in this pass (1: y 168, 2: 433, 4: 570)
 static bool ui_title_pass;  // this pass draws the title screen (its layout, layer 108 at the canvas centre, came first)
 static bool ui_frontend_pass;  // this pass draws a front-end screen (Main Menu, Character Select: its 16:9 backdrop, layer
                                // 250 at the canvas centre, came first)
@@ -1012,8 +1013,13 @@ static void ui_group_add(float *m, float pos_z, float pos_x, float pos_y, int va
     bool apart = (g_render_aspect > 16.0f / 9.0f || !(ui_group.anchors & (1u << vanchor))) &&
                  (pos_x < ui_group.xmin - margin || pos_x > ui_group.xmax + margin) &&
                  (pos_y < ui_group.ymin - margin || pos_y > ui_group.ymax + margin);
+    // Meownster Hunters: the map in its frame (lower edge y 495 / 510) and the launcher under it (cannon, Palico picker,
+    // prompts, y 562 and below) are two windows of layer 100. After a launch the flight's dots (y 551..630) are drawn
+    // after the frame's lower edge and bridged the two: the map's tokens and the frame's edge went Bottom with the
+    // launcher, the edge a black bar ~70 px under the map until the dots were gone. A window there is on one side of y 530.
+    bool meownster_side = ui_meownster_pass && (pos_y > 530.0f) != (ui_group.y0 > 530.0f);
     if (ui_group.n && (fabsf(pos_z - ui_group.z) > 0.5f || pos_y < ui_group.ymin - 470.0f || pos_y > ui_group.ymax + 470.0f ||
-                       apart || ui_group.n == UI_GROUP_MAX))
+                       apart || meownster_side || ui_group.n == UI_GROUP_MAX))
         ui_group_end();
     if (!ui_group.n) {
         ui_group.z = pos_z, ui_group.x0 = ui_group.xmin = ui_group.xmax = pos_x, ui_group.y0 = ui_group.ymin = ui_group.ymax = pos_y;
@@ -1029,7 +1035,9 @@ static void ui_group_add(float *m, float pos_z, float pos_x, float pos_y, int va
     ui_group.n++;
 }
 static VkRenderPass pass_rp;
-static float pass_sx = 1.0f, pass_sy = 1.0f;  // FSR: the pass renders into output-size stand-ins (fsr.c): viewport, scissor x
+// The pass's targets are larger than the guest's: FSR's output-size stand-ins (fsr.c) or resolution scaling (textures.c
+// tex_scalable). The guest's viewports and scissors are multiplied by these.
+static float pass_sx = 1.0f, pass_sy = 1.0f;
 
 // Redundant-state filter: what draw() last set in the current command buffer (forgotten whenever something else may
 // have recorded state: a new command buffer, a new pass, the clear pipeline).
@@ -1256,6 +1264,10 @@ void vk_gpuprof_frame(void) {  // (device.c, after each presented frame's submis
 static bool pass_msaa;  // (MSAA, below) the pass renders through multisampled images (resolved when next read)
 static TexBackend *pass_att[9];
 static uint32_t pass_natt;
+// (MSAA) the pass has cleared or may have written its depth / stencil target (a draw writing depth or testing stencil):
+// one that only tests depth leaves its multisampled image as it was, and a resolve of it (a copy of every sample, ~2.5 ms
+// at 1080p 4x on a Radeon iGPU) isn't needed again
+static bool pass_ds_written;
 // (MSAA) colour target 0 is a picture 3D models are drawn into (ms_expand). Its picture is copied into the samples
 // only for what tests depth (the models, and the depth clears before them): the menu's 2D draws around them stay
 // without MSAA. draw / clear set ms_want_depth before a pass begins; pass_want_depth: what the pass began for
@@ -1288,7 +1300,10 @@ void vk_end_pass(void) {
                  (unsigned long long)(stat_draws - pass_draws_at), gp_pass_note);
         gp_mark(l);
     }
-    if (pass_msaa) for (uint32_t k = 0; k < pass_natt; k++) pass_att[k]->ms_dirty = true;
+    if (pass_msaa)
+        for (uint32_t k = 0; k < pass_natt; k++)
+            if (pass_ds_written || !(pass_att[k]->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)))
+                pass_att[k]->ms_dirty = true;
     pass_msaa = false;
     if (g_dump_active) dump_pass();
 }
@@ -1398,10 +1413,12 @@ static VkPipeline resolve_pipeline(VkRenderPass rp, int kind, uint32_t samples) 
 
 void vk_ms_resolve(TexBackend *b) {
     if (!b || !b->ms_dirty) return;
+    // (the pass ends first: ending it marks its targets for resolving again, and this resolve covers what it drew - it
+    // was marked after clearing the mark, and the scene's depth was resolved twice in a row, ~2.5 ms each on an iGPU)
+    if (b->ms && in_pass) { vk_end_pass(); st.rt_dirty = true; }
     b->ms_dirty = false;
     TexBackend *m = b->ms;
     if (!m) return;
-    if (in_pass) { vk_end_pass(); st.rt_dirty = true; }
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);
     bool depth = b->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
@@ -1420,6 +1437,7 @@ void vk_ms_resolve(TexBackend *b) {
         VkImageCopy c = {.srcSubresource = {m->aspect, 0, 0, 1}, .dstSubresource = {m->aspect, 0, 0, 1},
                          .extent = {b->width, b->height, 1}};
         vkCmdCopyImage(cb, m->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+        gp_mark("  depth copy");
     }
     ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ib.newLayout = att;
     ib.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -1459,7 +1477,11 @@ void vk_ms_resolve(TexBackend *b) {
         vkCmdEndRenderPass(cb);
         ss_forget();
     }
-    gp_mark("  resolve");
+    if (gp_active) {
+        char l[64];
+        snprintf(l, sizeof l, "  resolve %s %ux%u @%p", depth ? "depth" : "colour", b->width, b->height, (void *)b);
+        gp_mark(l);
+    }
 }
 
 // A pass that draws 3D models over a picture it did not clear: menus draw the hunter and Palicoes (Character Select,
@@ -1525,8 +1547,8 @@ static int models_aa(void) {
     return config_live_fxaa() ? MODELS_AA_FXAA : MODELS_AA_NONE;
 }
 static bool full_picture(uint32_t w, uint32_t h) {
-    return models_aa() != MODELS_AA_NONE && aa_pass_frame == g_present_count && w == g_render_size[0] &&
-           h == g_render_size[1];
+    return models_aa() != MODELS_AA_NONE && aa_pass_frame == g_present_count && w == g_render_host[0] &&
+           h == g_render_host[1];  // (the image's size: resolution scaling makes it larger than the game's)
 }
 
 // FXAA over such models (MODELS_AA_FXAA): the picture is copied before each run of their depth-testing draws (and
@@ -1665,6 +1687,7 @@ static void begin_pass(void) {
     pass_ncolor = (uint32_t)st.rt.ncolor;
     pass_samples = 1;
     pass_sx = pass_sy = 1.0f;
+    bool fsr_standin = false;
     for (int i = 0; i < st.rt.ncolor; i++) {
         NvnTexture *t = st.rt.color[i];
         pass_color[i] = VK_FORMAT_UNDEFINED;
@@ -1673,7 +1696,7 @@ static void begin_pass(void) {
         vk_rt_widen(t, vk_fsr_input(t) ? WIDE_NONE : vk_hdr_rt_float(t) ? WIDE_FLOAT16 : vk_wide_rt_on() ? WIDE_UNORM16 : WIDE_NONE);
         if (g_fsr_on) {  // FSR: from the start of the HUD on, an output-size stand-in (fsr.c)
             NvnTexture *s = vk_fsr_map(t, false);
-            if (s != t) pass_sx = (float)s->width / (float)t->width, pass_sy = (float)s->height / (float)t->height, t = s;
+            if (s != t) pass_sx = (float)s->width / (float)t->width, pass_sy = (float)s->height / (float)t->height, t = s, fsr_standin = true;
         }
         renderer_mark_gpu_owned(t);
         VkImageView v = vk_view(t, &st.rt.cview[i], st.rt.has_cview[i], true, TEXTYPE_2D);
@@ -1693,7 +1716,7 @@ static void begin_pass(void) {
     }
     pass_depth = VK_FORMAT_UNDEFINED;
     pass_d24_as_float = false;
-    NvnTexture *dt = st.rt.depth && pass_sx != 1.0f ? vk_fsr_map(st.rt.depth, true) : st.rt.depth;  // (FSR: as above)
+    NvnTexture *dt = st.rt.depth && fsr_standin ? vk_fsr_map(st.rt.depth, true) : st.rt.depth;  // (FSR: as above)
     if (dt) {
         renderer_mark_gpu_owned(dt);
         VkImageView v = vk_view(dt, &st.rt.dview, st.rt.has_dview, true, TEXTYPE_2D);
@@ -1713,8 +1736,19 @@ static void begin_pass(void) {
         }
     }
     if (minw == UINT32_MAX) minw = minh = 16;
+    if (!fsr_standin && nviews) {  // resolution scaling (textures.c tex_scalable): the guest's units onto larger targets
+        pass_sx = vk_tex_sx(att[0]), pass_sy = vk_tex_sy(att[0]);
+        for (uint32_t k = 1; k < nviews; k++) {
+            if (fabsf(vk_tex_sx(att[k]) - pass_sx) < 0.01f && fabsf(vk_tex_sy(att[k]) - pass_sy) < 0.01f) continue;
+            static int nlog;  // (both made from the render size, so never expected: the pass is drawn at the first's scale)
+            if (nlog++ < 10) LOG("[vk] a pass's targets have different scales: %ux%u x%.3f and %ux%u x%.3f\n", att[0]->width,
+                                 att[0]->height, pass_sx, att[k]->width, att[k]->height, vk_tex_sx(att[k]));
+            break;
+        }
+    }
     pass_w = minw; pass_h = minh;
     ui_loading_pass = false;
+    ui_loading_rows = 0;
     ui_title_pass = false;
     ui_frontend_pass = ui_frontend_frame == g_present_count;
     ui_stamp_pass = false;
@@ -1739,10 +1773,10 @@ static void begin_pass(void) {
         vk_ms_resolve(b);
         b->ms_valid = false;
     }
-    if (ms_ok && pass_depth != VK_FORMAT_UNDEFINED && minw == g_render_size[0] && minh == g_render_size[1] &&
+    if (ms_ok && pass_depth != VK_FORMAT_UNDEFINED && minw == g_render_host[0] && minh == g_render_host[1] &&
         !(pass_models && !pass_want_depth && !models_2d_in_samples())) {  // (2D: not even with samples still valid)
         bool stencil = pass_depth == VK_FORMAT_D24_UNORM_S8_UINT || pass_depth == VK_FORMAT_D32_SFLOAT_S8_UINT;
-        uint32_t cleared = leading_clears(minw, minh, stencil);
+        uint32_t cleared = leading_clears(g_render_size[0], g_render_size[1], stencil);  // (the guest's scissors)
         bool ok = true, expand[9] = {false};
         for (uint32_t k = 0; k < nviews && ok; k++) {
             TexBackend *b = att[k];
@@ -1793,6 +1827,7 @@ static void begin_pass(void) {
     ss_forget();
     in_pass = true;
     pass_draws_at = stat_draws;
+    pass_ds_written = false;
     if (g_dump_active) {  // (debug) the pass's targets: texture object, size, NVN format
         char tg[400];
         int n = 0;
@@ -2200,6 +2235,7 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
     depth = depth && has_depth;
     stencil = stencil && has_stencil;
     if (index < 0 && !depth && !stencil) return;
+    if (depth || stencil) pass_ds_written = true;  // (MSAA: vk_end_pass)
     if (g_clear_draw < 0) { const char *e = getenv("MHGU_CLEAR_DRAW"); g_clear_draw = e && atoi(e); }
     bool simple = (index < 0 || ((mask & 0xF) == 0xF && !g_clear_draw)) && (!stencil || (smask & 0xFF) == 0xFF);
     if (simple) {
@@ -3313,7 +3349,13 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     if (size < 16) size = 16;
     if (!guest_range_ok(r.addr, size)) return zero_buffer(size);
     if (stage == 0 && k == 3) ui_relax_scissor = false, ui_scissor_v = -1;
-    if (stage == 0 && k == 3 && !st.ds[0] && (pass_h == g_render_size[1] || pass_sy != 1.0f) &&  // (FSR: stand-ins)
+    // (a pass the size of the game's picture, in the guest's units: FSR's stand-ins and scaled targets are larger)
+    bool screen_pass = stage == 0 && k == 3 && roundf((float)pass_h / pass_sy) == (float)g_render_size[1];
+    if (screen_pass && !st.ds[0] && size >= 64) {
+        void menulearn_piece(const float *m);  // (the HUD pieces of the frame, at any shape: where menus' rows are)
+        menulearn_piece((const float *)G2H((uint32_t)r.addr));
+    }
+    if (screen_pass && !st.ds[0] &&
         fabsf(g_render_aspect - 16.0f / 9.0f) > 0.01f) {
         if (size >= 64) {
             float m[16];
@@ -3342,9 +3384,15 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                 if (fabsf(pos_z - 110.0f) < 0.5f) {
                     // (only the strips: the lock-on markers and other effects use layer 110 too, mid-hunt, and made
                     // everything after them center-anchored, so the HUD jumped down)
-                    loading_strip = fabsf(pos_y - 168.0f) < 0.3f || fabsf(pos_y - 433.0f) < 0.3f || fabsf(pos_y - 570.0f) < 0.3f;
-                    if (loading_strip) ui_loading_pass = true;
-                    if (ui_loading_pass) sy = 1.0f;
+                    unsigned row = fabsf(pos_y - 168.0f) < 0.3f ? 1u : fabsf(pos_y - 433.0f) < 0.3f ? 2u
+                                 : fabsf(pos_y - 570.0f) < 0.3f ? 4u : 0u;
+                    loading_strip = row != 0;
+                    // The loading screen once the backdrop has shown two of its rows: a reticle or lock-on marker passing
+                    // through one of those heights mid-hunt made the pass a loading screen, and the HUD drawn after it for
+                    // that frame sat centred (its top pieces ~94 px lower at 16:10, the item bar higher): a flash.
+                    ui_loading_rows |= row;
+                    if (ui_loading_rows & (ui_loading_rows - 1)) ui_loading_pass = true;
+                    if (loading_strip || ui_loading_pass) sy = 1.0f;
                 }
                 // Front-end screens keep their backdrop 16:9: the HUD stays on it as with the 16:9 anchor. Edges / 21:9 / 32:9
                 // took their centred menus (layer 100, x 640, anchored Right) and the help box (96) off it, to the sides.
@@ -3426,9 +3474,10 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                         // Status HUD (Clock, HP bar, Stamina, gauges, palico status: y < 500) -> Left anchor
                         // Item Selector wheel (y >= 500) -> Right anchor
                         // The bowgun's ammo list (held L) stands over the item bar, x 970..1242, y 360..568: by height it was
-                        // split at 500, its upper rows Left / Top, a gap in the middle. The status HUD ends at x 742, so the
-                        // right side (x >= 900) is the item bar's whatever its height.
-                        if (pos_y < 500.0f && pos_x < 900.0f) {
+                        // split at 500, its upper rows Left / Top, a gap in the middle. So the right side (x >= 900) is the item
+                        // bar's, but only below the bars: the HP and stamina bars grow to the right with their maximum (a full
+                        // stamina bar's end piece is at x 1062, y 33), so the top (y < 300) is the status HUD's at any x.
+                        if (pos_y < 300.0f || (pos_y < 500.0f && pos_x < 900.0f)) {
                             anchor = ANCHOR_LEFT;
                             vanchor = V_TOP;
                         } else {
@@ -3535,6 +3584,10 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                 VkSpan sp = vk_transient_copy(G2H((uint32_t)r.addr), size, 256);  // (all of it, the matrix changed)
                 memcpy(sp.ptr, m, 64);
                 if (grouped) ui_group_add((float *)sp.ptr, pos_z, pos_x, pos_y, vgroup);
+                {   // (where the piece ends up: read at the frame's end, once its group has its anchor - runtime/menulearn.c)
+                    void menulearn_piece_final(const float *m);
+                    menulearn_piece_final((const float *)sp.ptr);
+                }
                 // The game clips some windows (a list, the help windows' body) with a scissor laid out for the 16:9 window:
                 // it moves with the piece, as its group was anchored last frame (the group is not complete yet), or for a
                 // group not seen before as the pieces so far are.
@@ -3580,7 +3633,7 @@ static VkDescriptorSet stage_set(int nbinds, const VkBindingInfo *binds, VkDescr
     VkWriteDescriptorSet w[MAX_BIND];
     VkDescriptorBufferInfo bi[MAX_BIND];
     VkDescriptorImageInfo ii[MAX_BIND];
-    int n = 0;
+    int n = 0, rs_write = -1;
     for (int i = 0; i < nbinds; i++) {
         const VkBindingInfo *b = &binds[i];
         if (b->set != set) continue;
@@ -3601,12 +3654,8 @@ static VkDescriptorSet stage_set(int nbinds, const VkBindingInfo *binds, VkDescr
             int32_t base[4] = {fsr_cap_base, 0, 0, 0};
             bi[n] = ubo_span(vk_transient_copy(base, sizeof base, 256), sizeof base);
             w[n].pBufferInfo = &bi[n];
-        } else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding == 18) {  // rscale: no scaling here
-            float rs[67][4];
-            for (int k = 0; k < 67; k++) rs[k][0] = rs[k][1] = 1, rs[k][2] = rs[k][3] = 0;
-            rs[66][0] = -1;  // [66].x: -1.0, the front-face mask's all ones once converted (translate.c)
-            bi[n] = ubo_span(vk_transient_copy(rs, sizeof rs, 256), sizeof rs);
-            w[n].pBufferInfo = &bi[n];
+        } else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding == 18) {  // rscale: after the textures (below)
+            rs_write = n;
         } else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding == HDR_PARAMS_BINDING) {  // (hdr.c)
             float hp[HDR_NPARAMS];
             vk_hdr_params(hp);
@@ -3626,6 +3675,24 @@ static VkDescriptorSet stage_set(int nbinds, const VkBindingInfo *binds, VkDescr
             continue;
         }
         n++;
+    }
+    if (rs_write >= 0) {
+        // The resolution-scale table (translate.c): [0] the render target's scale (FragCoord in the guest's pixels), [1 + i]
+        // texture i's (its texel fetches and size queries in the guest's texels): resolution scaling (textures.c
+        // tex_scalable), made once the textures above have their images. FSR's stand-ins keep 1, as before.
+        float rs[67][4];
+        for (int k = 0; k < 67; k++) rs[k][0] = rs[k][1] = 1, rs[k][2] = rs[k][3] = 0;
+        rs[66][0] = -1;  // [66].x: -1.0, the front-face mask's all ones once converted (translate.c)
+        if (!g_fsr_on) {
+            if (stage == 1) rs[0][0] = pass_sx, rs[0][1] = pass_sy;
+            for (int i = 0; i < si->ntex && i < 64; i++) {
+                NvnTexture *t = shader_texture_object(stage, &si->tex[i]);
+                TexBackend *tb = t ? t->backend : NULL;
+                if (vk_tex_scaled(tb)) rs[1 + i][0] = tb->sx, rs[1 + i][1] = tb->sy;
+            }
+        }
+        bi[rs_write] = ubo_span(vk_transient_copy(rs, sizeof rs, 256), sizeof rs);
+        w[rs_write].pBufferInfo = &bi[rs_write];
     }
     if (n) vkUpdateDescriptorSets(g_vk.dev, (uint32_t)n, w, 0, NULL);
     return ds;
@@ -3739,6 +3806,44 @@ static bool topology(uint32_t mode, VkPrimitiveTopology *t) {
 }
 
 // The fragment code's content hash: the same in every run and area (its address is not).
+// Tall grass (Marshlands area 8): drawn twice a frame, into the shadow pass and then the main pass, both with depth
+// writes and a cut-out (discard, under MSAA a sample mask). Writing depth with a cut-out keeps the GPU from testing
+// depth before shading, so every blade behind the front one is shaded too. The shadow pass has already written the
+// same blades' depth, so the main pass's draw of geometry the shadow pass drew this frame, into the same depth target,
+// leaves its depth writes out: hidden blades are then dropped before shading (main pass 8.0 -> 5.95 ms, Radeon iGPU,
+// 1080p MSAA 4x; the picture the same). Matched per draw (the index / vertex data, count and depth target), so a draw
+// the shadow pass didn't make keeps its depth writes.
+#define GRASS_MAIN_FS 0x6451e52f4661b1b0ull    // the grass's main-pass fragment shader (prog_fs_hash)
+#define GRASS_SHADOW_FS 0x56d0c2e7b8b9e1f8ull  // ... its shadow-pass one
+static struct { uint64_t key; uint32_t n; } grass_laid[64];
+static int grass_nlaid;
+static uint64_t grass_frame;
+static uint64_t grass_key(const CmdRec *r, bool indexed) {
+    uint64_t k = indexed ? r->x[3] * 0x9E3779B97F4A7C15ull + r->x[4] : r->x[1];
+    k = (k ^ r->x[2]) * 0x9E3779B97F4A7C15ull;
+    k = (k ^ st.vbuf[0].addr) * 0x9E3779B97F4A7C15ull;
+    return k ^ (uint64_t)(uintptr_t)st.rt.depth;
+}
+static int grass_find(uint64_t key) {
+    if (grass_frame != g_present_count) grass_frame = g_present_count, grass_nlaid = 0;
+    int i = 0;
+    while (i < grass_nlaid && grass_laid[i].key != key) i++;
+    return i;
+}
+static void grass_shadow_drawn(const CmdRec *r, bool indexed, uint64_t fs_hash) {  // (draw: issued, writing depth)
+    if (fs_hash != GRASS_SHADOW_FS) return;
+    uint64_t key = grass_key(r, indexed);
+    int i = grass_find(key);
+    if (i == grass_nlaid && grass_nlaid < 64) grass_laid[grass_nlaid++] = (typeof(grass_laid[0])){key, 0};
+    if (i < grass_nlaid) grass_laid[i].n++;
+}
+static bool grass_depth_laid(const CmdRec *r, bool indexed, uint64_t fs_hash) {  // (draw: true, leave depth writes out)
+    if (fs_hash != GRASS_MAIN_FS) return false;
+    int i = grass_find(grass_key(r, indexed));
+    if (i == grass_nlaid || !grass_laid[i].n) return false;
+    grass_laid[i].n--;
+    return true;
+}
 static uint64_t prog_fs_hash(Prog *p) {
     if (!p->chash[1]) p->chash[1] = code_hash(p->code[1], p->cmax[1], 1);
     return p->chash[1];
@@ -4044,6 +4149,8 @@ static void draw(CmdRec *r, bool indexed) {
     k.depth_write = k.depth_test && st.ds[1];
     k.depth_op = (uint8_t)(k.depth_test ? compare_fn(st.ds[2]) : VK_COMPARE_OP_ALWAYS);
     k.stencil_test = st.ds[3] && has_stencil;
+    if (k.depth_write && grass_depth_laid(r, indexed, prog_fs_hash(pr))) k.depth_write = false;  // (tall grass, above)
+    if (k.depth_write || k.stencil_test) pass_ds_written = true;  // (MSAA: vk_end_pass)
     // (3D models drawn over the finished picture, without MSAA: from the next frame on, for as long as they are drawn,
     // the player's anti-aliasing for them: ms_expand, models_fxaa_end)
     if (k.depth_write) {
@@ -4298,6 +4405,7 @@ static void draw(CmdRec *r, bool indexed) {
     if (mf_tex) models_fxaa_note();
     if (!use_index) vkCmdDraw(cb, count, inst, first, base_inst);
     else vkCmdDrawIndexed(cb, icount, inst, 0, base_vertex, base_inst);
+    if (k.depth_write) grass_shadow_drawn(r, indexed, prog_fs_hash(pr));  // (tall grass: its main pass, grass_depth_laid)
     stat_draws++;
     if (g_fsr_objvel && pr->fsrcap && (k.depth_write || (k.depth_test && pr->vi->cbuf_dynamic)) && inst == 1 && pass_samples == 1) {
         // FSR object motion: the same draw again through the capture variant of its vertex shader (rasterizer
@@ -4326,6 +4434,34 @@ static void draw(CmdRec *r, bool indexed) {
 }
 
 // ================================================================== texture copies
+// Resolution scaling: copies between guest memory and a scaled target (textures.c tex_scalable) go through an image of
+// the guest's size, blitted to or from the target's larger region. A w x h image of b's format, freed once the pending
+// submission completes; VK_NULL_HANDLE: could not be made.
+static VkImage scale_temp(const TexBackend *b, uint32_t w, uint32_t h) {
+    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = b->format,
+                            .extent = {w ? w : 1, h ? h : 1, 1}, .mipLevels = 1, .arrayLayers = 1,
+                            .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                            .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VkImage img;
+    VmaAllocation mem;
+    if (vmaCreateImage(g_vk.vma, &ci, &ai, &img, &mem, NULL) != VK_SUCCESS) return VK_NULL_HANDLE;
+    vk_image_init_layout(vk_cmd(), img, b->aspect);
+    vk_defer_image(img, mem);
+    return img;
+}
+// (a blit's aspect: depth alone for depth / stencil images, as copy_texture's; colour filtered unless integer)
+static void scale_blit(VkCommandBuffer cb, const TexBackend *b, uint32_t nvn_format, VkImage src, uint32_t slv, uint32_t sly,
+                       const int32_t s[4], VkImage dst, uint32_t dlv, uint32_t dly, const int32_t d[4]) {
+    VkImageAspectFlags a = b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : b->aspect;
+    VkImageBlit bl = {.srcSubresource = {a, slv, sly, 1}, .srcOffsets = {{s[0], s[1], 0}, {s[2], s[3], 1}},
+                      .dstSubresource = {a, dlv, dly, 1}, .dstOffsets = {{d[0], d[1], 0}, {d[2], d[3], 1}}};
+    bool linear = a == VK_IMAGE_ASPECT_COLOR_BIT && !rt_kind(nvn_format);
+    vk_full_barrier(cb);
+    vkCmdBlitImage(cb, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    vk_full_barrier(cb);
+}
+
 static void copy_region_dims(NvnTexture *t, const TexRef *ref, const FormatInfo **fi, int32_t rg[6], int *level,
                              uint64_t *row, uint64_t *img) {
     *fi = nvn_format_info(t->format);
@@ -4398,6 +4534,20 @@ static void copy_buffer_to_texture(uint64_t src, const TexRef *dst) {
                                                 (uint32_t)level, array ? (uint32_t)rg[2] : 0, array ? nz : 1},
                            .imageOffset = {rg[0], rg[1], array ? 0 : rg[2]},
                            .imageExtent = {(uint32_t)rg[3], (uint32_t)rg[4], array ? 1 : nz}};
+    if (vk_tex_scaled(b) && !decode && nz == 1) {  // resolution scaling: into a guest-size image, then blown up into place
+        VkImage tmp = scale_temp(b, (uint32_t)rg[3], (uint32_t)rg[4]);
+        if (!tmp) return;
+        c.imageSubresource.mipLevel = 0, c.imageSubresource.baseArrayLayer = 0, c.imageOffset = (VkOffset3D){0, 0, 0};
+        vkCmdCopyBufferToImage(cb, s.buf, tmp, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+        int32_t lw = (int32_t)level_extent(b->width, (uint32_t)level), lh = (int32_t)level_extent(b->height, (uint32_t)level);
+        int32_t sr[4] = {0, 0, rg[3], rg[4]};
+        int32_t dr[4] = {(int32_t)lroundf(rg[0] * b->sx), (int32_t)lroundf(rg[1] * b->sy),
+                         (int32_t)lroundf((rg[0] + rg[3]) * b->sx), (int32_t)lroundf((rg[1] + rg[4]) * b->sy)};
+        if (dr[2] > lw) dr[2] = lw;
+        if (dr[3] > lh) dr[3] = lh;
+        if (dr[2] > dr[0] && dr[3] > dr[1]) scale_blit(cb, b, t->format, tmp, 0, 0, sr, b->image, (uint32_t)level, 0, dr);
+        return;
+    }
     vkCmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
 }
 
@@ -4427,7 +4577,24 @@ static void copy_texture_to_buffer(const TexRef *src, uint64_t dst) {
                                                 (uint32_t)level, array ? (uint32_t)rg[2] : 0, array ? nz : 1},
                            .imageOffset = {rg[0], rg[1], array ? 0 : rg[2]},
                            .imageExtent = {(uint32_t)rg[3], (uint32_t)rg[4], array ? 1 : nz}};
-    vkCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, out.buf, 1, &c);
+    VkImage from = b->image;
+    if (vk_tex_scaled(b) && nz == 1) {  // resolution scaling: the region shrunk to the guest's size first
+        VkImage tmp = scale_temp(b, (uint32_t)rg[3], (uint32_t)rg[4]);
+        if (!tmp) return;
+        int32_t lw = (int32_t)level_extent(b->width, (uint32_t)level), lh = (int32_t)level_extent(b->height, (uint32_t)level);
+        int32_t sr[4] = {(int32_t)lroundf(rg[0] * b->sx), (int32_t)lroundf(rg[1] * b->sy),
+                         (int32_t)lroundf((rg[0] + rg[3]) * b->sx), (int32_t)lroundf((rg[1] + rg[4]) * b->sy)};
+        int32_t dr[4] = {0, 0, rg[3], rg[4]};
+        if (sr[2] > lw) sr[2] = lw;
+        if (sr[3] > lh) sr[3] = lh;
+        if (sr[2] <= sr[0] || sr[3] <= sr[1]) return;
+        scale_blit(cb, b, t->format, b->image, (uint32_t)level, 0, sr, tmp, 0, 0, dr);
+        c.imageSubresource.mipLevel = 0, c.imageSubresource.baseArrayLayer = 0, c.imageOffset = (VkOffset3D){0, 0, 0};
+        from = tmp;
+        static int nlog;
+        if (nlog++ < 10) LOG("[vk] guest-size readback of a scaled %ux%u target (region %dx%d)\n", t->width, t->height, rg[3], rg[4]);
+    }
+    vkCmdCopyImageToBuffer(cb, from, VK_IMAGE_LAYOUT_GENERAL, out.buf, 1, &c);
     renderer_submit();  // the CPU may read the result right after the fence
     vk_wait_seq(submit_seq);
     if (b->wide == WIDE_FLOAT16) {  // (HDR: values above 1 clamp, as the game's RGBA8 would have)
@@ -4454,7 +4621,13 @@ static void copy_texture(const TexRef *src, const TexRef *dst, uint64_t flags) {
     vk_ms_resolve(d);
     d->ms_valid = false;
     renderer_mark_gpu_owned(dt);
-    const int32_t *sr = src->region, *dr = dst->region;
+    // (regions in the guest's texels: resolution scaling's larger images get theirs scaled, textures.c tex_scalable)
+    float ssx = vk_tex_sx(s), ssy = vk_tex_sy(s), dsx = vk_tex_sx(d), dsy = vk_tex_sy(d);
+    int32_t sr[6], dr[6];
+    for (int i = 0; i < 6; i++) sr[i] = src->region[i], dr[i] = dst->region[i];
+    if (ssx != 1.0f || ssy != 1.0f) for (int i = 0; i < 5; i++) sr[i] = (int32_t)lroundf(sr[i] * (i == 1 || i == 4 ? ssy : i == 2 ? 1.0f : ssx));
+    if (dsx != 1.0f || dsy != 1.0f) for (int i = 0; i < 5; i++) dr[i] = (int32_t)lroundf(dr[i] * (i == 1 || i == 4 ? dsy : i == 2 ? 1.0f : dsx));
+    bool rescale = fabsf(ssx - dsx) > 0.001f || fabsf(ssy - dsy) > 0.001f;  // (one scaled, one not: filtered below)
     int sx0 = sr[0], sy0 = sr[1], dx0 = dr[0], dy0 = dr[1];
     int sw = sr[3] ? sr[3] : (int)s->width, sh = sr[4] ? sr[4] : (int)s->height;
     int dw = dr[3] ? dr[3] : (int)d->width, dh = dr[4] ? dr[4] : (int)d->height;
@@ -4498,7 +4671,7 @@ static void copy_texture(const TexRef *src, const TexRef *dst, uint64_t flags) {
                       .srcOffsets = {{sx0, sy0, 0}, {sx0 + sw, sy0 + sh, 1}},
                       .dstSubresource = {depth ? (da & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : da) : da, dlv, dly, 1},
                       .dstOffsets = {{dx0, dy0, 0}, {dx0 + dw, dy0 + dh, 1}}};
-    bool linear = (flags & 1) && !depth && !rt_kind(st_->format);
+    bool linear = ((flags & 1) || rescale) && !depth && !rt_kind(st_->format);
     vkCmdBlitImage(cb, s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
 }
 

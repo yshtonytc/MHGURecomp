@@ -1272,6 +1272,15 @@ static void app_run(Cpu *c) {
             p->active = false;
             continue;
         }
+        // The emulators' High Frame Rate Fixes plugin (the port's hle/emjump.c, emstall.c, hatestep.c, combowin.c,
+        // mashrate.c and buffcycle.c as a Forge plugin): built in here, and both would scale the same things twice.
+        // MHGU_FORGE_HFR=1 starts it anyway (tests, with MHGU_NO_EMJUMP=1 MHGU_NO_EMSTALL=1 MHGU_NO_HATESTEP=1
+        // MHGU_NO_MASHRATE=1; its hooks then take the patched sites over)
+        if (!strcmp(gstr(p->param + 6), "High Frame Rate Fixes") && !(getenv("MHGU_FORGE_HFR") && *getenv("MHGU_FORGE_HFR") == '1')) {
+            LOG("[forge] plugin %s (High Frame Rate Fixes) not started: built into the port\n", p->name);
+            p->active = false;
+            continue;
+        }
         if (p->on_init) {
             flog(0, "Initializing plugin app:/nativeNX/plugins/%s", p->name);
             gcall(c, p->on_init, 0, 0, 0, 0);
@@ -1517,7 +1526,7 @@ void forge_init(void) {
         if (d) closedir(d);
     }
     str_savedata = gstring("savedata");
-    uint32_t at = PLUGIN_BASE;
+    uint32_t at = PLUGIN_BASE, at2 = PLUGIN2_BASE;
     for (int i = 0; i < nf; i++) {
         size_t len;
         uint8_t *data = read_all(found[i], &len);
@@ -1526,7 +1535,9 @@ void forge_init(void) {
         if (data && len >= 0x3C) memcpy(&bss, data + 0x38, 4);
         // (the image, its bss and the 64 KiB alignment of the next one; the trampolines and stubs have their own regions)
         bool room = data && (uint64_t)at + len + bss + 0x10000 <= PLUGIN_END;
-        Module *m = room ? loader_load_nro(name, data, len, at) : NULL;
+        bool high = false;  // (the first region is full: the second one, as far from everything as the guest space allows)
+        if (data && !room && (uint64_t)at2 + len + bss + 0x10000 <= PLUGIN2_END) room = high = true;
+        Module *m = room ? loader_load_nro(name, data, len, high ? at2 : at) : NULL;
         free(data);
         if (!m) {
             if (!data) flog(3, "Failed to read plugin file app:/nativeNX/plugins/%s (%s)", name, found[i]);
@@ -1549,7 +1560,9 @@ void forge_init(void) {
         kernel_map_region(m->base + m->data_off, m->size - m->data_off, 4, 3);
         flog(0, "Found plugin file: app:/nativeNX/plugins/%s", name);
         LOG("[forge] plugin %s (%s)\n", name, found[i]);
-        at = (at + m->size + 0xFFFF) & ~0xFFFFu;
+        if (high) at2 = (at2 + m->size + 0xFFFF) & ~0xFFFFu;
+        else at = (at + m->size + 0xFFFF) & ~0xFFFFu;
+        if (high) LOG("[forge] %s is in the second plugin region (%08x)\n", name, m->base);
     }
     // Host settings need the overlay even when no Forge mods are installed.
     fnhook_set(text_addr(OFF_UPDATE), hle_register("forge:update", frame_update));

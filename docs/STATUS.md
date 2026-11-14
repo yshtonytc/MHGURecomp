@@ -292,6 +292,15 @@ Plan and security notes: docs/research/internet-hubs.md.
   the fuller, then the newest). Since then (server.go list) the server's ListMax is 18 and, with more hubs than
   that, each LIST is a random 18 (shuffled, hubs with a free place kept before full ones), then sorted as before: a
   Retry shows others.
+- Hunter Search networks apart (2026-11-12): with Hunter Search on (R in a village or the offline Hub / Hunters'
+  Pub) the game hosts a 2-player network for ~10 s, scans, and hosts again, as long as it is on; each of those was
+  listed on the hub server like a hub (the "6-10 s hubs"). A public LIST then held 12 hubs and 6 of them, so Join
+  Hub showed 2 pages instead of 3. They have room for 2 and 0xFF at advertise byte 0x1C (hubs: 1, a 2-player hub too, checked;
+  0x14-0x1B is the constant 0x90abcdef 0x12345678). The game scans
+  for 24 and its Hunter Search list has 6 rows, so most likely 18 hubs + 6 Hunter Search players (not seen in its
+  code). Since then (server.go huntSearch / pick) a LIST answers up to ListMax hubs, then up to ListSearchMax (6) of
+  those networks, each kind picked and sorted the same way; they come last, so whatever doesn't fit is theirs.
+  Hunter Search showed 0 players between two port games even with different hunters (shared account id?).
 - Passcoded hubs last (2026-11-08): MHGU's advertise data (NetworkInfo +0x26C, 200 bytes) has a u16 passcode at
   +0xC0: 0xFFFF = none, else the 4-digit code in bits 0-14 (1234 = 0x04D2), bit 15 set for "Everyone", clear for
   "Exclude Friends" (measured: open 0xFFFF, Everyone 1234 = 0x84D2, Exclude Friends 0000 = 0x0000). server.go list
@@ -503,6 +512,58 @@ Forcing 329 (selector +0xd68 on both, depart bit +0xd65) crashed the host at the
 it (and has the Hub counter: run3\st hasn't met the Guild Manager). Possibly the same
 kind of problem: 713 / 906 end with a type 1 Valstrax demo after the clear (see the 713 section); in a session it won't
 play, and whether the quest still ends is untested.
+
+## Resolution scaling: the game renders 1080 lines, the port renders larger (2026-11-12)
+
+Follows the GPU pool fix below: with it, the game's own render targets still took ~59 bytes a pixel of its fixed GPU pool
+in the 32-bit guest, so the render size was capped (~4724x2656 at 16:9). Now a 3D picture more than 1080 lines high
+(config.c) has the game render 1080 lines in the picture's shape (g_render_size: what gen.py's 0xdbcd34 patch, the
+cameras and the GPU pool see; 2520x1080 at 21:9) while the renderer makes its screen-sized targets larger
+(g_render_host, g_rscale = host / guest), the way emulators scale resolution. The game's GPU heap is then byte for byte
+what it is at 1920x1080 (town: 280 MB used, 35 MB largest free block in 848 MB) at 4320x2430 and at 7680x4320, so the
+size has no memory cap left (only the 16384 image limit). Off with FSR (its stand-ins are built for the game rendering
+at its input size: the old way, pool growth and cap) and with MHGU_NO_RSCALE=1 (A/B).
+- Which textures (textures.c tex_scalable): 2D, single-sample, NVN COMPRESSIBLE flag (every target the game makes; no
+  loaded texture has it), size = the guest render size or a halving of it, rounded down or up (the bloom chain down to
+  60x33). Not shadow maps (1024x3072), not the 1280x720 handheld twins the game makes at the same storage. TexBackend
+  sx / sy hold the image's scale; logged "[vk] render target WxH ... made WxH (resolution scaling)".
+- exec.c: begin_pass takes pass_sx / pass_sy from the targets (the FSR stand-in mechanism already scaled viewports and
+  scissors by them; FSR now flagged separately, fsr_standin); MSAA / model-AA size tests use g_render_host,
+  leading_clears the guest size; the HUD's screen-pass test is in guest units. The shaders' rscale table (binding 18,
+  translate.c) is filled: [0] the pass's scale (FragCoord in guest pixels: 62 of the game's fragment shaders read it),
+  [1 + i] each sampled texture's (texel fetches / size queries: none of the 6311 cached programs has any). Copies
+  scale their regions (a scale mismatch blits, filtered); copies between guest memory and a scaled target go through a
+  guest-size image (scale_temp / scale_blit; no such copy seen in play).
+- Tested (2026-11-12, quest 206, one-frame dumps compared with MHGU_NO_RSCALE=1 at the same size): 4320x2430,
+  2560x1440 with MSAA 4x, FXAA, SmoothGradients, HDR10, 21:9 3440x1440: every pass within run-to-run noise (measured with
+  two native runs: 0.3-16% of pixels > 8 codes apart by option, moving Palicos and smoke); 4320 crops match in
+  detail. A real clear (MHGU_KILL_AFTER) shows the quest photo at full detail (its buffer is a render-size target). No
+  fps cost on the RTX 5070 Ti (240 cap either way). Not tested: menus with 3D model previews, title / movies, the Hubs
+  and multiplayer, 16:10 above 1080 lines, weaker GPUs, the validation layer (not installed here).
+
+## GPU pool at large render sizes: the Great Maccao demo crash (2026-11-11)
+
+Report (0.16.1, RenderResolution 4320x2430): Vaulting Outlaw (206) crashed as the hunter entered Jurassic Frontier area 5,
+four threads at once on wild jumps. That is the quest's monster demo (event table entry 54: event054, stage 1, area 5),
+played only until the save has seen it: the demo's end sets bit n (entry n) of the event manager's seen flags (0x34e4d8,
+manager at *0x1a570d0, flags at +0x64; entry 54 = +0x68 bit 22), and the lookup 0x34cad8 skips a set bit. To replay one
+on a save that has seen it: `poke` that bit clear once in the quest (testsave/maccao/clearseen.sh).
+Cause: the game keeps render targets and textures in one GPU heap (game heap 6, *0x1aa62e8 [6] = 0x08026010, on the
+first NVN pool, 0x36400000) of a fixed 848 MB (`movt #0x3520` at 0x351e40 / 0x351fa4). The port has the game render at
+RenderResolution itself (0xdbcd34), and its screen-sized targets take ~59 bytes a pixel of that heap: used / largest free
+block in the town 209 / 41 MB at 1280x720, 280 / 35 at 1920x1080, 633 / 13 at 3840x2160, 791 / 5.59 MB at 4320x2430
+(heap object +0x4 used, +0x7c largest free). The demo's name card texture (boss_demo, 0x555a00 bytes, loaded by
+0xd084a4 on the loading thread through 0xa6a4c4) needs 2.5 KB more than that block: the allocation answers 0 and the
+game copies the 5.6 MB to address 0, over its own code from 0x200000 (a Switch would fault; here code is writable and
+the threads crash on what's left). Found with `protect 200000 172f000`: the memcpy faulted, called from 0xd08b40.
+Fix: gen.py PATCHES at 0x351e40 / 0x351fa4 take the size from g_gpu_pool_size (runtime/config.c): 848 MB + 64 bytes a
+pixel above 1920x1080, so the free part stays as on the Switch (4320x2430: 1365 MB, 37 MB largest free; the other two
+pools move up, the last ending at 0x9e600000). The heap fits ~665 MB more (4800x2700 played quest 1005; 5120x2880, +774:
+"out of command memory" before the town, 5760x3240: crash), and those sizes never worked before either (their targets
+alone are more than 848 MB): a 3D resolution above 1920x1080 + 640 MB / 64 is lowered to it in its shape and logged
+("is more than the game's memory holds": 7680x4320 -> 4724x2656, 1490 MB). Tested (2026-11-11, the user walking): 206's
+demo at 4320x2430 crashed at 30 and 120 fps and played at 1280x720 at 30 and 120 fps; with the fix it plays at
+4320x2430. Not tested: multiplayer at a large render size (four hunters, more of the heap in use), FSR with a large output.
 
 ## Save data safety (2026-10-22)
 
@@ -738,6 +799,17 @@ MHGU_LOG_MOVES also logs every act change ("is", with the time) and the stun's r
 "plact <act_st hex> <act_no> [param]" / "plsweep" start player actions; MHGU_PLSNAP=<file> + "plsnap [updates]"
 (also from a knockback) save the player's memory every update; "interpread" now also sees register-offset loads and
 VLDR (interp.c). Not tested yet: by the user at a high frame rate; the other holds.
+
+The frame-rate fixes for emulators, as a Forge plugin (2026-11-11, branch feat/highfps-plugin-skip): emjump.c, emstall.c,
+hatestep.c, combowin.c (Lenient), mashrate.c and buffcycle.c ported to "High Frame Rate Fixes" (highfps.nro, kept outside this
+repo in C:\MHGURecompile\highfps-forge with its NOTES.md), for emulator players on a 60 / 240 fps mod or cheat. The PATCHES sites
+become Forge hooks inside their functions: each site's two words jump to a stub that saves every register, runs the C, runs the
+second word (or emulates it when it reads pc or branches) and goes on. forge.c doesn't start a plugin of that name (both would
+scale the same counters twice); MHGU_FORGE_HFR=1 starts it anyway, for tests with MHGU_NO_EMJUMP=1 MHGU_NO_EMSTALL=1
+MHGU_NO_HATESTEP=1 MHGU_NO_MASHRATE=1 (its hooks then take the patched sites over, their functions interpreted). Checked here,
+quest 404 with MHGU_SUMMON, Volvidon's 7:92 / 7:98 forced, MHGU_EMTRACE=2: at 240 fps with the plugin the body press is in the air
+1.06-2.18 s, apex ~900 at 1.67 s, the drop hop 0.03-0.90 s, apex 532 at 0.50 s; at 30 fps 1.03-2.10 s / 1.63 s and 0.03-0.87 s /
+0.50 s; at 240 fps with nothing 1.14 s to the apex and the hop 0.03-0.11 s. Ryujinx 1.2.82 at 240 fps: see the plugin's notes.
 
 ## Fidelity audit (2026-10-20)
 
@@ -1271,6 +1343,25 @@ old way while on.
   side by side (Equipment Box, 1080p): better, but the stretched one reads more easily for some, so it stays an option
   ("Bold text"; its help names dyslexia).
 
+## 5.1 surround output: [Audio] Output (2026-11-14)
+
+- MHGU always mixes in 5.1: its device sink has six inputs (FL FR FC LFE BL BR, the final mix's buffers 0-5) and it
+  never asks IAudioDevice for the channel count (only cmds 4, 7, 10) or set:sys for the TV sound mode. Measured per
+  channel over 5 s in quest 101: center about as loud as the fronts, rears ~30-60 with peaks ~300 when a sound is
+  behind, LFE always 0 (the game sends no bass to it). Before, audio.c folded it to stereo and opened a 2-channel stream.
+- [Audio] Output = Stereo (default, the same fold as before: center and rears -3 dB, LFE -12 dB) or 5.1 (aliases
+  Surround, "5.1 surround"); settings menu Graphics & Audio > Output, live: the audio thread reopens the SDL stream when
+  the saved value changes (open_stream / pacing in renderer_tick; the queue levels are in sample frames now). SDL's 5.1
+  order is the sink's, so 5.1 is passed as it is; SDL converts to the device (a stereo device: SDL folds it down; 7.1:
+  SDL_Convert51To71 puts the six on their speakers and leaves the sides silent). The game has no more than 5.1, so
+  that's all the port sends: a 7.1 upmix is left to the system / receiver (decided 2026-11-14). The log says "[audren] output 5.1; device ... N channels".
+- MHGU_AUDIO_WAV writes WAVE_FORMAT_EXTENSIBLE float with the channel mask, in the Output it was opened with (6 tracks
+  in Audacity for 5.1).
+- Checked here (stereo device): both modes into quest 101, no underruns; the 5.1 dump's channels as measured above;
+  Stereo -> 5.1 and 5.1 -> Stereo through the menu with Save, reopened, no underruns. Not yet heard on real surround
+  speakers (the user's other PC, before release). Without speakers: the WAV dump, or Windows Sonic for Headphones
+  (the device then reports 7.1 and SDL places the 5.1 on it).
+
 ## Next steps
 1. Modding tools: decode resident.arc tables (weapon00..14 Base/Level data: record layouts derivable from the game
    code that reads them), monster files per `arc/enemy/emXXX_YY.arc` (`attackdata`, `bodydata`, `dtbase`,
@@ -1332,14 +1423,14 @@ old way while on.
    ui_group_end: by the nearer edge, or the centre; patched in transient memory before the pass ends; the game's scissor
    of a piece moves with it, as its group was anchored last frame, so the help windows' body is not cut), the village / Hub
    button guides on layer 96 go top, layers below 95 by thirds (the Guild Card name plate), the Meownster Hunters return screen (marked by its map frame, layer 105 at 215, 0) goes top but for
-   its prompts, the quest results screen (marked by its Time Left bar, layer 99 at y 643) centres its
+   its prompts (on the launch screen a window is on one side of the map frame's lower edge, y 530: the flight's dots bridged the map and the launcher), the quest results screen (marked by its Time Left bar, layer 99 at y 643) centres its
    middle: the stamp, reward table, item lists' parchment and rows, the title's PRESS A scales
    about the centre with its layout (layer 108), and a model preview follows the frame drawn over it (also from an earlier pass: the Smithy's model is drawn in a pass of
    its own), not the last quad; its camera, made for its box stretched to the taller picture, gets the box's 16:9 shape
    (config.c camera_aspect: only a camera whose aspect is a preview box's the renderer drew), so the model is as big and
    as wide as at 16:9, and a prompt just under its box (the Palico Scout's "Rotate") goes with its frame; a preview window beside the menus (the Smithy's
    parchment, the Poogie costume's) goes Top with them, whichever is drawn first; layer 110 outside the loading screen
-   (the bowgun's reticle, lock-on markers) is not stretched and scales about the centre; the bowgun's ammo list (layer 103, right side) goes with the item
+   (the bowgun's reticle, lock-on markers) is not stretched and scales about the centre; the bowgun's ammo list (layer 103, right side below y 300; above it the HP and stamina bars' end pieces, at x 1062 when full) goes with the item
    bar; a window's pieces up to 470 apart are one group (the Weapon Controls sheet's back parchment, 436 high), and a window stacked right on another of its layer
    that went the other way takes the pair's anchor with it (the chat log's "Chat" label over its box)
    (the Palico Scout's "Rotate" prompt). MHGU_CONTROL `hudtrace` logs a frame's HUD quads and their anchors. Left: the HUD's layout elsewhere (title, town, quest board, item box) unverified; at Edges
@@ -1636,11 +1727,14 @@ controller, frames = presented frames; e.g. `300:A:10`), `MHGU_NAME` (answers ev
 `MHGU_CONTROL=ctl.txt` (drive a running game: append lines `A`, `DOWN 8`, `STICK_UP 60`, `shot name` -> shots/name.png;
 `X 6 25` = X for 6 frames from 25 frames on, lines written together form a timed sequence; `fntrace lo hi n`;
 `fnnew lo hi [learn ms]` = log only the first call of each function in [lo, hi) not seen while learning, to find what an
-event runs; `peek` / `poke` / `memsave` / `find` for guest memory), `MHGU_QUICKHUNT=<quest number>` (from start-up
+event runs; `peek` / `poke` / `memsave` / `find` for guest memory; `protect <addr> <size>` = that guest memory read-only,
+so a wild write crashes at once with the writer named), `MHGU_POOL_LOG=1` (each NVN memory pool the game makes, with its
+callers), `MHGU_QUICKHUNT=<quest number>` (from start-up
 straight into that quest: A through the menus to the save's town, then the quest is ordered and departed on;
 runtime/hle/quickhunt.c has how the game departs; `MHGU_QUICKHUNT=town` stops in the town), `MHGU_KILL_AFTER=<s>`
-(the quest's large monster dies by one real hit that long into the quest), `MHGU_FORCE_EVENT=<n>` (the next quest-demo
-lookup plays event table entry n; both in quickhunt.c), `vpad` (control file:
+(the quest's large monster dies by one real hit that long into the quest), `MHGU_FORCE_EVENT=<n>` (the first quest-demo
+lookup in entry n's own area plays it; both in quickhunt.c; a forced demo doesn't give the hunter back at its end: to
+see a quest's demo as a player would, clear its seen bit instead, see "GPU pool at large render sizes"), `vpad` (control file:
 attach an SDL virtual controller; `vpad <n> <button> <0|1>` presses its button), `MHGU_LOG_MOVES=1` (the player's actions and command table
 changes, runtime/hle/movelog.c), `MHGU_EMTRACE=1/2/3` (large monster actions with their real-time length, height and
 distance; 2: the position every update; 3: the monster object saved on 4 updates once a forced action is 200 up;
