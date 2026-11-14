@@ -18,14 +18,14 @@ def main():
     endpoint='latest' if args.tag=='latest' else 'tags/'+args.tag
     with urllib.request.urlopen(urllib.request.Request('https://api.github.com/repos/'+config['repository']+'/releases/'+endpoint,headers={'User-Agent':'MHGU-Chinese'}),timeout=30) as response:release=json.load(response)
     tag=release['tag_name']
-    if not re.fullmatch(r'\d+\.\d+\.\d+',tag) or release.get('prerelease'):raise SystemExit('Review this upstream version format before merging.')
+    if not re.fullmatch(r'\d+\.\d+\.\d+',tag) or (release.get('prerelease') and args.tag=='latest'):raise SystemExit('Review this upstream version format before merging.')
     asset=next(a for a in release['assets'] if a['name'].startswith('Windows-') and a['name'].endswith('.zip'))
     if not asset.get('digest','').startswith('sha256:'):raise SystemExit('Upstream release lacks a verified digest.')
     git('fetch','https://github.com/'+config['repository']+'.git','refs/tags/'+tag)
     commit=git('rev-parse','FETCH_HEAD^{commit}')
     subprocess.run(['git','merge','--no-edit',commit],cwd=ROOT,check=True)
     if config['tag']!=tag:config['custom_version']=tag+'.1'
-    config.update(tag=tag,commit=commit,asset=asset['name'],sha256=asset['digest'])
+    config.update(tag=tag,commit=commit,asset=asset['name'],sha256=asset['digest'],prerelease=bool(release.get('prerelease')))
     path.write_text(json.dumps(config,indent=2)+'\n',encoding='utf-8')
     # New upstream labels must be translated explicitly before anything is pushed.
     subprocess.run([sys.executable,str(ROOT/'custom/generate_catalog.py')],cwd=ROOT,check=True)
