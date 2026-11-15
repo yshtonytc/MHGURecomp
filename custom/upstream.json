@@ -1,11 +1,11 @@
 {
   "repository": "morerokk/MHGURecomp",
-  "tag": "0.17.2",
-  "commit": "cdc67a5d4cb724fdbb28dd92891967ace8dc013e",
-  "asset": "Windows-MHGURecomp.0.17.2.zip",
-  "sha256": "sha256:9f50987e522c3f192e91cf8e37041995cd2a82a1e408c819ce1d22565a6c920d",
+  "tag": "0.17.3",
+  "commit": "de1b9a37c2b23443cdc335374f09d6969bdcb8e3",
+  "asset": "Windows-MHGURecomp.0.17.3.zip",
+  "sha256": "sha256:93f17847f73d9e1c6c400d4515f5bed13936cc54f6e17aacd4eb0b28715dc695",
   "custom_repository": "yshtonytc/MHGURecomp",
   "branch": "chinese-ui",
-  "custom_version": "0.17.2.1",
+  "custom_version": "0.17.3.1",
   "prerelease": false
 }
