@@ -40,7 +40,7 @@ def fetch():
             if not relative or entry.is_dir():continue
             p=Path(relative)
             if p.is_absolute() or '..' in p.parts or ':' in relative or '\\' in relative:raise ValueError('Unsafe archive path')
-            allowed=(len(p.parts)==1 and (p.suffix.lower() in ('.exe','.dll') or p.name=='pipelines.list')) or p.parts[0]=='licenses'
+            allowed=(len(p.parts)==1 and (p.suffix.lower() in ('.exe','.dll') or p.name in ('pipelines.list','mhgurecomp-cjk.otf'))) or p.parts[0]=='licenses'
             if not allowed:continue
             target=stage/p;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(z.read(entry))
     print('Verified stock program package:',config['tag'])
@@ -60,14 +60,12 @@ def package():
     for file in built.glob('*.dll'):
         if file.name!='mhgugame.dll':shutil.copy2(file,base/file.name)
     if (built/'licenses').exists():shutil.copytree(built/'licenses',base/'licenses',dirs_exist_ok=True)
-    font=json.loads((ROOT/'custom/font.json').read_text())
-    for name,info in font['files'].items():download(info['url'],ROOT/'out/cache'/name,info['sha256'])
-    from fontTools.ttLib import TTFont
-    from fontTools.varLib.instancer import instantiateVariableFont
-    face=TTFont(ROOT/'out/cache/NotoSansSC[wght].ttf');face=instantiateVariableFont(face,{'wght':400},inplace=True)
-    destination=base/'localization/fonts';destination.mkdir(parents=True,exist_ok=True)
-    face.save(destination/'NotoSansSC-Regular.ttf')
-    shutil.copy2(ROOT/'out/cache/OFL.txt',base/'licenses/NotoSansSC-OFL.txt')
+    font_path=base/'mhgurecomp-cjk.otf'
+    source_font=ROOT/'extras/mhgurecomp-cjk.otf'
+    if not font_path.is_file() or sha(font_path)!=sha(source_font):
+        raise ValueError('Official bundled CJK font does not match the verified source')
+    font={'family':'Noto Sans CJK SC','license':'SIL Open Font License 1.1',
+          'source':'verified upstream release','sha256':sha(font_path)}
     commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
     (base/'CUSTOM-BUILD.json').write_text(json.dumps({'repository':config['custom_repository'],'commit':commit,
         'upstream':config,'font':font,'gamelib_id':identity,

@@ -1,3 +1,5 @@
+当前 0.20.3 起使用官方 `settings_text_zh` 中文与 `mhgurecomp-cjk.otf` 字体。旧 `zh-CN.json` 和 `settings_zh.h` 仅保留历史参考，不再注入运行时。`generate_catalog.py` 自动验证官方翻译、占位符和字形覆盖；新增双屏译文记录在 `dual-screen-zh.json`。默认语言由上游按系统检测，已有 Chinese/中文配置都映射到语言编号 2，更新不覆盖用户 INI。
+
 # MHGU Recomp 简体中文维护分支
 
 这是移植版 F1／手柄设置菜单的源码汉化，包含设置标签、帮助、按键、错误提示与联机通知。

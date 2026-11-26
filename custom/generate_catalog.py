@@ -27,6 +27,12 @@ def help_keys():
     return result
 
 def generate(check=False):
+    # The official implementation now supplies Chinese and the matching font.
+    if 'static inline const char *settings_text_zh' in (ROOT/'runtime/settings_locale.h').read_text(encoding='utf-8'):
+        import subprocess, sys
+        subprocess.run([sys.executable,'-m','unittest','discover','-s','tests','-p','test_settings_locale.py'],cwd=ROOT,check=True)
+        print('Verified upstream Chinese catalog, formatting and bundled CJK glyph coverage.')
+        return
     translations=json.loads((ROOT/'custom/zh-CN.json').read_text(encoding='utf-8'))
     text=(ROOT/'runtime/settings_locale.h').read_text(encoding='utf-8')
     keys=[ast.literal_eval(re.findall(LITERAL,row)[0]) for row in

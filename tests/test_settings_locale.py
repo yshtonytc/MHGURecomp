@@ -115,10 +115,12 @@ class SettingsLocaleTest(unittest.TestCase):
                      "A", "B", "X", "Y", "L", "R", "ZL", "ZR",
                      "Default: ",
                      "MHGU Player"}  # (a language's own name, the Switch buttons' keybinds, a help line's prefix, the room name others see)
+        # Panel layout strings are INI values, not visible captions.
+        source = re.sub(r'"(?:[a-z0-9]+@\d+,\d+ ?)+"', '""', source)
         visible = {text for text in literals(source) if text and
                    (text[0].isupper() or " " in text) and any(c.isalpha() for c in text)}
-        self.assertFalse(visible - set(keys) - unchanged,
-                         f"Untranslated UI labels: {sorted(visible - set(keys) - unchanged)}")
+        self.assertFalse(visible - set(keys) - set(zh_keys) - unchanged,
+                         f"Untranslated UI labels: {sorted(visible - set(keys) - set(zh_keys) - unchanged)}")
 
         # the Game actions screen's labels (runtime/actions.c: an action's and a merged row's)
         actions = (ROOT / "runtime/actions.c").read_text(encoding="utf-8")
@@ -144,7 +146,7 @@ class SettingsLocaleTest(unittest.TestCase):
         table = (ROOT / "runtime/config.c").read_text(encoding="utf-8")
         messages += [literals(value)[0] for value in re.findall(r'#define ERR_\w+ +(' + LITERAL + ')', table)]
         self.assertTrue(messages)
-        self.assertFalse(set(messages) - set(keys))
+        self.assertFalse(set(messages) - set(zh_keys))
 
 
 if __name__ == "__main__":
