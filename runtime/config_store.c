@@ -31,6 +31,7 @@ static SDL_AtomicInt live_fsr_reactive;
 // [Graphics]
 static SDL_AtomicInt live_draw = {0x3f800000};
 static SDL_AtomicInt live_smooth;
+static SDL_AtomicInt live_aniso = {1};
 static SDL_AtomicInt live_kerning;
 static SDL_AtomicInt live_bold;
 // [HDR]
@@ -43,6 +44,7 @@ static SDL_AtomicInt live_hdr_saturation = {0x42480000}, live_hdr_highlight_satu
 // [Performance]
 static SDL_AtomicInt show_fps;
 static SDL_AtomicInt show_battery;
+static SDL_AtomicInt show_temperature;
 static SDL_AtomicInt live_fps;
 static SDL_AtomicInt live_vsync = {1};
 // [Controls]
@@ -52,9 +54,12 @@ static SDL_AtomicInt live_menu_confirm;
 static SDL_AtomicInt live_background = {1};
 static SDL_AtomicInt live_combo;
 static SDL_AtomicInt live_chat_key;
+static SDL_AtomicInt live_pause_key = {SDL_SCANCODE_PAUSE};
 static SDL_AtomicInt menu_chord = {1};
+static SDL_AtomicInt title_back_exit = {1};
 // [Mouse]
 static SDL_AtomicInt live_mouse, live_mouse_y, live_mouse_invert, live_mouse_smooth, live_mouse_capture;
+static SDL_AtomicInt live_menu_mouse = {1};
 // [Keybinds]
 static SDL_AtomicInt live_binds[BINDS][BIND_KEYS];
 // [Multiplayer]
@@ -62,6 +67,9 @@ static SDL_AtomicInt live_ldn_port;
 static SDL_AtomicInt live_sync_zako;
 static SDL_AtomicInt live_lagcomp;
 static SDL_AtomicInt live_ldn_direct;
+static SDL_AtomicInt live_friend_requests;
+static SDL_AtomicInt live_friend_online_notices;
+static SDL_AtomicInt live_friend_hub_notices;
 static SDL_AtomicInt live_share_urgent;
 // [Monster HP, Village Quests]
 static SDL_AtomicInt live_village;
@@ -72,10 +80,14 @@ static SDL_AtomicInt live_discord;
 static SDL_AtomicInt live_discord_hunter;
 // [Bonus Content]
 static SDL_AtomicInt live_bonus;
+// [Save Backups]
+static SDL_AtomicInt live_backups;
 // [Audio]
 static SDL_AtomicInt volume = {100};
 static SDL_AtomicInt mute_in_background;
 static SDL_AtomicInt audio_output;
+static SDL_SpinLock audio_device_lock;
+static char audio_device[sizeof saved.audio_device];
 // [Application]
 static SDL_AtomicInt confirm_exit = {1};
 static SDL_AtomicInt language = {0};
@@ -100,6 +112,7 @@ static void publish_live(const Config *c, bool all) {
     if (all || c->mouse_invert_y != saved.mouse_invert_y) SDL_SetAtomicInt(&live_mouse_invert, c->mouse_invert_y);
     if (all || c->mouse_smoothing != saved.mouse_smoothing) set_float(&live_mouse_smooth, c->mouse_smoothing);
     if (all || c->mouse_capture != saved.mouse_capture) SDL_SetAtomicInt(&live_mouse_capture, c->mouse_capture);
+    if (all || c->menu_mouse != saved.menu_mouse) SDL_SetAtomicInt(&live_menu_mouse, c->menu_mouse);
     if (all || c->draw_distance != saved.draw_distance) set_float(&live_draw, c->draw_distance);
     if (all || c->fxaa != saved.fxaa) SDL_SetAtomicInt(&live_fxaa, c->fxaa);
     if (all || c->msaa != saved.msaa) SDL_SetAtomicInt(&live_msaa, c->msaa);
@@ -111,8 +124,11 @@ static void publish_live(const Config *c, bool all) {
     if (all || c->combo_window != saved.combo_window) SDL_SetAtomicInt(&live_combo, c->combo_window);
     if (all || strcmp(c->chat_key, saved.chat_key))
         SDL_SetAtomicInt(&live_chat_key, *c->chat_key ? (int)SDL_GetScancodeFromName(c->chat_key) : 0);
+    if (all || strcmp(c->pause_key, saved.pause_key))
+        SDL_SetAtomicInt(&live_pause_key, *c->pause_key ? (int)SDL_GetScancodeFromName(c->pause_key) : 0);
     if (all || c->fxaa_mode != saved.fxaa_mode) SDL_SetAtomicInt(&live_fxaa_mode, c->fxaa_mode);
     if (all || c->smooth_gradients != saved.smooth_gradients) SDL_SetAtomicInt(&live_smooth, c->smooth_gradients);
+    if (all || c->aniso != saved.aniso) SDL_SetAtomicInt(&live_aniso, c->aniso);
     if (all || c->fix_kerning != saved.fix_kerning) SDL_SetAtomicInt(&live_kerning, c->fix_kerning);
     if (all || c->bold_text != saved.bold_text) SDL_SetAtomicInt(&live_bold, c->bold_text);
     if (all || c->hdr != saved.hdr) SDL_SetAtomicInt(&live_hdr, c->hdr);
@@ -159,7 +175,14 @@ static void publish_live(const Config *c, bool all) {
     if (all || c->sync_small_monsters != saved.sync_small_monsters) SDL_SetAtomicInt(&live_sync_zako, c->sync_small_monsters);
     if (all || c->lag_compensation != saved.lag_compensation) SDL_SetAtomicInt(&live_lagcomp, c->lag_compensation);
     if (all || c->ldn_direct != saved.ldn_direct) SDL_SetAtomicInt(&live_ldn_direct, c->ldn_direct);
+    if (all || c->ldn_friend_requests != saved.ldn_friend_requests) SDL_SetAtomicInt(&live_friend_requests, c->ldn_friend_requests);
+    if (all || c->ldn_friend_online_notices != saved.ldn_friend_online_notices)
+        SDL_SetAtomicInt(&live_friend_online_notices, c->ldn_friend_online_notices);
+    if (all || c->ldn_friend_hub_notices != saved.ldn_friend_hub_notices)
+        SDL_SetAtomicInt(&live_friend_hub_notices, c->ldn_friend_hub_notices);
     if (all || c->bonus_content != saved.bonus_content) SDL_SetAtomicInt(&live_bonus, c->bonus_content);
+    if (all || c->save_backups != saved.save_backups || c->backups_on != saved.backups_on)
+        SDL_SetAtomicInt(&live_backups, c->backups_on ? c->save_backups : 0);
 }
 void config_store_loaded(const Config *c) {
     publish_live(c, !have_saved);
@@ -168,10 +191,15 @@ void config_store_loaded(const Config *c) {
     SDL_SetAtomicInt(&volume, c->volume);
     SDL_SetAtomicInt(&mute_in_background, c->mute_in_background);
     SDL_SetAtomicInt(&audio_output, c->audio_output);
+    SDL_LockSpinlock(&audio_device_lock);
+    SDL_strlcpy(audio_device, c->audio_device, sizeof audio_device);
+    SDL_UnlockSpinlock(&audio_device_lock);
     SDL_SetAtomicInt(&confirm_exit, c->confirm_exit);
     SDL_SetAtomicInt(&show_fps, c->show_fps);
     SDL_SetAtomicInt(&menu_chord, c->menu_chord);
+    SDL_SetAtomicInt(&title_back_exit, c->title_back_exit);
     SDL_SetAtomicInt(&show_battery, c->show_battery);
+    SDL_SetAtomicInt(&show_temperature, c->show_temperature);
 }
 void config_runtime_init(const Config *effective) {
     startup = saved; runtime_ready = true; runtime_fsr = effective->fsr != 0;
@@ -192,6 +220,7 @@ float config_live_mouse_sensitivity_y(void) { return get_float(&live_mouse_y); }
 int config_live_mouse_invert_y(void) { return SDL_GetAtomicInt(&live_mouse_invert); }
 float config_live_mouse_smoothing(void) { return get_float(&live_mouse_smooth); }
 int config_live_mouse_capture(void) { return SDL_GetAtomicInt(&live_mouse_capture); }
+int config_live_menu_mouse(void) { return SDL_GetAtomicInt(&live_menu_mouse); }
 float config_live_draw_distance(void) { return get_float(&live_draw); }
 int config_live_fxaa(void) { return runtime_fsr ? 0 : SDL_GetAtomicInt(&live_fxaa); }
 int config_live_msaa(void) { return runtime_fsr ? 1 : SDL_GetAtomicInt(&live_msaa); }
@@ -200,10 +229,21 @@ int config_live_menu_confirm(void) { return SDL_GetAtomicInt(&live_menu_confirm)
 int config_live_face_buttons(void) { return SDL_GetAtomicInt(&live_face); }
 int config_live_kbm_prompts(void) { return SDL_GetAtomicInt(&live_kbm_prompts); }
 int config_live_background_input(void) { return SDL_GetAtomicInt(&live_background); }
+// [Dual Screen] (nvn/vulkan/second_display*.c): kept here so the settings menu needs nothing of the renderer
+static SDL_AtomicInt second_display_there, second_display_changed;
+int config_second_display_available(void) { return SDL_GetAtomicInt(&second_display_there); }
+void config_set_second_display_available(int yes) { SDL_SetAtomicInt(&second_display_there, yes != 0); }
+void config_second_display_request(void) { SDL_SetAtomicInt(&second_display_changed, 1); }
+int config_second_display_take_request(void) { return SDL_SetAtomicInt(&second_display_changed, 0); }
 int config_live_combo_window(void) { return SDL_GetAtomicInt(&live_combo); }
 int config_live_chat_key(void) { return SDL_GetAtomicInt(&live_chat_key); }
+int config_live_pause_key(void) { return SDL_GetAtomicInt(&live_pause_key); }
 int config_live_fxaa_mode(void) { return SDL_GetAtomicInt(&live_fxaa_mode); }
 int config_live_smooth_gradients(void) { return SDL_GetAtomicInt(&live_smooth); }
+int config_live_aniso(void) { return SDL_GetAtomicInt(&live_aniso); }
+void config_set_live_aniso(int af) {
+    SDL_SetAtomicInt(&live_aniso, af >= 16 ? 16 : af >= 8 ? 8 : af >= 4 ? 4 : af >= 2 ? 2 : af >= 1 ? 1 : 0);
+}
 int config_live_fix_kerning(void) { return SDL_GetAtomicInt(&live_kerning); }
 int config_live_bold_text(void) { return SDL_GetAtomicInt(&live_bold); }
 int config_live_hdr(void) { return SDL_GetAtomicInt(&live_hdr); }
@@ -231,7 +271,11 @@ int config_live_ldn_port(void) { return SDL_GetAtomicInt(&live_ldn_port); }
 int config_live_sync_small_monsters(void) { return SDL_GetAtomicInt(&live_sync_zako); }
 int config_live_lag_compensation(void) { return SDL_GetAtomicInt(&live_lagcomp); }
 int config_live_ldn_direct(void) { return SDL_GetAtomicInt(&live_ldn_direct); }
+int config_live_friend_requests(void) { return SDL_GetAtomicInt(&live_friend_requests); }
+int config_live_friend_online_notices(void) { return SDL_GetAtomicInt(&live_friend_online_notices); }
+int config_live_friend_hub_notices(void) { return SDL_GetAtomicInt(&live_friend_hub_notices); }
 int config_live_bonus_content(void) { return SDL_GetAtomicInt(&live_bonus); }
+int config_live_save_backups(void) { return SDL_GetAtomicInt(&live_backups); }
 void config_live_ldn_join(char *join, size_t size) {
     SDL_LockSpinlock(&live_ldn_lock);
     SDL_strlcpy(join, live_ldn_join, size);
@@ -277,10 +321,17 @@ float config_audio_gain(void) {
     return SDL_GetAtomicInt(&volume) / 100.0f;
 }
 int config_audio_output(void) { return SDL_GetAtomicInt(&audio_output); }
+void config_audio_device(char *name, size_t size) {
+    SDL_LockSpinlock(&audio_device_lock);
+    SDL_strlcpy(name, audio_device, size);
+    SDL_UnlockSpinlock(&audio_device_lock);
+}
 void config_window_focus(bool focused) { SDL_SetAtomicInt(&window_focused, focused); }
 bool config_confirm_exit(void) { return SDL_GetAtomicInt(&confirm_exit) != 0; }
 bool config_menu_chord(void) { return SDL_GetAtomicInt(&menu_chord) != 0; }
+bool config_title_back_exit(void) { return SDL_GetAtomicInt(&title_back_exit) != 0; }
 int config_show_battery(void) { return SDL_GetAtomicInt(&show_battery); }
+int config_show_temperature(void) { return SDL_GetAtomicInt(&show_temperature); }
 bool config_show_fps(void) { return SDL_GetAtomicInt(&show_fps) != 0; }
 bool config_restart_required(const Config *c) {
     if (!runtime_ready) return false;
@@ -314,7 +365,7 @@ bool config_validate(const Config *c, char *error, size_t size) {
 
 // What config_save writes: a setting of the table (setting) or a Quest<number> entry (setting NULL)
 typedef struct { const ConfigSetting *setting; const char *section; char key[64], value[256]; bool seen; } Entry;
-#define ENTRY_MAX (HP_QUESTS_MAX + 128)  // (every setting of g_settings, 67 now, and the quests set apart)
+#define ENTRY_MAX (HP_QUESTS_MAX + 256)  // (every setting of g_settings, 129 now, and the quests set apart)
 static void normalize(const char *s, char *out, size_t size) {
     size_t n = 0;
     for (; *s && n + 1 < size; s++)

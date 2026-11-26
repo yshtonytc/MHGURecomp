@@ -15,16 +15,34 @@
 #include <algorithm>
 #include <atomic>
 #include <cfloat>
+#include <climits>
 #include <cstdio>
-#include <cstring>
 #include <cstdlib>
+#include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <vector>
 
 #include "imgui.h"
-#include <SDL3/SDL.h>
 #include "imgui_internal.h"  // (the Forge window's Cancel: ImGui's active item, popups and nav window)
+// stb_truetype's own copy (ImGui's is static to imgui_draw.cpp): a font file is checked with it before ImGui gets it,
+// since ImGui stops the program on one it can't read (font_merge)
+namespace font_check {
+#define STBTT_STATIC
+#define STB_TRUETYPE_IMPLEMENTATION
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
+#endif
+#include "imstb_truetype.h"
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+#undef STB_TRUETYPE_IMPLEMENTATION
+#undef STBTT_STATIC
+}  // namespace font_check
 #ifndef MHGU_NULL_BACKEND
 #include "backends/imgui_impl_vulkan.h"
 #else  // (no renderer: no overlay)
@@ -34,10 +52,14 @@ static void ImGui_ImplVulkan_UpdateTexture(ImTextureData *) {}
 #endif
 
 #include "config.h"
+#ifdef __ANDROID__
+#include "android_files.h"
+#endif
 #include "hdr_stats.h"
 #include "forge.h"
 #include "menu_confirm.h"
 #include "overlay.h"
+#include "pause.h"
 #include "hle/chat.h"
 #include "settings_locale.h"
 #include "settings_panel.h"
@@ -52,6 +74,15 @@ void vk_unlock(void);
 SDL_Window *ui_window(void);
 bool shader_prewarm_progress(uint64_t *done, uint64_t *total);  // (runtime/nvn/vulkan/exec.c)
 bool romfs_mods_progress(int *done, int *total);                // (runtime/romfs.c)
+bool plat_exe_path(char *buf, size_t size);                     // (runtime/platform.h)
+const char *plat_utf8_path(const char *path, char *buf, size_t size);
+}
+
+// The fonts' paths here are the runtime's (a mod's folder, the program's, WINDIR): in the ANSI code page on Windows,
+// where SDL and ImGui open files by UTF-8 ones (a mod folder named in Chinese would not open)
+static std::string utf8_path(const char *path) {
+    char buf[1400];
+    return plat_utf8_path(path, buf, sizeof buf);
 }
 
 static std::atomic<bool> g_enabled, g_ready, g_open, g_wants_text;
@@ -289,22 +320,24 @@ static void apply_input(ImGuiIO &io) {
     }
     // the controller (as Forge maps it: A activates, B cancels, the left stick and the d-pad move)
     if (!g_open) pad = {};
-    // Apply only to settings. Forge retains its existing semantic A/B mapping.
+    // Confirm and Cancel where the host menus have them (menu_confirm.h: the game's MenuConfirm binding, else
+    // [Controls] MenuConfirm), in the settings and in Forge's menu alike, so that one button confirms in both (#417).
+    // Only Forge's menu: what plugins read (forge_input_*) stays the game's own A and B.
     bool settings = g_settings_open && !g_forge_over;  // (the settings have the controller)
-    if (settings) {
+    int owner = settings ? 1 : g_forge_open ? 2 : 0;
+    int policy = owner ? menu_confirm_policy_now() : MENU_CONFIRM_ORIGINAL;
+    if (owner) {
         int a = overlay_face_position(0), b = overlay_face_position(1);
         int confirm, cancel;
-        menu_confirm_buttons(menu_confirm_policy_now(), a, b, pad.a, pad.b, &confirm, &cancel);
+        menu_confirm_buttons(policy, a, b, pad.a, pad.b, &confirm, &cancel);
         pad.a = confirm; pad.b = cancel;
     }
     // A or B held from the menu that had the controller (the settings' row that opened Forge's menu, Cancel that
     // closed it) does nothing in the next one until let go: as the host reads the controller, not as the clear left it
     static int last_policy = -1, was_owner;
     static bool wait_release;
-    int owner = settings ? 1 : g_forge_open ? 2 : 0;
     if (owner && owner != was_owner) wait_release = true;
     was_owner = owner;
-    int policy = settings ? menu_confirm_policy_now() : MENU_CONFIRM_ORIGINAL;
     if (last_policy >= 0 && policy != last_policy) wait_release = true;
     last_policy = policy;
     if (wait_release) {
@@ -403,39 +436,194 @@ static void forge_style(ImGuiStyle &style) {  // Forge's own (source/forge/graph
     c[ImGuiCol_NavWindowingDimBg] = c[ImGuiCol_ModalWindowDimBg] = dim;
 }
 
-// The context, ImGui's own font and Forge's style at 12 px: from the start (overlay_init_early), Forge's settings
-// once its config is read (overlay_init). (Under g_frame_lock: the loading screen may be drawing.)
-static void merge_chinese_font(ImFontAtlas *atlas, float size) {
-    // Load installed fonts at runtime; never bundle a Microsoft font. The OFL
-    // Noto fallback also makes the language selector readable on non-CJK PCs.
-    ImFont *base = atlas->Fonts.Size ? atlas->Fonts.back() : nullptr;
-    static ImFont *merged_into = nullptr;
-    if (!base || base == merged_into) return;
-    std::vector<std::string> candidates;
-#ifdef _WIN32
-    if (const char *windows = std::getenv("WINDIR")) {
-        candidates.push_back(std::string(windows)+"/Fonts/msyh.ttc");
-        candidates.push_back(std::string(windows)+"/Fonts/msjh.ttc");
-    }
+// The font the menus draw with (ImGui's default), which the glyphs of a translation are merged into
+static ImFont *g_ui_font;
+static std::string g_ui_cjk;  // a mod's MHGU-CJK.ttf merged into g_ui_font ("": none)
+static bool g_ui_release;     // the release's mhgurecomp-cjk.otf was merged into g_ui_font
+static bool g_han_tried;      // the system's Chinese glyphs were merged into g_ui_font, or no font for them was found
+static bool g_hangul_tried;   // the Korean glyphs were merged into g_ui_font, or no font for them was found
+
+static bool can_read(const char *path) {  // (an absolute path; SDL: UTF-8 on Windows too)
+    SDL_IOStream *io = SDL_IOFromFile(utf8_path(path).c_str(), "rb");
+    if (io) SDL_CloseIO(io);
+    return io != NULL;
+}
+
+// A file beside the program (the release's fonts): the game's folder is not always the program's (MHGU_HOME, a game
+// folder given on the command line), so not a path relative to the current one. (Not on Android: the program there is
+// the system's app_process.)
+#ifndef __ANDROID__
+static std::string beside_program(const char *name) {
+    char exe[1024];
+    if (!plat_exe_path(exe, sizeof exe)) return name;
+    char *s = strrchr(exe, '/'), *s2 = strrchr(exe, '\\');
+    if (s2 > s) s = s2;
+    if (!s) return name;
+    *s = 0;
+    return std::string(exe) + "/" + name;
+}
 #endif
-    if (const char *folder = SDL_GetBasePath())
-        candidates.push_back(std::string(folder)+"localization/fonts/NotoSansSC-Regular.ttf");
-    for (const auto &path : candidates) {
-        FILE *test = std::fopen(path.c_str(),"rb");
-        if (!test) continue;
-        std::fclose(test);
-        ImFontConfig chinese;
-        chinese.MergeMode = true;
-        chinese.FontNo = 0;
-        if (atlas->AddFontFromFileTTF(path.c_str(),size,&chinese)) {
-            merged_into = base;
-            LOG("[locale] Chinese glyph font ready: %s\n",path.c_str());
-            break;
+
+// The release's glyphs beyond ImGui's font, beside the program: mhgurecomp-cjk.otf, a subset of Noto Sans CJK SC
+// (1.7 MB, made by tools/subset_cjk_font.py) with the translations' Chinese and Korean (runtime/settings_locale.h),
+// kana, and the arrows and shapes cheats and mods name buttons with. Merged from the start, the loading box included,
+// so the Language list's 中文 and 한국어 show in every language. On Android it is in the APK's assets (android/apk.mk):
+// the name alone, which font_file finds there. ("": not there)
+static std::string release_font(const char *name) {
+#ifdef __ANDROID__
+    SDL_IOStream *io = SDL_IOFromFile(name, "rb");  // (a relative path: the APK's assets)
+    if (io) SDL_CloseIO(io);
+    return io ? std::string(name) : std::string();
+#else
+    std::string p = beside_program(name);
+    return can_read(p.c_str()) ? p : std::string();
+#endif
+}
+
+// A font file's bytes (SDL_free them), or NULL. (SDL_LoadFile: a UTF-8 path on Windows too.) On Android a path that
+// is not a file is looked for in the APK's assets (the release's fonts); SDL would look there first for a relative
+// path, and a mod's font path may be relative to the app's folder, so stdio comes first.
+static void *font_file(const char *path, size_t *n) {
+#ifndef __ANDROID__
+    return SDL_LoadFile(utf8_path(path).c_str(), n);
+#else
+    void *data = nullptr;
+    if (FILE *f = fopen(path, "rb")) {
+        long size = fseek(f, 0, SEEK_END) == 0 ? ftell(f) : -1;
+        if (size > 0 && fseek(f, 0, SEEK_SET) == 0 && (data = SDL_malloc((size_t)size)) &&
+            fread(data, 1, (size_t)size, f) != (size_t)size) {
+            SDL_free(data);
+            data = nullptr;
         }
+        if (data) *n = (size_t)size;
+        fclose(f);
+    }
+    if (!data) data = SDL_LoadFile(path, n);
+    return data;
+#endif
+}
+
+// Merges a font's glyphs into the menus' font (font_no: the face in a .ttc). Read here rather than by ImGui (which
+// reads only files, not the APK's assets), and checked with stb_truetype first: ImGui stops the program on a font it
+// can't read (an assert, not an error), and some can't be: Android 13 and later have Noto Sans CJK as a variable font
+// (CFF2), which stb_truetype does not read, and a mod's MHGU-CJK.ttf may be anything.
+static bool font_merge(ImFont *into, const char *path, int font_no = 0) {
+    size_t n = 0;
+    void *file = font_file(path, &n);
+    if (!file) return false;
+    const unsigned char *data = (const unsigned char *)file;
+    int offset = n >= 12 ? font_check::stbtt_GetFontOffsetForIndex(data, font_no) : -1;
+    font_check::stbtt_fontinfo info;
+    bool readable = offset >= 0 && (size_t)offset < n && font_check::stbtt_InitFont(&info, data, offset);
+    if (!readable) {
+        LOG("[overlay] %s (face %d): not a font ImGui can read (a variable / CFF2 one?)\n", path, font_no);
+        SDL_free(file);
+        return false;
+    }
+    void *owned = IM_ALLOC(n);  // (the atlas keeps the file for the glyphs it loads later, and frees it with IM_FREE)
+    memcpy(owned, file, n);
+    SDL_free(file);
+    ImFontConfig cfg;
+    cfg.MergeMode = true;
+    cfg.DstFont = into;
+    cfg.FontNo = font_no;
+    cfg.SizePixels = g_font_size;  // (the same size, so the menu's rows keep the height they have in English)
+    return ImGui::GetIO().Fonts->AddFontFromMemoryTTF(owned, (int)n, g_font_size, &cfg) != nullptr;
+}
+
+struct FontFile {
+    std::string path;
+    int font_no;  // (Noto Sans CJK's .ttc: 0 Japanese, 1 Korean, 2 Simplified Chinese)
+};
+
+// A font the system has, the first of these that can be read
+static FontFile system_font(const std::vector<FontFile> &files) {
+    for (const FontFile &f : files)
+        if (can_read(f.path.c_str())) return f;
+    return {};
+}
+
+#ifdef _WIN32
+static std::string windows_font(const char *name) {
+    const char *windir = getenv("WINDIR");
+    return std::string(windir ? windir : "C:\\Windows") + "\\Fonts\\" + name;
+}
+#endif
+
+// The Chinese menu's glyphs when the release's font is not there (a build folder made without it): the system's own
+// Chinese font (Microsoft YaHei on Windows, Noto Sans CJK on Android and most Linux desktops; Android 13's and later
+// is a variable font ImGui can't read, which font_merge leaves out).
+static FontFile han_font_find(void) {
+    return system_font({
+#ifdef _WIN32
+        {windows_font("msyh.ttc"), 0}, {windows_font("msyh.ttf"), 0}, {windows_font("simsun.ttc"), 0},
+#elif defined(__ANDROID__)
+        {"/system/fonts/NotoSansCJK-Regular.ttc", 2}, {"/system/fonts/NotoSansSC-Regular.otf", 0},
+        {"/system/fonts/DroidSansFallback.ttf", 0},
+#else
+        {"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 2},  // (Debian, Ubuntu)
+        {"/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", 2},       // (Arch)
+        {"/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc", 2},
+        {"/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc", 0},
+        {"/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 0},
+#endif
+    });
+}
+
+// The Korean menu's glyphs when the release's font is not there (as for Chinese): the system's own Korean font (Malgun
+// Gothic on Windows, Noto Sans CJK on Android and most Linux desktops, else Nanum Gothic).
+static FontFile hangul_font_find(void) {
+    return system_font({
+#ifdef _WIN32
+        {windows_font("malgun.ttf"), 0},
+#elif defined(__ANDROID__)
+        {"/system/fonts/NotoSansCJK-Regular.ttc", 1}, {"/system/fonts/NotoSansKR-Regular.otf", 0},
+        {"/system/fonts/NanumGothic.ttf", 0},
+#else
+        {"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 1},  // (Debian, Ubuntu)
+        {"/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", 1},       // (Arch)
+        {"/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc", 1},
+        {"/usr/share/fonts/truetype/nanum/NanumGothic.ttf", 0}, {"/usr/share/fonts/nanum/NanumGothic.ttf", 0},
+        {"/usr/share/fonts/truetype/noto/NotoSansKR-Regular.ttf", 0},
+#endif
+    });
+}
+
+// A system font for a translation, merged the first time the menu is in that language (before a NewFrame, under
+// g_frame_lock), not at the start: a system's font is large (Malgun Gothic is 13 MB in memory), and ImGui loads only
+// the glyphs that are drawn. Not when the menus' font has the glyphs already (the release's, a mod's MHGU-CJK.ttf).
+static void language_font_merge(int language) {
+    if (!g_ui_font) return;
+    struct Script {
+        int language;
+        bool *tried;
+        ImWchar probe;
+        const char *name;
+        FontFile (*find)(void);
+    };
+    static const Script scripts[] = {
+        {2, &g_han_tried, 0x8BBE, "Chinese", han_font_find},       // (设)
+        {3, &g_hangul_tried, 0xD55C, "Korean", hangul_font_find},  // (한)
+    };
+    for (const Script &s : scripts) {
+        if (language != s.language || *s.tried) continue;
+        *s.tried = true;  // (once: a font that does not load is not read again every frame)
+        if (g_ui_font->IsGlyphInFont(s.probe)) return;
+        FontFile f = s.find();
+        if (f.path.empty()) {
+            LOG("[overlay] No %s font found (beside the program, or the system's): %s shows as boxes\n", s.name, s.name);
+            return;
+        }
+        bool ok = font_merge(g_ui_font, f.path.c_str(), f.font_no);
+        LOG("[overlay] %s glyphs from %s%s\n", s.name, f.path.c_str(), ok ? "" : ": the file did not load");
     }
 }
 
-static void context_init(const char *font_path, float font_size) {
+// The context, ImGui's own font and Forge's style at 12 px: from the start (overlay_init_early), Forge's settings
+// once its config is read (overlay_init). (Under g_frame_lock: the loading screen may be drawing.)
+// cjk_font: a mod's Chinese font (NULL: none), merged into the menus' font ahead of the release's, which still gives
+// what the mod's has not (Hangul, symbols). Returns whether font_path loaded.
+static bool context_init(const char *font_path, const char *cjk_font, float font_size) {
     if (!ImGui::GetCurrentContext()) {
         IMGUI_CHECKVERSION();
         ImGui::CreateContext();
@@ -449,58 +637,85 @@ static void context_init(const char *font_path, float font_size) {
     g_font_size = font_size > 0 ? font_size : 12.0f;
     ImFontConfig cfg;
     cfg.SizePixels = g_font_size;
-    ImFont *font = font_path ? io.Fonts->AddFontFromFileTTF(font_path, g_font_size, &cfg) : nullptr;
+    std::string mod = cjk_font ? cjk_font : "";
+    ImFont *font = font_path ? io.Fonts->AddFontFromFileTTF(utf8_path(font_path).c_str(), g_font_size, &cfg) : nullptr;
     if (font) io.FontDefault = font;
-    else if (io.Fonts->Fonts.Size == 0) io.Fonts->AddFontDefaultVector(&cfg);
-    merge_chinese_font(io.Fonts,g_font_size);
+    // (ImGui's own; again when a mod's Chinese font comes after another was merged: the first source that has a glyph
+    // is the one drawn, so the mod's goes into a font of its own, ahead of the release's)
+    else if (io.Fonts->Fonts.Size == 0 || (!mod.empty() && g_ui_cjk != mod && (g_ui_release || !g_ui_cjk.empty())))
+        io.FontDefault = io.Fonts->AddFontDefaultVector(&cfg);
+    ImFont *ui = io.FontDefault ? io.FontDefault : io.Fonts->Fonts[0];
+    if (ui != g_ui_font) {  // (a new font for the menus: the translations' glyphs merge into it again)
+        g_ui_cjk.clear();
+        g_ui_release = g_han_tried = g_hangul_tried = false;
+    }
+    g_ui_font = ui;
+    if (!mod.empty() && g_ui_cjk.empty()) {
+        if (font_merge(ui, mod.c_str())) g_ui_cjk = mod;
+        else LOG("[overlay] Chinese glyphs: %s did not load\n", mod.c_str());
+    }
+    std::string release = g_ui_release ? std::string() : release_font("mhgurecomp-cjk.otf");
+    if (!release.empty()) {
+        if (font_merge(ui, release.c_str())) g_ui_release = true;
+        else LOG("[overlay] CJK glyphs: %s did not load\n", release.c_str());
+    }
     ImGuiStyle style;
     ImGui::StyleColorsDark(&style);
     forge_style(style);
     style.FontSizeBase = g_font_size;
     ImGui::GetStyle() = g_base_style = style;
     g_scale = 0;  // (frame_setup scales it again)
+    return font != nullptr;
 }
 
 void overlay_init_early(void) {
 #ifndef MHGU_NULL_BACKEND
     std::lock_guard<std::mutex> l(g_frame_lock);
-    context_init(nullptr, 0);
+    context_init(nullptr, nullptr, 0);
     g_enabled = true;
 #endif
 }
 
-void overlay_init(const char *font_path, float font_size, int menu_key) {
+void overlay_init(const char *font_path, const char *cjk_font, float font_size, int menu_key) {
 #ifdef MHGU_NULL_BACKEND
     return;
 #endif
     std::lock_guard<std::mutex> l(g_frame_lock);
-    context_init(font_path, font_size);
-    bool font = font_path && ImGui::GetIO().FontDefault;
+    bool font = context_init(font_path, cjk_font, font_size);
     g_menu_key = menu_key;
     g_enabled = true;
-    LOG("[forge] ImGui %s overlay: %s opens the menu (font %s, %.0f px)\n", IMGUI_VERSION,
-        SDL_GetScancodeName((SDL_Scancode)menu_key), font ? font_path : "ImGui's", g_font_size);
+    LOG("[forge] ImGui %s overlay: %s opens the menu (font %s, %.0f px; mod's Chinese glyphs %s; CJK glyphs %s)\n",
+        IMGUI_VERSION, SDL_GetScancodeName((SDL_Scancode)menu_key), font ? font_path : "ImGui's", g_font_size,
+        g_ui_cjk.empty() ? "none" : g_ui_cjk.c_str(), g_ui_release ? "the release's" : "none");
 }
 
 // ------------------------------------------------------------------ notices (any thread -> game thread)
-// A few seconds at the top of the screen, menus open or not (runtime/net/ldn.c: the hub server's failures). Drawn on
-// the foreground draw list: over every window, taking no input or focus.
+// A few seconds at the top of the screen, menus open or not (runtime/net/ldn.c: the hub server's failures, friends).
+// Drawn on the foreground draw list: over every window, taking no input or focus. They queue: one at a time, each its
+// NOTICE_NS from when it is first drawn (a loading screen doesn't use its time up), the same one not twice in the queue,
+// at most NOTICES_MAX waiting (the oldest waiting one goes).
+struct Notice {
+    std::string title, text;
+    uint64_t shown;  // when it was first drawn (SDL_GetTicksNS); 0: not yet
+};
 static std::mutex g_notice_lock;
-static std::string g_notice_title, g_notice_text;
-static uint64_t g_notice_ns;  // when it came (SDL_GetTicksNS); 0: none
+static std::deque<Notice> g_notices;
 static const uint64_t NOTICE_NS = 7000000000ull;
+static const size_t NOTICES_MAX = 6;
 
 void overlay_notice(const char *title, const char *text) {
     std::lock_guard<std::mutex> l(g_notice_lock);
-    g_notice_title = title ? title : "";
-    g_notice_text = text ? text : "";
-    g_notice_ns = std::max<uint64_t>(SDL_GetTicksNS(), 1);
+    Notice n{title ? title : "", text ? text : "", 0};
+    for (const Notice &q : g_notices)
+        if (q.title == n.title && q.text == n.text) return;
+    if (g_notices.size() >= NOTICES_MAX) g_notices.erase(g_notices.begin() + 1);  // (not the one on screen)
+    g_notices.push_back(std::move(n));
 }
 
 static bool notice_due(uint64_t now) {
     std::lock_guard<std::mutex> l(g_notice_lock);
-    if (g_notice_ns && now - g_notice_ns >= NOTICE_NS) g_notice_ns = 0;
-    return g_notice_ns != 0;
+    if (!g_notices.empty() && g_notices.front().shown && now - g_notices.front().shown >= NOTICE_NS) g_notices.pop_front();
+    return !g_notices.empty();
 }
 
 static void draw_notice(uint64_t now, float scale) {
@@ -508,8 +723,10 @@ static void draw_notice(uint64_t now, float scale) {
     uint64_t at;
     {
         std::lock_guard<std::mutex> l(g_notice_lock);
-        if (!g_notice_ns) return;
-        title = g_notice_title, text = g_notice_text, at = g_notice_ns;
+        if (g_notices.empty()) return;
+        Notice &n = g_notices.front();
+        if (!n.shown) n.shown = std::max<uint64_t>(now, 1);
+        title = n.title, text = n.text, at = n.shown;
     }
     float age = (now - at) / 1e9f, alpha = std::clamp(std::min(age / .15f, (NOTICE_NS / 1e9f - age) / .5f), 0.f, 1.f);
     auto color = [alpha](float r, float g, float b, float a) {
@@ -587,9 +804,22 @@ static bool battery_text(uint64_t now, char *out, size_t size) {
     return true;
 }
 
+#ifdef __ANDROID__
+// The device's temperature ([Performance] ShowTemperature), "36°C": the battery's (runtime/platform/android.c), the
+// number and unit only. false while it isn't known.
+static bool temperature_text(int unit, char *out, size_t size) {
+    int tenths = android_temperature();
+    if (tenths == INT_MIN) return false;
+    if (unit == TEMP_FAHRENHEIT) snprintf(out, size, "%.0f\xC2\xB0" "F", tenths * 0.18f + 32);
+    else snprintf(out, size, "%.0f\xC2\xB0" "C", tenths * 0.1f);
+    return true;
+}
+#endif
+
 // The frame rate ([Performance] ShowFPS): frames the game presented, counted over half a second. An ImGui window of
 // its own, so it can be dragged while the settings menu (which gets the mouse) is open; ImGui keeps where it was put in
-// forge_imgui.ini. With ShowBattery = WithFPS the battery's charge is in it; ByItself: a window of its own.
+// forge_imgui.ini. With ShowBattery = WithFPS the battery's charge is in it; ByItself: a window of its own. Android's
+// ShowTemperature: a line under the frame rate, or a window of its own with the frame rate off.
 static void draw_fps(uint64_t now) {
     static uint64_t t0, f0;
     static float fps, ms;
@@ -601,10 +831,14 @@ static void draw_fps(uint64_t now) {
         ms = n ? (now - t0) / 1e6f / n : 0;
         t0 = now, f0 = frames;
     }
-#ifdef __ANDROID__  // (a phone's battery: the Android tab's setting)
-    int battery = config_show_battery();
+#ifdef __ANDROID__  // (a phone's battery and temperature: Android-only settings)
+    int battery = config_show_battery(), unit = config_show_temperature();
+    char temps[16];
+    bool have_temps = unit != TEMP_OFF && temperature_text(unit, temps, sizeof temps);
 #else
     int battery = BATTERY_OFF;
+    char temps[1] = "";
+    bool have_temps = false;
 #endif
     char charge[32];
     bool have_charge = battery != BATTERY_OFF && battery_text(now, charge, sizeof charge);
@@ -616,7 +850,13 @@ static void draw_fps(uint64_t now) {
         if (ImGui::Begin("FPS##counter", nullptr, flags)) {
             if (have_charge && battery == BATTERY_WITH_FPS) ImGui::Text("%.0f FPS  %.1f ms  %s", fps, ms, charge);
             else ImGui::Text("%.0f FPS  %.1f ms", fps, ms);
+            if (have_temps) ImGui::TextUnformatted(temps);
         }
+        ImGui::End();
+    } else if (have_temps) {
+        ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowBgAlpha(0.6f);
+        if (ImGui::Begin("Temperature##counter", nullptr, flags)) ImGui::TextUnformatted(temps);
         ImGui::End();
     }
     if (have_charge && battery == BATTERY_ALONE) {
@@ -710,6 +950,23 @@ static float loading_alpha(uint64_t now) {  // (the game's frames)
     float a = 1 - (now - g_loading_fade) / (float)LOADING_FADE_NS;
     if (a <= 0) g_loading_over = true;
     return std::max(a, 0.0f);
+}
+
+// Pause/Suspend (runtime/pause.h): the held picture dimmed, PAUSED in the middle. Behind every window (the settings
+// menu, Forge's), which stay usable meanwhile.
+static void draw_paused() {
+    ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImDrawList *dl = ImGui::GetBackgroundDrawList();
+    ImVec2 p0 = vp->Pos, p1(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y);
+    dl->AddRectFilled(p0, p1, IM_COL32(0, 0, 0, 140));
+    const char *text = settings_text(config_language(), "PAUSED");
+    ImFont *font = ImGui::GetFont();
+    float size = std::max(vp->Size.y * .075f, 24.f);  // (a fixed share of the window's height)
+    ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0, text);
+    ImVec2 at(p0.x + (vp->Size.x - ts.x) * .5f, p0.y + (vp->Size.y - ts.y) * .5f);
+    float sh = std::max(size * .05f, 1.f);
+    dl->AddText(font, size, ImVec2(at.x + sh, at.y + sh), IM_COL32(0, 0, 0, 200), text);
+    dl->AddText(font, size, at, IM_COL32(255, 255, 255, 255), text);
 }
 
 static void draw_loading(uint64_t now, float scale, float alpha) {
@@ -824,7 +1081,7 @@ void overlay_frame(void *cpu) {
     ImGuiIO &io = ImGui::GetIO();
     g_wants_text = open && io.WantTextInput;  // (as of the last frame; the window side reads it: runtime/textinput.c)
 #ifdef __ANDROID__
-    bool fps = config_show_fps() || config_show_battery() == BATTERY_ALONE;
+    bool fps = config_show_fps() || config_show_battery() == BATTERY_ALONE || config_show_temperature() != TEMP_OFF;
 #else
     bool fps = config_show_fps();
 #endif
@@ -834,7 +1091,8 @@ void overlay_frame(void *cpu) {
 #else
     bool hdr_stats = false;
 #endif
-    if (!open && !free_render && !notice && !chat && !fps && !loading && !hdr_stats) {  // (nothing to draw)
+    bool paused = pause_held();
+    if (!open && !free_render && !notice && !chat && !fps && !loading && !hdr_stats && !paused) {  // (nothing to draw)
         std::lock_guard<std::mutex> l(g_snap_lock);
         if (g_snap.Valid) snap_clear();
         apply_input(io);  // (keep the queue short)
@@ -843,6 +1101,7 @@ void overlay_frame(void *cpu) {
     }
     uint32_t w = g_disp_w, h = g_disp_h;
     if (!w || !h) return;
+    language_font_merge(settings_panel_language());  // (the menu's language as picked, before Save too)
     float scale = frame_setup(io, w, h, now);
     apply_input(io);
 
@@ -900,6 +1159,7 @@ void overlay_frame(void *cpu) {
         if (!keep) set_open(false);
     }
     forge_imgui_run(cpu, FORGE_IMGUI_FREE_RENDER);
+    if (paused) draw_paused();
     if (notice) draw_notice(now, scale);
     if (chat) draw_chat(line, now, scale);
     if (fps) draw_fps(now);
@@ -990,6 +1250,7 @@ static bool backend_ready(const OverlayTarget *t) {
 // A frame of its own with only the loading indicator, drawn at once (holding the Vulkan lock and g_frame_lock)
 static void loading_frame(VkCommandBuffer cb, const OverlayTarget *t) {
     uint64_t now = SDL_GetTicksNS();
+    language_font_merge(config_language());
     float scale = frame_setup(ImGui::GetIO(), t->width, t->height, now);
     ImGui_ImplVulkan_NewFrame();
     ImGui::NewFrame();
@@ -1007,6 +1268,109 @@ static void loading_frame(VkCommandBuffer cb, const OverlayTarget *t) {
 }
 #endif
 
+// ------------------------------------------------------------------ plugins' own textures (Forge 2.0.0)
+// forge_graphics_registerTexture(texture, view): an NVNtexture (the plugin's or the game's) for ImGui::Image. Forge
+// puts it in its NVN backend's texture pool and hands out the texture handle. Here the plugin gets a tag (USER_TEX_TAG
+// | slot), the texture's Vulkan view is looked up each frame the game presents (device.c, outside the render pass:
+// the image is made current there, uploaded or resolved), and the overlay's draw turns the tag into an ImGui Vulkan
+// descriptor set for that view (a new one when the view changes; the old set is freed frames later, as are the sets
+// of unregistered textures). The view is read at registration, as Forge's pool does. A tag with no view this frame
+// (a texture finalized before it was unregistered) draws nothing.
+#define USER_TEX_MAX 256
+#define USER_TEX_TAG 0x7E57000000000000ull
+#define USER_TEX_TAG_MASK 0xFFFF000000000000ull
+#define USER_TEX_FREE_AFTER 10  // presents (the backend's ImageCount is 8)
+struct UserTex {
+    bool live;
+    uint32_t tex;               // guest NVNtexture *
+    bool has_view;
+    uint8_t view[0x28];         // its NVNtextureView, as registered
+    VkImageView vk;             // this frame's (overlay_user_textures_prepare)
+    VkImageView set_view;       // what set was made for
+    VkDescriptorSet set;
+};
+static std::mutex g_user_tex_lock;
+static UserTex g_user_tex[USER_TEX_MAX];
+struct DeadSet { VkDescriptorSet set; uint64_t at; };
+static std::vector<DeadSet> g_dead_sets;  // (under g_user_tex_lock)
+static uint64_t g_draws;                   // overlay_draw calls
+
+extern "C" uint64_t overlay_user_texture_add(uint32_t tex, const void *view) {
+    std::lock_guard<std::mutex> l(g_user_tex_lock);
+    for (int i = 0; i < USER_TEX_MAX; i++) {
+        UserTex &u = g_user_tex[i];
+        if (u.live) continue;
+        u = UserTex{};
+        u.live = true;
+        u.tex = tex;
+        u.has_view = view != nullptr;
+        if (view) memcpy(u.view, view, sizeof u.view);
+        return USER_TEX_TAG | (uint64_t)(i + 1);
+    }
+    return 0;
+}
+
+static UserTex *user_tex_of(uint64_t id) {
+    if ((id & USER_TEX_TAG_MASK) != USER_TEX_TAG) return nullptr;
+    uint64_t i = (id & ~USER_TEX_TAG_MASK) - 1;
+    return i < USER_TEX_MAX && g_user_tex[i].live ? &g_user_tex[i] : nullptr;
+}
+
+extern "C" bool overlay_user_texture_remove(uint64_t id) {
+    std::lock_guard<std::mutex> l(g_user_tex_lock);
+    UserTex *u = user_tex_of(id);
+    if (!u) return false;
+    u->live = false;
+    u->vk = VK_NULL_HANDLE;
+    if (u->set) g_dead_sets.push_back({u->set, g_draws});
+    u->set = VK_NULL_HANDLE;
+    return true;
+}
+
+extern "C" void overlay_user_textures_prepare(VkImageView (*view_of)(uint32_t tex, const void *view)) {
+    std::lock_guard<std::mutex> l(g_user_tex_lock);
+    for (UserTex &u : g_user_tex)
+        if (u.live) u.vk = view_of(u.tex, u.has_view ? u.view : nullptr);
+}
+
+#ifndef MHGU_NULL_BACKEND
+// (render thread, under the Vulkan lock and g_user_tex_lock) Sets for this frame's views; sets nothing draws any more
+// freed once the frames that may have drawn them are done
+static void user_tex_sets(void) {
+    g_draws++;
+    for (UserTex &u : g_user_tex) {
+        if (!u.live || !u.vk || u.vk == u.set_view) continue;
+        if (u.set) g_dead_sets.push_back({u.set, g_draws});
+        u.set = ImGui_ImplVulkan_AddTexture(VK_NULL_HANDLE, u.vk, VK_IMAGE_LAYOUT_GENERAL);  // (the renderer's images stay GENERAL)
+        u.set_view = u.set ? u.vk : VK_NULL_HANDLE;
+    }
+    size_t k = 0;
+    for (DeadSet &d : g_dead_sets) {
+        if (g_draws - d.at > USER_TEX_FREE_AFTER) ImGui_ImplVulkan_RemoveTexture(d.set);
+        else g_dead_sets[k++] = d;
+    }
+    g_dead_sets.resize(k);
+}
+
+// g_snap drawn with the plugins' texture tags as their sets (put back after: the copy may be drawn again)
+static void draw_snap(VkCommandBuffer cb) {
+    std::lock_guard<std::mutex> lt(g_user_tex_lock);
+    user_tex_sets();
+    struct Patched { ImDrawCmd *cmd; ImTextureID id; ImVec4 clip; };
+    std::vector<Patched> patched;
+    for (ImDrawList *list : g_snap.CmdLists)
+        for (ImDrawCmd &cmd : list->CmdBuffer) {
+            if (cmd.UserCallback || cmd.TexRef._TexData || (cmd.TexRef._TexID & USER_TEX_TAG_MASK) != USER_TEX_TAG) continue;
+            patched.push_back({&cmd, cmd.TexRef._TexID, cmd.ClipRect});
+            UserTex *u = user_tex_of(cmd.TexRef._TexID);
+            if (u && u->set && u->vk) cmd.TexRef._TexID = (ImTextureID)(uintptr_t)u->set;
+            else cmd.ClipRect = ImVec4(0, 0, 0, 0);  // (the backend skips an empty clip before it binds anything)
+        }
+    ImGui_ImplVulkan_RenderDrawData(&g_snap, cb);
+    for (Patched &p : patched) p.cmd->TexRef._TexID = p.id, p.cmd->ClipRect = p.clip;
+}
+#endif
+
 // (render thread) The game's overlay frame; before the game's thread has made one (its first frame or two), the
 // loading indicator as the loading screen draws it, so it doesn't blink out.
 void overlay_draw(VkCommandBuffer cb, const OverlayTarget *t) {
@@ -1020,7 +1384,7 @@ void overlay_draw(VkCommandBuffer cb, const OverlayTarget *t) {
         }
     }
     std::lock_guard<std::mutex> l(g_snap_lock);
-    if (g_snap.Valid && g_snap.CmdListsCount) ImGui_ImplVulkan_RenderDrawData(&g_snap, cb);
+    if (g_snap.Valid && g_snap.CmdListsCount) draw_snap(cb);
 #endif
 }
 

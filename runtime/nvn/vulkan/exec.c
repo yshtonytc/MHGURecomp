@@ -28,6 +28,9 @@
 #include "hdr.h"
 #include "shaders.h"
 #include "vk.h"
+#ifdef MHGU_DUAL_SCREEN
+#include "bottom_hud.h"
+#endif
 
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_snapshots;
 // (MHGU_VK_STATS) time spent: translating command lists, waiting for the GPU, guest memory copied per submission
@@ -95,9 +98,42 @@ static VkFence seq_fence_take(uint64_t seq) {
     return f;
 }
 
+// No status polls (g_vk.no_poll: Turnip on Android's KGSL, issue #444). There, before Mesa 26.3 (e984ef29; forks such
+// as PurpleVK 26.3.0-devel still lack it), a check with no timeout waits until the GPU has finished everything
+// submitted: vk_collect_dead's check after each submission made the CPU and GPU take turns (35 fps where 60 hold with
+// the fix). vkGetSemaphoreCounterValue and vkGetFenceStatus both do it, and so does vkWaitSemaphores (the emulated
+// timeline checks each pending point before it waits). So: a fence per submission, and fence_thread waits for them in
+// order (a wait with a timeout waits for that fence only) and moves fence_done along; vk_completed_seq only reads it.
+static pthread_cond_t fence_cond = PTHREAD_COND_INITIALIZER;  // (no_poll) a new submission for fence_thread
+static bool fence_thread_on;
+
+static void *fence_thread(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&fence_lock);
+    for (;;) {
+        while (fence_done >= fence_last) pthread_cond_wait(&fence_cond, &fence_lock);
+        uint64_t seq = fence_done + 1;
+        int i = (int)(seq % SEQ_FENCES);
+        VkFence f = seq_fence[i].fence;
+        seq_fence[i].waiters++;
+        pthread_mutex_unlock(&fence_lock);
+        // (exit in progress: never reach the driver; the 1 s timeout brings the check round again)
+        VkResult r = vk_exiting() ? VK_TIMEOUT : vkWaitForFences(g_vk.dev, 1, &f, VK_TRUE, 1000000000ull);
+        pthread_mutex_lock(&fence_lock);
+        seq_fence[i].waiters--;
+        if (r == VK_SUCCESS && fence_done < seq) fence_done = seq;
+        if ((r != VK_SUCCESS && r != VK_TIMEOUT) || vk_exiting()) {
+            if (!vk_exiting()) LOG("[vk] fence thread: vkWaitForFences %d (device lost?): stops\n", r);
+            pthread_mutex_unlock(&fence_lock);
+            return NULL;
+        }
+    }
+}
+
 static uint64_t fence_completed(void) {
     pthread_mutex_lock(&fence_lock);
-    while (fence_done < fence_last && vkGetFenceStatus(g_vk.dev, seq_fence[(fence_done + 1) % SEQ_FENCES].fence) == VK_SUCCESS)
+    while (!g_vk.no_poll && fence_done < fence_last &&
+           vkGetFenceStatus(g_vk.dev, seq_fence[(fence_done + 1) % SEQ_FENCES].fence) == VK_SUCCESS)
         fence_done++;
     uint64_t v = fence_done;
     pthread_mutex_unlock(&fence_lock);
@@ -171,11 +207,14 @@ static void begin_cb(VkCommandBuffer *cb, bool *begun) {
     *begun = true;
 }
 
+static void gp_submission(int kind);  // (debug) MHGU_CONTROL "gpuprof": where each submission begins and ends
+
 VkCommandBuffer vk_cmd(void) {
     Sub *s = sub();
     if (!s->main_begun) {
         begin_cb(&s->main, &s->main_begun);
         ss_forget();
+        gp_submission(1);
     }
     return s->main;
 }
@@ -210,6 +249,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal) {
         cbs[n++] = s->upload;
     }
     vk_cmd();  // (an empty main buffer still carries the semaphores)
+    gp_submission(signal ? 3 : 2);
     VK_CHECK(vkEndCommandBuffer(s->main));
     cbs[n++] = s->main;
     VkSemaphore sig[2] = {g_vk.timeline, signal};
@@ -230,9 +270,19 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal) {
         si.pSignalSemaphores = &signal;
     }
     VK_CHECK(vkQueueSubmit(g_vk.queue, 1, &si, fence));
+    gp_submission(signal ? 5 : 4);
     if (g_vk.fences) {
         pthread_mutex_lock(&fence_lock);
         fence_last = submit_seq + 1;
+        if (g_vk.no_poll) {
+            if (!fence_thread_on) {
+                pthread_t th;
+                fence_thread_on = pthread_create(&th, NULL, fence_thread, NULL) == 0;
+                if (fence_thread_on) pthread_detach(th);
+                else FATAL("[vk] the fence thread could not be started\n");
+            }
+            pthread_cond_signal(&fence_cond);
+        }
         pthread_mutex_unlock(&fence_lock);
     }
     pthread_mutex_lock(&seq_lock);
@@ -412,6 +462,55 @@ static VkSpan guest_copy_vertex(uint64_t addr, uint64_t size) {
 }
 
 static bool guest_range_ok(uint64_t addr, uint64_t size) { return addr && addr < GUEST_SPACE && size <= GUEST_SPACE - addr; }
+
+// ---- (debug) MHGU_LATE_WRITES=1: the vertices a small draw reads (immediate quads: at most 512 bytes), as copied for
+// it, compared with guest memory again when the frame is presented (vk_latewrite_frame). A difference means the game
+// wrote them after the copy: a Switch GPU reads them when it runs the commands, later than this submit-time copy.
+// (The Deck's shadow cascades cleared to 0 in a rectangle: is the clear quad's data copied before the game wrote it?)
+#define LW_TAB 4096
+static struct { uint64_t addr, vs; uint32_t len, stride, count; float vp_y; uint8_t depth_only, snap[512]; } lw[LW_TAB];
+static uint32_t lw_n, lw_frames, lw_checked, lw_changed, lw_logged, lw_quads;
+static bool latewrite_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("MHGU_LATE_WRITES") && atoi(getenv("MHGU_LATE_WRITES"));
+    return on;
+}
+static void latewrite_note(uint64_t addr, const void *copied, uint32_t len, uint32_t stride, uint32_t count, uint64_t vs,
+                           bool depth_only, float vp_y) {
+    if (!len || len > sizeof lw[0].snap || lw_n >= LW_TAB || !guest_range_ok(addr, len)) return;
+    lw[lw_n].addr = addr, lw[lw_n].len = len, lw[lw_n].stride = stride, lw[lw_n].count = count, lw[lw_n].vs = vs;
+    lw[lw_n].depth_only = depth_only, lw[lw_n].vp_y = vp_y;
+    memcpy(lw[lw_n].snap, copied ? copied : G2H((uint32_t)addr), len);
+    lw_n++;
+}
+void vk_latewrite_frame(void) {
+    if (!latewrite_on()) return;
+    uint32_t changed = 0;
+    for (uint32_t i = 0; i < lw_n; i++) {
+        lw_quads += lw[i].depth_only && lw[i].count == 4;  // (the shadow cascades' clear quads among them)
+        if (!memcmp(lw[i].snap, G2H((uint32_t)lw[i].addr), lw[i].len)) continue;
+        changed++;
+        if (lw_logged >= 300) continue;
+        lw_logged++;
+        char cp[200] = "", now[200] = "";
+        int a = 0, b = 0;
+        for (uint32_t v = 0; v < lw[i].count && v < 4 && (v + 1) * lw[i].stride <= lw[i].len && lw[i].stride >= 12; v++) {
+            float f[3], g[3];
+            memcpy(f, lw[i].snap + v * lw[i].stride, 12);
+            memcpy(g, G2H((uint32_t)(lw[i].addr + v * lw[i].stride)), 12);
+            a += snprintf(cp + a, sizeof cp - a, " (%.3g %.3g %.3g)", f[0], f[1], f[2]);
+            b += snprintf(now + b, sizeof now - b, " (%.3g %.3g %.3g)", g[0], g[1], g[2]);
+        }
+        LOG("[latew] present %llu: vs %llx %s vp y %.0f, %u vertices at %llx (%u bytes) changed after the copy\n"
+            "[latew]   copied:%s\n[latew]   now:   %s\n", (unsigned long long)vk_frame_counter(), (unsigned long long)lw[i].vs,
+            lw[i].depth_only ? "depth-only" : "colour", lw[i].vp_y, lw[i].count, (unsigned long long)lw[i].addr, lw[i].len, cp, now);
+    }
+    lw_checked += lw_n, lw_changed += changed, lw_frames++;
+    if (lw_frames % 600 == 0)
+        LOG("[latew] %u frames: %u small vertex ranges checked (%u depth-only 4-vertex), %u changed after their copy\n", lw_frames,
+            lw_checked, lw_quads, lw_changed);
+    lw_n = 0;
+}
 
 // ---- vertex cache: device-local copies of bound vertex ranges, kept across submissions and refreshed only when the
 // CPU wrote their pages since (page write tracking, textures.c vk_pages_changed). The copy goes into the submission's
@@ -840,6 +939,10 @@ static VkFormat pass_color[8], pass_depth;
 static bool pass_d24_as_float;  // the depth attachment is a DEPTH24_STENCIL8 made as D32S8 (polygon offsets in D24 steps)
 static uint32_t pass_ncolor, pass_samples = 1, pass_w, pass_h;
 static bool ui_relax_scissor;  // the draw being set up moved a HUD piece out from under the game's scissor
+#ifdef MHGU_DUAL_SCREEN
+static int ui_bottom = -1;  // the draw being set up is a HUD piece of this bottom group (bottom_hud.c), -1 none
+static float ui_bottom_m[16];  // its model matrix (the piece's outline from its vertices: bottom_piece_outline)
+#endif
 static int ui_scissor_v = -1;  // 16:10: the draw being set up is a HUD piece anchored so (0 top, 1 centre, 2 bottom),
                                // and its scissor moves with it
 static bool ui_menu_pass;  // this pass drew a layer 97 menu before (the windows of layer 100 then sit beside Top-anchored ones)
@@ -931,15 +1034,21 @@ static void ui_group_hend(int n) {
     float x0 = ui_group.xmin, x1 = ui_group.xmax, cut = INFINITY, asp = g_render_aspect;
     int h = ui_group_hside(x0, x1), h2 = h;
     // Across the middle, not centred, with nothing of it over a quarter of the canvas: two things side by side on one
-    // row (the smithy's title at the top left and its page counter at the top right), each placed by its own side
-    if (h != 2 && x0 < 640.0f && x1 > 640.0f) {
+    // row (the smithy's title at the top left and its page counter at the top right), each placed by its own side.
+    // Centred too when the empty quarter is the middle and each side is a window of its own (wider than 160): Set
+    // Decorations' details window (x 26..402) and Equipment Box (870..1254) mirror about x 640 and went Centre as one
+    // dialog, but on an empty slot the box is drawn alone and went Right: it jumped sideways with Edges / 21:9. (A
+    // frame drawn as its corners only has nothing between its sides either, but no width on each side.)
+    if (x0 < 640.0f && x1 > 640.0f) {
         static float xs[UI_GROUP_MAX];
         for (int i = 0; i < n; i++) xs[i] = ui_group.p[i].pos_x;
         qsort(xs, (size_t)n, sizeof xs[0], ui_float_cmp);
         int k = 0;
         for (int i = 1; i < n; i++)
             if (xs[i] - xs[i - 1] > (k ? xs[k] - xs[k - 1] : 0.0f)) k = i;
-        if (k && xs[k] - xs[k - 1] > 320.0f) cut = xs[k], h = ui_group_hside(x0, xs[k - 1]), h2 = ui_group_hside(xs[k], x1);
+        bool apart = k && xs[k] - xs[k - 1] > 320.0f;
+        if (h == 2) apart = apart && xs[k - 1] < 640.0f && xs[k] > 640.0f && xs[k - 1] - x0 > 160.0f && x1 - xs[k] > 160.0f;
+        if (apart) cut = xs[k], h = ui_group_hside(x0, xs[k - 1]), h2 = ui_group_hside(xs[k], x1);
     }
     float s = (16.0f / 9.0f) / asp, anchor = g_ui_anchor_aspect < asp ? g_ui_anchor_aspect : asp;
     float left = 640.0f * (1.0f - anchor / asp);
@@ -1221,43 +1330,100 @@ static void dump_pass(void) {
 }
 
 // ================================================================== (debug) GPU profile: MHGU_CONTROL "gpuprof"
-// GPU timestamps between the passes (and MSAA resolves) of the next frame, logged in milliseconds by vk_gpuprof_frame.
+// GPU timestamps between the passes (and MSAA resolves) of the next two frames, logged in milliseconds by
+// vk_gpuprof_frame. Also where each submission begins (a top-of-pipe timestamp: when the GPU got to it) and ends, so
+// the log shows the time the GPU sat idle waiting for the next submission (the CPU not done with it yet, or a
+// semaphore the present waits for), and when the CPU submitted each one. Two frames: the gap after the first frame's
+// present is the one that says whether the CPU keeps the GPU fed.
+#define GP_MAX 512
 volatile int g_gpuprof_request;
-static int gp_active, gp_n, gp_pass;
+static int gp_active, gp_n, gp_pass, gp_frames, gp_ncpu;
 static VkQueryPool gp_pool;
-static char gp_label[256][64];
+static char gp_label[GP_MAX][64];
+static uint8_t gp_kind[GP_MAX];  // 0 a pass mark, 1 a submission begins (top of pipe), 2 / 3 it ends (3: the present's)
+static uint64_t gp_cpu[16], gp_wait0;  // CPU: when each submission went to the queue; stat_wait_ns at the start
+static bool gp_cpu_present[16];
 static const char *gp_pass_note = "", *gp_next_note = "";  // what this pass and the next one are, when known (FXAA)
 
-static void gp_mark(const char *label) {
-    if (!gp_active || gp_n >= 256) return;
-    vkCmdWriteTimestamp(vk_cmd(), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gp_pool, (uint32_t)gp_n);
-    snprintf(gp_label[gp_n++], sizeof gp_label[0], "%s", label);
+static void gp_mark_kind(const char *label, int kind) {
+    if (!gp_active || gp_n >= GP_MAX - 1) return;
+    VkCommandBuffer cb = vk_cmd();  // (first: it may begin a command buffer, which marks its own beginning)
+    int i = gp_n++;
+    vkCmdWriteTimestamp(cb, kind == 1 ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gp_pool,
+                        (uint32_t)i);
+    snprintf(gp_label[i], sizeof gp_label[0], "%s", label);
+    gp_kind[i] = (uint8_t)kind;
+}
+static void gp_mark(const char *label) { gp_mark_kind(label, 0); }
+
+// 1: a main command buffer begins, 2 / 3: the submission (3: the present's) is about to end, 4 / 5: it was submitted
+static void gp_submission(int kind) {
+    if (!gp_active) return;
+    if (kind == 1) gp_mark_kind("(GPU idle: waiting for this submission)", 1);
+    else if (kind <= 3) gp_mark_kind(kind == 3 ? "end of the present submission (window picture, overlay)" : "end of a submission", kind);
+    else if (gp_ncpu < 16) gp_cpu_present[gp_ncpu] = kind == 5, gp_cpu[gp_ncpu++] = plat_now_ns();
+}
+
+static void gp_log(const uint64_t *t) {
+    double per = g_vk.props.limits.timestampPeriod / 1e6;
+    // A submission's top-of-pipe time can come before the end of the one ahead of it (the GPU overlapped them): no gap
+    // then. Everything else follows in order.
+    uint64_t cur = t[0];
+    bool ok = true;
+    for (int i = 1; i < gp_n; i++) {
+        if (gp_kind[i] == 1) { if (t[i] > cur) cur = t[i]; continue; }
+        ok = ok && t[i] >= cur;
+        cur = t[i];
+    }
+    if (!ok || cur <= t[0]) { LOG("[gpuprof] no usable timestamps these frames: ask again\n"); return; }
+    uint64_t fstart = t[0];
+    double idle = 0, all_idle = 0;
+    int frame = 1;
+    cur = t[0];
+    LOG("[gpuprof] -- frame 1\n");
+    for (int i = 1; i < gp_n; i++) {
+        if (gp_kind[i] == 1) {
+            double gap = t[i] > cur ? (t[i] - cur) * per : 0.0;
+            if (t[i] > cur) cur = t[i];
+            idle += gap;
+            if (gap >= 0.0005) LOG("[gpuprof] %7.3f ms  %s\n", gap, gp_label[i]);
+            continue;
+        }
+        LOG("[gpuprof] %7.3f ms  %s\n", (t[i] - cur) * per, gp_label[i]);
+        cur = t[i];
+        if (gp_kind[i] == 3) {
+            double ft = (t[i] - fstart) * per;
+            LOG("[gpuprof] %7.3f ms  frame (GPU busy %.3f ms, idle %.3f ms)\n", ft, ft - idle, idle);
+            fstart = t[i], all_idle += idle, idle = 0;
+            if (i < gp_n - 1) LOG("[gpuprof] -- frame %d\n", ++frame);
+        }
+    }
+    char cpu[400];
+    int o = 0;
+    for (int i = 0; i < gp_ncpu && o < (int)sizeof cpu - 40; i++)
+        o += snprintf(cpu + o, sizeof cpu - o, "%s%.1f%s", i ? ", " : "", (gp_cpu[i] - gp_cpu[0]) / 1e6, gp_cpu_present[i] ? " (present)" : "");
+    LOG("[gpuprof] GPU idle %.3f ms in %d frames | CPU: submitted at %s ms, and waited for the GPU %.1f ms meanwhile\n",
+        all_idle, frame, gp_ncpu ? cpu : "-", (stat_wait_ns - gp_wait0) / 1e6);
 }
 
 void vk_gpuprof_frame(void) {  // (device.c, after each presented frame's submission)
-    if (gp_active) {
+    if (gp_active && ++gp_frames == 2) {
         gp_active = 0;
-        uint64_t t[256];
+        uint64_t t[GP_MAX];
         if (gp_n > 1 && vkGetQueryPoolResults(g_vk.dev, gp_pool, 0, (uint32_t)gp_n, sizeof t, t, 8,
-                                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
-            double per = g_vk.props.limits.timestampPeriod / 1e6;
-            bool ok = t[gp_n - 1] > t[0];
-            for (int i = 1; i < gp_n; i++) ok = ok && t[i] >= t[i - 1];
-            if (!ok) LOG("[gpuprof] no usable timestamps this frame: ask again\n");
-            for (int i = 1; ok && i < gp_n; i++) LOG("[gpuprof] %7.3f ms  %s\n", (t[i] - t[i - 1]) * per, gp_label[i]);
-            if (ok) LOG("[gpuprof] %7.3f ms  frame\n", (t[gp_n - 1] - t[0]) * per);
-        }
+                                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS)
+            gp_log(t);
     }
-    if (g_gpuprof_request) {
+    if (g_gpuprof_request && !gp_active) {
         g_gpuprof_request = 0;
         if (!gp_pool) {
             VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP,
-                                        .queryCount = 256};
+                                        .queryCount = GP_MAX};
             VK_CHECK(vkCreateQueryPool(g_vk.dev, &qi, NULL, &gp_pool));
         }
-        vkCmdResetQueryPool(vk_cmd(), gp_pool, 0, 256);
-        gp_active = 1, gp_n = 0, gp_pass = 0;
-        gp_mark("start");
+        vkCmdResetQueryPool(vk_cmd(), gp_pool, 0, GP_MAX);
+        gp_active = 1, gp_n = 0, gp_pass = 0, gp_frames = 0, gp_ncpu = 0, gp_wait0 = stat_wait_ns;
+        gp_mark("start");  // (in the next submission: the idle time before it shows from frame 2 on)
     }
 }
 
@@ -1294,6 +1460,11 @@ void vk_end_pass(void) {
     if (ui_nrecent != ui_pass_recent) ui_results_last = ui_results_pass;
     vkCmdEndRenderPass(vk_cmd());
     in_pass = false;
+#ifdef MHGU_DUAL_SCREEN
+    if (!g_bottom_hud_on) bottom_hud_discard();  // (turned off during the pass: its draws are never replayed later)
+    else if (bottom_hud_flush(vk_cmd(), pass_rp, pass_color, pass_ncolor, pass_depth, pass_samples, submit_seq + 1))
+        ss_forget();  // (the bottom pass bound pipelines and buffers of its own)
+#endif
     if (gp_active) {
         char l[64];
         snprintf(l, sizeof l, "pass %d %ux%u%s, %llu draws%s", gp_pass++, pass_w, pass_h, pass_msaa ? " MSAA" : "",
@@ -2821,6 +2992,31 @@ typedef struct {
     uint8_t sample_shading;  // (MSAA) every sample shaded (exec.c pass_models)
 } PipeKey;
 
+#ifdef MHGU_DUAL_SCREEN
+// A bottom piece's outline on the 1280x720 canvas: its vertices (attribute 0, the position: 2 or more 32-bit floats)
+// through its model matrix, the first 64 at most. All zero when the position isn't a float pair or more.
+static void bottom_piece_outline(const PipeKey *k, uint32_t from, uint32_t to, float out[4]) {
+    out[0] = out[1] = out[2] = out[3] = 0;
+    uint32_t f = k->attr_fmt[0];
+    if (!(k->attr_mask & 1) || (f != VK_FORMAT_R32G32_SFLOAT && f != VK_FORMAT_R32G32B32_SFLOAT && f != VK_FORMAT_R32G32B32A32_SFLOAT))
+        return;
+    uint32_t b = k->attr_bind[0];
+    Range v = b < 16 ? st.vbuf[b] : (Range){0, 0};
+    uint64_t stride = k->stride[b];
+    if (!v.addr || !stride || to <= from) return;
+    if (to - from > 64) to = from + 64;
+    if (!guest_range_ok(v.addr + k->attr_off[0] + (uint64_t)from * stride, (uint64_t)(to - from) * stride)) return;
+    const float *m = ui_bottom_m;
+    float x0 = INFINITY, y0 = INFINITY, x1 = -INFINITY, y1 = -INFINITY;
+    for (uint32_t i = from; i < to; i++) {
+        const float *p = (const float *)G2H((uint32_t)(v.addr + k->attr_off[0] + (uint64_t)i * stride));
+        float x = m[0] * p[0] + m[4] * p[1] + m[12], y = m[1] * p[0] + m[5] * p[1] + m[13];
+        x0 = fminf(x0, x), x1 = fmaxf(x1, x), y0 = fminf(y0, y), y1 = fmaxf(y1, y);
+    }
+    out[0] = x0, out[1] = y0, out[2] = x1, out[3] = y1;
+}
+#endif
+
 typedef struct Pipe {
     PipeKey k;
     VkPipeline pipe;
@@ -3351,6 +3547,18 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     if (stage == 0 && k == 3) ui_relax_scissor = false, ui_scissor_v = -1;
     // (a pass the size of the game's picture, in the guest's units: FSR's stand-ins and scaled targets are larger)
     bool screen_pass = stage == 0 && k == 3 && roundf((float)pass_h / pass_sy) == (float)g_render_size[1];
+#ifdef MHGU_DUAL_SCREEN
+    // (by the place the game gave it, before the 16:10 / ultrawide rules below move it)
+    if (stage == 0 && k == 3) ui_bottom = -1;
+    if (g_bottom_hud_on && screen_pass && !st.ds[0] && size >= 64) {
+        float m[16];
+        memcpy(m, G2H((uint32_t)r.addr), 64);
+        ui_bottom = bottom_hud_group(m[14], m[12], m[13]);
+        memcpy(ui_bottom_m, m, sizeof ui_bottom_m);
+        // (drawn on the bottom panel only: as the game placed it, without the main screen's 16:10 / ultrawide moves)
+        if (ui_bottom >= 0) return ubo_span(guest_copy(r.addr, size), size);
+    }
+#endif
     if (screen_pass && !st.ds[0] && size >= 64) {
         void menulearn_piece(const float *m);  // (the HUD pieces of the frame, at any shape: where menus' rows are)
         menulearn_piece((const float *)G2H((uint32_t)r.addr));
@@ -3408,6 +3616,7 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                 float new_pos_x = pos_x, new_pos_y = pos_y;
                 bool grouped = false;
                 int vgroup = 1;
+                float zgroup = pos_z;  // (the layer its group is on: a menu window's text, 94, joins the window's 97)
 
                 if (is_3d_overlay && g_hudtrace_active)
                     LOG("[hud] z %.1f pos %.1f,%.1f m %.2f %.2f %.2f %.2f: 3D overlay, not moved\n", pos_z, pos_x, pos_y, m[0], m[1], m[4], m[5]);
@@ -3415,6 +3624,13 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                     enum { ANCHOR_LEFT, ANCHOR_RIGHT, ANCHOR_CENTER } anchor = ANCHOR_CENTER;
                     // vertically one anchor per layer (or per part of one), so a window drawn in pieces stays together
                     enum { V_TOP, V_BOTTOM, V_CENTER } vanchor = V_CENTER;
+                    // Text of layer 94 drawn on a layer 97 window right after its pieces, inside them: the Hub Info's
+                    // Canteen panel (frame x 508..942, y 300..470; its skill rows at x 598 / 610, y 350..431). By the
+                    // banners' rule it went Centre, ~40 px below its Top-anchored frame at 16:10 (out of the box), and
+                    // stayed in the middle wider than 16:9 while the frame went to its side. It is part of the window:
+                    // the menus' rule and group.
+                    bool menu_text = pos_z < 95.0f && ui_group.n && fabsf(ui_group.z - 97.0f) < 0.5f && pos_x >= ui_group.xmin &&
+                                     pos_x <= ui_group.xmax && pos_y >= ui_group.ymin && pos_y <= ui_group.ymax;
 
                     // Title screen: its layout (layer 108) is placed at the canvas centre and carries the copyright line at
                     // its bottom (y ~698), which the centre anchor moved up into "PRESS A" (layer 100, y 653 / 671, bottom
@@ -3429,7 +3645,7 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                         // "Summary" header landed on the text. All of it scales about the center instead.
                         anchor = ANCHOR_CENTER;
                         vanchor = V_CENTER;
-                    } else if (pos_z < 95.0f) {
+                    } else if (pos_z < 95.0f && !menu_text) {
                         // 94.0: Central notifications & banners ("Time limit: 50 min.")
                         // 60.0: the Guild Card's name plate (top right, under its page counter): by which third it is in
                         anchor = ANCHOR_CENTER;
@@ -3439,7 +3655,7 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                         // left and right)
                         anchor = pos_x >= 650.0f ? ANCHOR_RIGHT : ANCHOR_LEFT;
                         vanchor = pos_y < 360.0f ? V_TOP : V_BOTTOM;
-                    } else if (fabsf(pos_z - 97.0f) < 0.5f || fabsf(pos_z - 98.0f) < 0.5f) {
+                    } else if (fabsf(pos_z - 97.0f) < 0.5f || fabsf(pos_z - 98.0f) < 0.5f || menu_text) {
                         // 97.0: Menus and Submenus
                         // 98.0: text drawn over them (the Qty. label of the quantity box): it used the generic rule, which
                         // centered it 36 px below its top-anchored box
@@ -3565,11 +3781,12 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                     // right): the item box's Manage Equipment submenu (x 333..563) lost its body and right corners to the
                     // right, its Rotate / Camera prompts (100, x 18..98, under the menu) and the Multiplayer dialog (over
                     // the middle) went right. Not on the screens placed whole above, nor the bars that belong to an edge.
-                    if (s < 1.0f && (fabsf(pos_z - 97.0f) < 0.5f || fabsf(pos_z - 98.0f) < 0.5f || fabsf(pos_z - 100.0f) < 0.5f) &&
+                    if (s < 1.0f && (fabsf(pos_z - 97.0f) < 0.5f || fabsf(pos_z - 98.0f) < 0.5f || fabsf(pos_z - 100.0f) < 0.5f || menu_text) &&
                         !ui_frontend_pass && !ui_title_pass && !ui_loading_pass && !ui_stamp_pass && !ui_results_pass &&
                         !ui_results_last && !ui_meownster_pass && pos_y >= 10.0f && pos_y <= 712.0f)
                         grouped = true;
                     vgroup = v;
+                    if (menu_text) zgroup = 97.0f;
                     if (g_hudtrace_active)
                         LOG("[hud] z %.1f pos %.1f,%.1f m %.2f %.2f %.2f %.2f -> %c%c %.1f,%.1f%s sc %d,%d %dx%d\n", pos_z, pos_x, pos_y, m[0], m[1], m[4],
                             m[5], "LRC"[anchor], "TBC"[vanchor], new_pos_x, new_pos_y, ui_menu_pass ? " menu" : "", st.scissor[0][0],
@@ -3583,7 +3800,7 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
 
                 VkSpan sp = vk_transient_copy(G2H((uint32_t)r.addr), size, 256);  // (all of it, the matrix changed)
                 memcpy(sp.ptr, m, 64);
-                if (grouped) ui_group_add((float *)sp.ptr, pos_z, pos_x, pos_y, vgroup);
+                if (grouped) ui_group_add((float *)sp.ptr, zgroup, pos_x, pos_y, vgroup);
                 {   // (where the piece ends up: read at the frame's end, once its group has its anchor - runtime/menulearn.c)
                     void menulearn_piece_final(const float *m);
                     menulearn_piece_final((const float *)sp.ptr);
@@ -3603,6 +3820,9 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
 }
 
 static int32_t fsr_cap_base;  // (FSR capture draw: its FSR_CAP_BASE_BINDING value, stage_set)
+// The draw being set up tests depth: its samplers get [Graphics] AnisotropicFiltering. Flat draws (no depth test: the
+// HUD, menus, the loading backdrop) keep the game's own; the backdrop's tiles showed seams with it (textures.c).
+static bool draw_aniso = true;
 
 static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out) {
     ShaderTexture *stx = &si->tex[i];
@@ -3620,7 +3840,7 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
                     view = stx->type == TEXTYPE_2D ? feedback_view[k] : vk_dummy_view(TEXTYPE_2D_ARRAY);
         }
     }
-    if (h && st.spool && tsc < (uint32_t)st.spool->count) smp = vk_sampler(&((NvnSamplerDesc *)st.spool->entries)[tsc]);
+    if (h && st.spool && tsc < (uint32_t)st.spool->count) smp = vk_sampler(&((NvnSamplerDesc *)st.spool->entries)[tsc], draw_aniso);
     if (!view) view = vk_dummy_view(stx->type);
     if (!smp) smp = vk_default_sampler(true);
     *out = (VkDescriptorImageInfo){smp, view, VK_IMAGE_LAYOUT_GENERAL};
@@ -3767,6 +3987,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);
     nfeedback = 0;
+    draw_aniso = true;  // (compute: no derivatives, so anisotropy changes nothing; the sampler the game's other uses get)
     VkDescriptorSet ds = stage_set(cp->p.nbinds, cp->p.binds, cp->p.set_layout[0], 0, 5, cp->si, gx, gy, gz);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p.layout, 0, 1, &ds, 0, NULL);
@@ -4074,6 +4295,21 @@ static void draw(CmdRec *r, bool indexed) {
     if (in_pass && pass_models && !pass_msaa && ms_want_depth && !pass_want_depth) st.rt_dirty = true;
     if (in_pass && pass_models && pass_msaa && !ms_want_depth && !models_2d_in_samples()) st.rt_dirty = true;
     models_fxaa_track(ms_want_depth);  // (FXAA: the same, models_fxaa_end)
+    // RADV (g_vk.bias_sync, device.c): in a depth-only pass a draw whose polygon offset or polygon state (offset enable,
+    // culling, winding) differs from the draw before starts a new pass, behind a full barrier. Without it the Steam Deck's
+    // shadow cascades came out wrong one at a time (the terrain and its decals flickering black, mostly with shadow
+    // casters at ground level: small monsters, the area 6 rock sunk into the ground). Found on the Deck: RADV_DEBUG=
+    // syncshaders hid it; barriers in colour passes, or the state sent again without a barrier, did not; these did, at
+    // about 0.6 ms of a 5.3 ms frame there. Within a pass draws get no barrier otherwise.
+    if (g_vk.bias_sync) {
+        static float last_offset[3];
+        static uint8_t last_poly[4];
+        if (in_pass && pass_ncolor == 0 &&
+            (memcmp(last_offset, st.poly_offset, sizeof last_offset) || memcmp(last_poly, st.poly, sizeof last_poly)))
+            st.rt_dirty = true;
+        memcpy(last_offset, st.poly_offset, sizeof last_offset);
+        memcpy(last_poly, st.poly, sizeof last_poly);
+    }
     if (st.rt_dirty) vk_end_pass();  // (MSAA: the ending pass marks its targets for resolving before they are read)
     ms_resolve_sampled(0, pr->vi);
     ms_resolve_sampled(1, pr->fi);
@@ -4238,6 +4474,7 @@ static void draw(CmdRec *r, bool indexed) {
     apply_scissor(cb);
 
     // ---- descriptor sets
+    draw_aniso = k.depth_test;
     VkDescriptorSet sets[2] = {stage_set(pr->nbinds, pr->binds, pr->set_layout[0], 0, 0, pr->vi, 0, 0, 0),
                                stage_set(pr->nbinds, pr->binds, pr->set_layout[1], 1, 1, pr->fi, 0, 0, 0)};
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr->layout, 0, 2, sets, 0, NULL);
@@ -4319,6 +4556,12 @@ static void draw(CmdRec *r, bool indexed) {
                 sp = (VkSpan){cached, 0, NULL};
                 vtail_put(v.addr, v.size, sp);
             } else sp = guest_copy_vertex(v.addr, need ? need : 16);
+            if (latewrite_on() && v.addr && stride && max_index && (uint64_t)max_index * stride <= 512) {  // (debug)
+                uint32_t lo = indexed ? 0 : first, len = (max_index - lo) * (uint32_t)stride;
+                latewrite_note(v.addr + (uint64_t)lo * stride, sp.ptr ? (const uint8_t *)sp.ptr + (uint64_t)lo * stride : NULL,
+                               len, (uint32_t)stride, max_index - lo, st.program->stages[0].code_addr, !st.rt.ncolor,
+                               st.viewport[0][1]);
+            }
         }
         VkDeviceSize off = sp.off;
         if ((ss.vb_known >> s & 1) && ss.vb[s] == sp.buf && ss.vo[s] == off) continue;
@@ -4403,6 +4646,26 @@ static void draw(CmdRec *r, bool indexed) {
         }
     }
     if (mf_tex) models_fxaa_note();
+#ifdef MHGU_DUAL_SCREEN
+    if (ui_bottom >= 0 && !k.stencil_test) {
+        BottomDraw bd = {.group = ui_bottom, .pipe = pp->pipe, .layout = pr->layout, .sets = {sets[0], sets[1]},
+                         .indexed = use_index, .ib = ib.buf, .io = ib.off, .it = itype_vk, .count = use_index ? icount : count,
+                         .inst = inst, .first = first, .base_inst = base_inst, .base_vertex = base_vertex};
+        for (int s = 0; s < 17; s++)
+            if (k.used_streams & (1u << s)) bd.vb_mask |= 1u << s, bd.vb[s] = ss.vb[s], bd.vo[s] = ss.vo[s];
+        memcpy(bd.blend, st.blend_color, sizeof bd.blend);
+        float pw, ph;
+        pass_guest_size(&pw, &ph);
+        bd.clip[0] = (float)st.scissor[0][0] * 1280.0f / pw, bd.clip[1] = (float)st.scissor[0][1] * 720.0f / ph;
+        bd.clip[2] = (float)(st.scissor[0][0] + st.scissor[0][2]) * 1280.0f / pw;
+        bd.clip[3] = (float)(st.scissor[0][1] + st.scissor[0][3]) * 720.0f / ph;
+        bottom_piece_outline(&k, first, use_index ? max_index : first + count, bd.outline);
+        bottom_hud_record(&bd);
+        ui_bottom = -1;
+        return;  // (on the bottom panel only, as MHXX's top screen has none of these)
+    }
+    ui_bottom = -1;
+#endif
     if (!use_index) vkCmdDraw(cb, count, inst, first, base_inst);
     else vkCmdDrawIndexed(cb, icount, inst, 0, base_vertex, base_inst);
     if (k.depth_write) grass_shadow_drawn(r, indexed, prog_fs_hash(pr));  // (tall grass: its main pass, grass_depth_laid)

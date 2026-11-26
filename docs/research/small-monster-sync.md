@@ -108,6 +108,29 @@ list alone. Two instances, Server Off, MHGU_EMTRACE_ZAKO=1 and `MHGU_CONTROL` dr
   240 fps, 3-4 players, two PCs. A monster stuck looping a later action wouldn't be caught. Since 2026-11-04 a monster joins the
   sync once its action word has been non-zero (others pass through 0:0 for a moment, so the word alone can't tell); this route not
   run again since.
+- uEms100 is file ems101, species 0x1065: Volcanic Hollow's breakable rock (models ems101_rock00-02, sounds rock_break_s,
+  rock_break_collapse, fire_stone_broke; ems100-106 are the same rock for the other maps). Quest 10537 (Hub, Volcanic Hollow) has
+  two in zone 7 at fixed spots (3464,-390 and -1204,-1854); the user remembers the first flood in zone 5 next to it. Whole, a rock's
+  action word is 0 in every sample. Broken (by hits or a large monster), it goes 0 -> 0xb once and stays (measured on both games
+  46 ms apart), and isn't spawned again on re-entry. Rocks and other small monsters don't spawn in an MHGU_START_AREA zone until an
+  area change; the Hub's random high rank start does spawn them, but each hunter gets their own start zone.
+- 2026-11-22 report: players dropped on area entry in quest 10537 (4 players, SyncSmallMonsters mixed On/Off, the reporter alone in
+  zone 11). Not reproduced with two instances at 240 fps: both On, hunters walked zone by zone through nearly every zone, each in
+  turn arriving where the other was (peak netEmAction 2.4/s per game); host Off / joiner On (the On joiner owns a zone the moment it
+  walks in on an Off player), zone 7, a rock broken, the joiner out and back in (peak 2.2/s). Busiest normal small monster: 9 action
+  changes in one second (species 0x1013), most stay under 5.
+- Flood cap (2026-11-23, emsync.c em_send / emsync_filter): a hook on 0x2cafe8 counts each small monster's netEmAction (kind 1)
+  per second; over CAP_PER_SEC (20; MHGU_EMSYNC_CAP=<n> for tests) the send is dropped, the monster made local for the rest of the
+  owner's stay in the zone, and an aux message (magic 0xE9: slot, area, id) tells the others twice a second, who keep their copy
+  local for 5 s after the last one. Incoming kind-1 messages for a small monster are counted the same way (byte 3 of the message at
+  0x2cb120 is the kind) and dropped past the cap, whatever the setting, so an older owner's flood stops at a newer follower too.
+  The left-first check is keyed by network id as well as address (a new monster can take a departed one's address and list place).
+  MHGU_EMSYNC_NOGUARD=1 turns that check off, bringing the rock flood back for testing the cap. Tested (two instances, 240 fps,
+  both On, NOGUARD=1, quest 10537, the user walking the host then the joiner into zone 7): the owner logged both rocks (10016,
+  10017) over the cap, the joiner logged both caps heard, nobody dropped; netEmAction averaged 8.1/s over that 5 s report and
+  ~1/s otherwise (the same rocks without the cap: 480/s). No other small monster hit the cap in this or the earlier runs. Rig:
+  C:\MHGURecompile\scratch-vhsync\user (launch.sh: two instances into quest 10537 by poking sQuestSelector +0xd68). Not tested:
+  3-4 players, two PCs, an older owner flooding a newer follower (the receive-side count).
 - Maccao preferring Palicoes comes from their score table (docs/STATUS.md, "Monsters' attention scores"), not from sync: the user
   reports they rarely go for hunters unprovoked. Use Jaggi or Rhenoplos to test hostility.
 - Herds: sEnemy (0x1a51fe0, class sEnemyMure) +0x25c0 holds 10 herds of 0x50 bytes: +0 type, +1 id, +2 the herd's master
@@ -115,6 +138,42 @@ list alone. Two instances, Server Off, MHGU_EMTRACE_ZAKO=1 and `MHGU_CONTROL` dr
   copy the herd's target (a monster's own target type is one higher: 1 hunter, 2 Palico, 3 enemy). emsync.c doesn't touch
   herds, so their own master and netMureEm* messages run alongside it. 0x264f90 sets a herd's target only on its master's game;
   no harm seen in the tests, where one herd's master and the zone's owner were different players.
+
+## Zamites stuck in hunters (issue #456, fixed 2026-11-24)
+
+Reported: online, a Zamite (ems044, species 0x102c, Frozen Seaway) that bites a hunter stays stuck in them, does no damage,
+and the others don't see it on them. How a latch works: the leap (7:14) hitting a hunter runs on that hunter's own game, as
+every hit on a hunter does (0x130ed00..): 0x2c2100(monster, hunter, 2, offset {0, -60, -530}, 5) attaches the monster
+(status block +0x5c2f attach mode, 1..5 attached; +0x5c30 the hunter; +0x5c34 2; +0x5c40.. the offset; +0x5c50 1.0;
+0x2c21b0 clears the mode, 0x2c21c8 tests it), 0x4f5528 tells the hunter, then the forced action 0x276984 asks for 3:5.
+3:5 is the latch: attach mode 5, the monster on the hunter, the drain; about 10 s if the hunter stands still, about 5 s
+with rolls. Then 3:0 (mode 0, dropped off, ~5 s) and 1:3. 0x276984 runs the action at once on the game that runs the
+monster (+0x7420), and otherwise only stores it (+0x73e5 flag, +0x73e6/7 group and index). Replaying 3:5 doesn't attach.
+
+So with the sync: on a follower bitten by the replayed leap, the copy was attached to its hunter with the latch stored and
+never run (the stuck, harmless Zamite), and the owner never heard of it. On the owner's own hunter the latch ran, but no
+other game attached its copy (nobody saw it). Measured with two instances (MHGU_EMTRACE_ZAKO, a temporary trace of +0x73e4,
++0x7420 and the attach fields), quest 10517 "Zamite Fight" (Hub, Frozen Seaway; Zamites in areas 2, 7, 9; the large
+intruder killed with MHGU_KILL_AFTER on the host).
+
+Fix (emsync.c, latches): a hook on 0x276984 sees a synced small monster attached to the local hunter on a game that
+doesn't run it, and runs it from then on (+0x7420 1): the latch runs, drains and can be rolled off, and its actions go out
+as an owner's would. A game whose hunter a small monster holds (taken over, or bitten by one it runs anyway) announces it
+over the aux link (0xEA: slot, area, mode, id, kind, offset, scale) on every change and twice a second, until 1.5 s after
+it let go (then a release). The others follow that game for that monster (emsync_filter takes its messages only), and
+write the same attach fields with that player's hunter, so their copy shows on them. Two hunters bitten by one monster at
+once: the lower slot keeps it, the other game runs its copy alone (out of the sync) until it lets go. Checked (two
+instances, 240 fps): host bitten while the joiner owned the zone (taken over, the joiner's copy on the host's hunter
+within 33 ms, the host's health drained); the joiner bitten by one it ran (the host's copy on the joiner's hunter 66 ms
+later); rolls ended a latch after 5 s on the owner's hunter, and early on a taken-over one too (both games showed it on
+the ground after); release back to the zone's owner. Rig: C:\MHGURecompile\scratch-zamite\rig (zam7.sh: both into area 2
+of quest 10517, back 25 s and left into area 7; KILL_host=40). Not checked: two hunters bitten by one at once (the yield),
+3-4 players, two PCs, mixed versions (an older owner keeps running its
+own copy; the bitten newer game still gets the drain and the roll). The netEmAction of the first 3:5 (UDP) can reach the
+zone's owner before the 0xEA message (TCP) and is then dropped; in the runs its own copy went to 3:5 anyway.
+
+Also fixed: ldn.c's friend hellos use aux magic 0xE9 like the flood cap's message; cap_received now takes only its exact
+size (a hello was read as a cap for a made-up id when a hunter's name length matched the zone number).
 
 ## Debug tools made for this
 

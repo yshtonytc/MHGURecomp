@@ -3,11 +3,12 @@
 //   MHGU_GPU=<index>       which Vulkan device (default: the first discrete GPU)
 //   MHGU_VSYNC=0|1         0: no vsync (tearing possible, lowest latency), 1: classic vsync (FIFO). Default: the
 //                          settings' VSync - On: mailbox (no tearing; the game paces itself), FIFO where there is
-//                          none (the R9's driver), Off: immediate. MHGU_VK_PRESENT=fifo|mailbox|immediate picks the present mode directly.
+//                          none (the R9's driver), Off: immediate (mailbox where there is none, as in gamescope). MHGU_VK_PRESENT=fifo|mailbox|immediate picks the present mode directly.
 //   MHGU_SHOT_AT=<frame>[,<frame>...]   save the window image at those presented frames as shots/frame_N.png
 //   MHGU_FPS=1             frames per second in the log every 2 s
 //   MHGU_NO_BC=1           act as if the GPU had no BC textures, as phone GPUs (they are decoded on the CPU then)
 //   MHGU_VK11=1            take the path for Vulkan 1.1 devices on any device (g_vk.api11), to test it on a PC
+//   MHGU_VK_NO_POLL=1|0    no driver completion checks (fences waited for by a thread: on by itself for Turnip on Android)
 //   MHGU_NO_LOADING_SCREEN=1   no loading indicator before the game's first frame (a black window, as before)
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -22,6 +23,10 @@
 #include "fsr.h"
 #include "hdr.h"
 #include "vk.h"
+#ifdef MHGU_DUAL_SCREEN
+#include "bottom_hud.h"
+#include "second_display.h"
+#endif
 
 VkG g_vk;
 static VkDebugUtilsMessengerEXT messenger;
@@ -234,6 +239,32 @@ static void create_device(void) {
                                       .pNext = g_vk.api11 ? (void *)&s16_have : (void *)&f11_have};
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
     g_vk.fences = !f12_have.timelineSemaphore;
+    // Turnip (Mesa's Adreno driver) on Android's KGSL: a completion check can wait for the GPU there, so none are made
+    // (exec.c "No status polls", issue #444). MHGU_VK_NO_POLL=1 / 0 turns that on / off on any device.
+#ifdef __ANDROID__
+    if (!g_vk.api11) {
+        VkPhysicalDeviceDriverProperties dp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &dp};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
+        g_vk.no_poll = dp.driverID == VK_DRIVER_ID_MESA_TURNIP;
+    }
+#endif
+    if (getenv("MHGU_VK_NO_POLL")) g_vk.no_poll = atoi(getenv("MHGU_VK_NO_POLL")) != 0;
+    // RADV (Mesa's AMD driver: the Steam Deck): the draws of a depth-only pass (shadow cascades, depth pre-pass) overlap
+    // where the polygon offset changes between them, and a shadow cascade at a time came out wrong: terrain and its
+    // decals flickering black (Deserted Island area 6, exec.c draw). MHGU_VK_BIAS_SYNC=1 / 0 turns it on / off anywhere.
+    if (!g_vk.api11) {
+        VkPhysicalDeviceDriverProperties dp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &dp};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
+        g_vk.bias_sync = dp.driverID == VK_DRIVER_ID_MESA_RADV;
+    }
+    if (getenv("MHGU_VK_BIAS_SYNC")) g_vk.bias_sync = atoi(getenv("MHGU_VK_BIAS_SYNC")) != 0;
+    if (g_vk.bias_sync) LOG("[vk] depth-only passes: a barrier where the polygon offset changes (RADV)\n");
+    if (g_vk.no_poll) {
+        g_vk.fences = true;
+        LOG("[vk] no completion checks: a fence per submission, waited for by a thread of its own\n");
+    }
     g_vk.divisor = g_vk.divisor && div_have.vertexAttributeInstanceRateDivisor;
     g_vk.custom_border = g_vk.custom_border && cbc_have.customBorderColors && cbc_have.customBorderColorWithoutFormat;
 
@@ -261,6 +292,7 @@ static void create_device(void) {
     b->logicOp = h->logicOp;
     b->fillModeNonSolid = h->fillModeNonSolid;
     b->samplerAnisotropy = h->samplerAnisotropy;
+    g_vk.max_aniso = h->samplerAnisotropy ? fmaxf(1, g_vk.props.limits.maxSamplerAnisotropy) : 1;
     b->textureCompressionBC = g_vk.bc = h->textureCompressionBC && !(getenv("MHGU_NO_BC") && atoi(getenv("MHGU_NO_BC")));
     b->textureCompressionASTC_LDR = h->textureCompressionASTC_LDR;
     b->shaderInt64 = h->shaderInt64;
@@ -394,6 +426,12 @@ void vk_set_msaa(uint32_t n) {
 // ================================================================== swapchain
 static int swapchain_vsync = -1;
 static int configured_msaa = -1;
+static const char *present_name = "?";  // the swapchain's present mode, for the log
+static bool offers_present_mode(const VkPresentModeKHR *modes, uint32_t n, VkPresentModeKHR mode) {
+    for (uint32_t i = 0; i < n; i++)
+        if (modes[i] == mode) return true;
+    return false;
+}
 static VkPresentModeKHR present_mode(void) {
     swapchain_vsync = config_live_vsync();
     // MAILBOX by default: no tearing, and the game paces itself (its own 30 fps vsync waits); with FIFO the game's frames
@@ -408,8 +446,19 @@ static VkPresentModeKHR present_mode(void) {
     VkPresentModeKHR m[16];
     if (n > 16) n = 16;
     vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, m);
-    for (uint32_t i = 0; i < n; i++) if (m[i] == want) return want;
+    if (offers_present_mode(m, n, want)) {
+        present_name = want == VK_PRESENT_MODE_FIFO_KHR ? "fifo" : want == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "mailbox";
+        return want;
+    }
+    // Without vsync, MAILBOX before FIFO: gamescope offers no IMMEDIATE (Mesa's Wayland WSI has it only with the
+    // compositor's tearing-control protocol) and treats MAILBOX as a mode that may tear when tearing is allowed.
+    if (want == VK_PRESENT_MODE_IMMEDIATE_KHR && offers_present_mode(m, n, VK_PRESENT_MODE_MAILBOX_KHR)) {
+        LOG("[vk] present mode immediate not available: mailbox\n");
+        present_name = "mailbox";
+        return VK_PRESENT_MODE_MAILBOX_KHR;
+    }
     LOG("[vk] present mode %s not available: FIFO (vsync)\n", e);
+    present_name = "fifo";
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 
@@ -652,8 +701,8 @@ static void create_swapchain(void) {
         VK_CHECK(vkCreateFramebuffer(g_vk.dev, &fi, NULL, g_hdr_out ? &hdr_fb[i] : &sc_fb[i]));
     }
     if (g_hdr_out) hdr_send_metadata(true);
-    LOG("[vk] swapchain %ux%u, %u images (asked for %u), format %d%s\n", ext.width, ext.height, g_vk.sc_count, count, sf.format,
-        g_hdr_out == HDR_OUT_PQ ? " (HDR10)" : g_hdr_out == HDR_OUT_SCRGB ? " (scRGB)" : "");
+    LOG("[vk] swapchain %ux%u, %u images (asked for %u), format %d%s, %s\n", ext.width, ext.height, g_vk.sc_count, count,
+        sf.format, g_hdr_out == HDR_OUT_PQ ? " (HDR10)" : g_hdr_out == HDR_OUT_SCRGB ? " (scRGB)" : "", present_name);
 }
 
 static void recreate_swapchain(void) {
@@ -730,6 +779,30 @@ static bool surface_ready(void) {
 typedef struct { uint32_t image; VkSemaphore acquired; bool ok; } Frame;
 static Frame cur_frame;
 
+// A stuck present, logged: the window calls that can block with no timeout of their own (vk_wait_seq logs after 10 s by
+// itself). The step the presenting thread is in (written under vk_lock) and since when; stall_watch looks twice a
+// second and logs once per stall after 5 s, and the call logs again when it returns. (A full screen window on an
+// RX 9070 hung before the game's first frames with nothing in the log.)
+enum { STEP_NONE, STEP_ACQUIRE, STEP_SWAPCHAIN, STEP_SUBMIT, STEP_PRESENT };
+static const char *const step_names[] = {"", "getting a window image (vkAcquireNextImageKHR)", "making the swapchain again",
+                                         "submitting the frame (vkQueueSubmit)", "presenting (vkQueuePresentKHR)"};
+static int step_now;                // (__atomic)
+static uint64_t step_t0, step_seq;  // (__atomic)
+static const uint64_t STUCK_NS = 5000000000ull;
+
+static void step_begin(int s) {
+    __atomic_store_n(&step_t0, plat_now_ns(), __ATOMIC_RELAXED);
+    __atomic_add_fetch(&step_seq, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&step_now, s, __ATOMIC_RELEASE);
+}
+
+static void step_end(void) {
+    int s = __atomic_load_n(&step_now, __ATOMIC_RELAXED);
+    uint64_t dt = plat_now_ns() - __atomic_load_n(&step_t0, __ATOMIC_RELAXED);
+    __atomic_store_n(&step_now, STEP_NONE, __ATOMIC_RELEASE);
+    if (s && dt >= STUCK_NS) LOG("[vk] %s returned after %.1f s\n", step_names[s], dt / 1e9);
+}
+
 // Acquire the next window image and begin its render pass (cleared to black). false: nothing to draw into.
 static bool frame_begin(void) {
     cur_frame.ok = false;
@@ -745,15 +818,25 @@ static bool frame_begin(void) {
     if (configured_msaa < 0) configured_msaa = g_config.msaa;
     if (msaa != configured_msaa) { vk_set_msaa((uint32_t)msaa); configured_msaa = msaa; }
     if (!g_vk.swapchain || (uint32_t)w != g_vk.sc_extent.width || (uint32_t)h != g_vk.sc_extent.height ||
-        config_live_vsync() != swapchain_vsync || hdr_wanted() != swapchain_hdr) recreate_swapchain();
+        config_live_vsync() != swapchain_vsync || hdr_wanted() != swapchain_hdr) {
+        step_begin(STEP_SWAPCHAIN);
+        recreate_swapchain();
+        step_end();
+    }
     if (!g_vk.swapchain) return false;
     slot = (slot + 1) % FRAMES;
     if (!acquire_sem[slot]) acquire_sem[slot] = binary_semaphore();
     vk_wait_seq(slot_seq[slot]);
+    step_begin(STEP_ACQUIRE);
     VkResult r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
+    step_end();
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
+        step_begin(STEP_SWAPCHAIN);
         recreate_swapchain();
-        r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
+        step_end();
+        step_begin(STEP_ACQUIRE);
+        r =vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
+        step_end();
     }
 #ifdef __ANDROID__
     if (r == VK_ERROR_SURFACE_LOST_KHR) { surface_lost = true; return false; }
@@ -851,17 +934,25 @@ static void frame_end(const char *shot_path) {
     }
     if (!done_sem[img]) done_sem[img] = binary_semaphore();
     uint64_t seq = vk_pending_seq();
+    step_begin(STEP_SUBMIT);
     vk_submit_extra(cur_frame.acquired, done_sem[img]);
+    step_end();
     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &done_sem[img],
                            .swapchainCount = 1, .pSwapchains = &g_vk.swapchain, .pImageIndices = &img};
+    step_begin(STEP_PRESENT);
     VkResult r = vkQueuePresentKHR(g_vk.queue, &pi);
+    step_end();
     // (Android says SUBOPTIMAL whenever the system turns the image: a new swapchain would be no better. A new
     // window size is caught in frame_begin.)
 #ifdef __ANDROID__
     if (r == VK_ERROR_OUT_OF_DATE_KHR) recreate_swapchain();
     if (r == VK_ERROR_SURFACE_LOST_KHR) surface_lost = true;
 #else
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) recreate_swapchain();
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) {
+        step_begin(STEP_SWAPCHAIN);
+        recreate_swapchain();
+        step_end();
+    }
 #endif
     cur_frame.ok = false;
     if (shot_path) {  // (the copy is taken here; the PNG is made on a thread of its own: encoding the window's size
@@ -911,6 +1002,16 @@ static bool shot_frame(uint64_t f) {
     return false;
 }
 
+// A Forge plugin's registered texture (overlay_user_texture_add) as ImGui samples it: current (uploaded, or resolved
+// from its multisampled image), a 2D view with the registered NVNtextureView. Outside a render pass.
+static VkImageView user_tex_view(uint32_t tex, const void *view) {
+    if (!tex || !kernel_mapped(tex, 8)) return VK_NULL_HANDLE;
+    NvnTexture *t = HOST(NvnTexture, tex);  // (0 once nvnTextureFinalize ran)
+    if (!t) return VK_NULL_HANDLE;
+    vk_ms_resolve(vk_tex(t, false));
+    return vk_view(t, (const NvnTextureView *)view, view != NULL, false, TEXTYPE_2D);
+}
+
 void backend_present(NvnTexture *t) {
     extern void vi_apply_framerate(void);
     vi_apply_framerate();
@@ -921,6 +1022,7 @@ void backend_present(NvnTexture *t) {
     b->presented = true;
     vk_end_pass();
     vk_ms_resolve(b);
+    overlay_user_textures_prepare(user_tex_view);  // (Forge plugins' textures for ImGui, drawn by overlay_draw)
     if (g_hdr_out) vk_hdr_analyze(vk_cmd(), b);  // ([HDR] Analysis: measured before it is drawn, hdr.c)
     if (frame_begin()) {
         // the game's image, as large as fits with its aspect ratio, centred
@@ -950,6 +1052,7 @@ void backend_present(NvnTexture *t) {
     }
     g_frames++;
     g_present_count = g_frames;
+    { void vk_latewrite_frame(void); vk_latewrite_frame(); }  // (debug) MHGU_LATE_WRITES (exec.c)
     {   // (debug) MHGU_CONTROL "dump": the next whole frame's passes (exec.c dump_pass)
         extern volatile int g_dump_active, g_dump_request;
         extern int g_dump_no, g_dump_frame;
@@ -1006,6 +1109,47 @@ static void exit_handler(void) {
     _exit(0);
 }
 
+// The window's state for a stall's log line (SDL_GetWindowFlags only reads the window's flags: fine off its thread)
+static void window_state(char *out, size_t n) {
+    SDL_Window *win = ui_window();
+    SDL_WindowFlags f = SDL_GetWindowFlags(win);
+    snprintf(out, n, "swapchain %ux%u %s; window %s, %s%s%s", g_vk.sc_extent.width, g_vk.sc_extent.height, present_name,
+             !(f & SDL_WINDOW_FULLSCREEN) ? "windowed" : SDL_GetWindowFullscreenMode(win) ? "exclusive full screen" : "borderless",
+             f & SDL_WINDOW_INPUT_FOCUS ? "focused" : "not focused", f & SDL_WINDOW_MINIMIZED ? ", minimised" : "",
+             f & SDL_WINDOW_OCCLUDED ? ", occluded" : "");
+}
+
+// Twice a second: a window call stuck for 5 s (once per stall), and once the game has presented, no frame for 10 s
+// while no window call is stuck (once per stall: the game waits elsewhere), with whether the renderer's lock is free.
+static void *stall_watch(void *arg) {
+    (void)arg;
+    uint64_t told_seq = 0, frames = 0, frames_t = plat_now_ns();
+    bool told_frames = false;
+    for (;;) {
+        SDL_Delay(500);
+        if (exiting) return NULL;
+        uint64_t now = plat_now_ns(), f = __atomic_load_n(&g_frames, __ATOMIC_RELAXED);
+        int s = __atomic_load_n(&step_now, __ATOMIC_ACQUIRE);
+        uint64_t seq = __atomic_load_n(&step_seq, __ATOMIC_RELAXED), t0 = __atomic_load_n(&step_t0, __ATOMIC_RELAXED);
+        char state[200];
+        if (s && seq != told_seq && now > t0 && now - t0 >= STUCK_NS) {
+            told_seq = seq;
+            window_state(state, sizeof state);
+            LOG("[vk] stuck %.0f s %s: %s\n", (now - t0) / 1e9, step_names[s], state);
+        }
+        if (f != frames) {
+            if (told_frames) LOG("[vk] frames again after %.1f s\n", (now - frames_t) / 1e9);
+            frames = f, frames_t = now, told_frames = false;
+        } else if (f && !s && !told_frames && now - frames_t >= 2 * STUCK_NS) {
+            told_frames = true;
+            bool free = pthread_mutex_trylock(&g_vk_mutex) == 0;
+            if (free) pthread_mutex_unlock(&g_vk_mutex);
+            window_state(state, sizeof state);
+            LOG("[vk] no frame for 10 s, not in a window call (renderer lock %s): %s\n", free ? "free" : "held", state);
+        }
+    }
+}
+
 void backend_init(void) {
     static bool done;
     if (done) return;
@@ -1025,7 +1169,14 @@ void backend_init(void) {
     vk_shaders_init();
     vk_fsr_init();  // ([Upscaler] FSR: fsr.c)
     create_swapchain();
+#ifdef MHGU_DUAL_SCREEN
+    // ([Dual Screen] SecondDisplay: the bottom screen on Android's second display, second_display_android.c; or, test,
+    // MHGU_BOTTOM_HUD_TEST: its picture saved in shots/ without one)
+    if (!bottom_hud_test_init()) second_display_apply();
+#endif
     atexit(exit_handler);
+    pthread_t watch;
+    if (pthread_create(&watch, NULL, stall_watch, NULL) == 0) pthread_detach(watch);
     SDL_SetAtomicInt(&vk_up, 1);
 }
 

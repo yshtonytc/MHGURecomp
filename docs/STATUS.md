@@ -331,6 +331,9 @@ Fixed 2026-11-04: small monsters ignored players with sync on: it forced flag 0x
 them and left followers running their own AI. Jaggi and Rhenoplos now target and attack both hunters, the same on both games.
 Fixed 2026-11-03: players dropping in some zones (Volcanic Hollow zone 7): uEms100 restarts its first action every update,
 and a master's copy would send each restart. Such a monster is now left out of the sync.
+2026-11-23: flood cap. After a new report of drops on area entry in Volcanic Hollow (not reproduced; uEms100 turned out to be the
+map's breakable rock), any small monster sending more than 20 actions a second, or whose actions arrive faster than that, is
+dropped from the sync for that zone visit on every game, so a looping monster can no longer take the link down whatever triggers it.
 
 ## Text entry (2026-10-21)
 
@@ -402,7 +405,7 @@ Joining a posted quest looks its data up in the list (0x5ba50c): a quest from th
 (rQuestData loc\quest\questData\questData_<n>, resource manager *0x2326a64 vtable +0x30, mode 2) and appended -
 before that the joiner had to switch to the same list ("You do not meet the requirements"). Quest numbers: group *
 10000 + star * 100 + index (0 Village, 1 Hub, 2 Arena, 3 Village training, 4 Special Permit). HP: a Village quest
-started from the Hub or Pub gets [Village Quests] HubHP (2.0) first, then the [Monster HP] factor for the number of
+started from the Hub or Pub gets [Village Quests] HubHP (default 2.0, 1.6 since 2026-11-16, 1.5 since 2026-11-20) first, then the [Monster HP] factor for the number of
 hunters (runtime/hle/hpscale.c; the host's values in a hub, sent with the others). Tested (2026-10-22, two
 instances, the user driving): the switch both ways in the Pub and a Local Play Hub, the Village ★1 list in an online
 hub, a village quest (101) posted by the host, joined by the client from the Quest Board, both departed together;
@@ -592,16 +595,49 @@ falls back to FIFO and waits for the 60 Hz monitor. With VSync = Off (immediate 
 village at 640x360 runs ~138 fps at a 144 target on the R9 (CPU-bound there). Walking speed checked at 30, 60 and
 ~133 fps (player position 2 s apart: ~355 units each time): normal game speed.
 
-Theory, not tested: Pierce ammo hitting more often at high frame rates. Anything the game counts per update rather
-than by the step behaves differently above 60 (and at 30 the other way). Two likely ways for a piercing shot: (1) a
-per-target hit cooldown counted in updates: at 144 fps it would run out 2.4x sooner in real time, so the shot can
-hit the same hit zones again as it passes through; (2) collision is tested once per update at the shot's new
-position: smaller steps sample its path more finely, so fewer hits are skipped on thin parts. Both mean more hits per
-shot, but only up to the ammo's hit count, so damage would rise towards the most a shot can do rather than without
-bound. Other per-update counters (multi-hit attacks, status ticks) could act the same way. To check later: a save
-with a bowgun and Pierce ammo, the same shots into a still monster at 60 and at 144 fps, and count hits (a hook on
-the damage function, or the damage numbers); the shell data (shell\pl\pl_w<weapon>_<n>\..._hit<n> files,
-rBowgunShellData) would show which field holds the interval. A fix would scale that counter by the step.
+Pierce shots and the frame rate (2026-11-24): fixed. Reported: a Grimclaw Tigrex shot from the front takes 3 Pierce S
+Lv1 hits in its small head at 30 fps (3 x 47), never at 60 fps (47, 47, 31) unless the monster is scaled to 150%. The
+earlier theory here (hits sooner, or sampled more finely, at high rates) was wrong: the hits spread further apart along
+the shot. Measured (scratch-pierce rig, below): the shell (uShellPlw04_000, update 0x66c880) hits every 6 frames of
+60 fps (0.1 s) at any rate, and after each hit a 4-frame timer (+0x15d4, run by the step) slows it to 0.7 of its speed;
+but the update that takes the hit (hit count u16 +0x15d8) holds the shell still for that one update: 2 frames on the
+Switch, 1 at 60 fps, 0.25 at 240. From one hit to the next it flew 2 + 2 x 0.7 frames' worth at 30 fps, 3 + 2 x 0.7 at
+60: 253 against 311 units, so the third hit left the head. Fix (runtime/hle/shellstep.c, runtime only): after that
+update the shell stays still for the rest of the 2 frames (the last update's movement cut by the part of it still in
+the stop). Checked, hit 1 to hit 2 = 3.4 x the shell's speed per frame at 30, 60, 144 and 240 fps (237.9 / 247.9 /
+258.7 / 241.8 units for shells of 70.0 / 72.9 / ~71 / 71.1; 144 lands 1 frame of 0.42 late on the 6-frame gate);
+without it 311 at 60 and 386 at 144. MHGU_NO_SHELLSTEP=1 turns it off, MHGU_LOG_SHELLSTEP=1/2 logs it. A shell's speed
+varies about 2% from shot to shot at any rate (70.0 to 71.8 a frame), and the first hit's place by a few dozen units, so
+one shot's hit list is noisy; the spacing isn't. Not covered: the w04_100 / _101 shell classes (other bowgun ammo,
+their own updates 0x67262c / 0x673930), a 3-head-hit line reproduced (aims -7.55 / -4 / -1 gave head, head, neck or
+head, wing at 30 fps too).
+Follow-up (2026-11-25, reporter built f22f026: 3 x 47 now possible at 60 fps but rare): the shell's age (+0x1378,
+frames flown; +0x137c the value at the update's start) isn't added to by the update that takes a hit, and Pierce's
+critical distance (x1.5: the reporter's 47 against 31, the rig's head 15 / 19 against 10 / 13, the second number of
+each an affinity crit x1.25) goes by it. The fix held the shell's position for the rest of the 2 frames but let its
+age run, so each later hit came 1 frame older per hit before it at 60 fps (ages at the hits 11 / 16 / 21-22 against
+12 / 16 / 20 at 30 fps) and a third hit could leave the window. Now the age is held with it: 12 / 16 / 20 at 60 fps,
+12.1 / 16.3 / 20.6 at 144, +4 per hit at 240 (scratch-pierce run.sh at 1600 cm). Checked and ruled out on the way: a
+swept hit test (the previous position +0x1000 made 4x as far back changed no hit). Not explained: at 240 fps the first
+hit came ~150 units earlier along the shot in both runs (x 1889 / 1843 against 1713-1752 at 30 / 60 / 144), the shot's
+age matching its distance, so most likely the held Tigrex's frozen pose (it is frozen at whatever frame it was in).
+The Bow's Pierce arrows (uShellPlw10_000, update 0x67957c; a Pierce-only bow, uncharged shots) had the same kind of
+bug by another way: no stop on a hit, but a hit sets a timer (+0x15ec, 4 frames from the data, stored as 4 minus the
+step) and the update it runs out in moves the arrow at 0.7 of its velocity (+0x1010, per frame) and sets a 1-frame
+wait (+0x1404, counted down by the step) before the next hit can land. On the Switch that update covers frames 2-4
+after the hit, so hit to hit = 2 + 2 x 0.7 = 3.4 frames of the arrow's speed (measured 3.405), and the next update's
+step of 2 ends the wait at once (hit at frame 4); at 60 fps 3.7 (hit at frame 4); at 240 fps the wait held the hit
+back 3 more updates, to frame 4.75: ~4.5 (258-262 units). The monster's hit list (status +0x444..+0x4f8) only records
+attack numbers, no timer. Fixed in the same file: slowed from frame 2 by the factor last seen, the rest taken back
+when the game's timer runs out, the wait cut by what the Switch's next update would take off it, and the part of an
+update past frame 4 not moved. Measured 3.40 at 60, 144 and 240 fps (the next gap x0.70 as at 30), hits 4 updates
+apart at 60, 10 (4.17 frames) at 144, 16 at 240, 2 at 30 (untouched). Not covered: uShellPlw10_001 (update
+0x67bf88), charged shots, Bow Hunter Arts, whether other shells use +0x1404 the same way. Rig:
+scratch-pierce\brun.sh (the Bow save: X draws, R taps fire; NOHOLD=1 FIRE=10 CHARGE=0.1), gaps.sh prints hit-to-hit
+distance over the arrow's speed. The rig (outside the repo):
+C:\MHGURecompile\scratch-pierce\run.sh <tag> <fps>: quest 605 (Tigrex by the Tail) area 1, MHGU_DUMMY=1200 facing,
+MHGU_DUMMY_SCALE=1.0 (the quest's size roll, 0.82-0.96 seen, at object +0x60), MHGU_DUMMY_AIM (aim pitch, player
++0x14b8), MHGU_LOG_SHOTPOS (hitsync.c); a Heavy Bowgun: L + X selects Pierce S Lv1, R held aims, X reloads, A fires.
 
 Monster AI and the frame rate (2026-10-25): measured, no difference. f_276154(monster, group, index, flag) starts an
 enemy's new action (stores it at monster +0x73e0, sends it to the other players) for small and large monsters alike;
@@ -624,6 +660,23 @@ This is not why Maccao prefer Palicoes: Maccao's table (limits 1000 2000 3000 50
 that was set in these tests, set by 0x2b73c8) nets at most 0 for a hunter who only stands near, measured at 30 fps too, while the
 default Palico table climbs. Without Palicoes they attack the hunter, score 0. Most likely the original game's behaviour
 (game data, not compared with the original yet).
+
+Monsters' noticing meters and the frame rate (2026-11-20): fixed. Reported on 0.17.9: monsters that sleep in Arctic Ridge
+area 3 (Tigrex, Blangonga, Deviljho) go there at low HP but never lie down; area 7 sleepers are fine; Rathian sometimes
+hangs around her nest. Each monster keeps a meter per hunter (status +0x29c..+0x2a8) and Palico (+0x2ac..+0x2b8), 0..20000,
+and every update 0x2badac does `meter += (int)(rate * step)`, the rate by the hunter's distance (+150 near ... -2 far, out of
+sight or in another area; the 0x2bb1d8 defaults). A calm monster in an idle or move action whose meter passes 20000 notices
+that hunter (0x2bb5f0 in 0x27f0xx): it saves its routine (+0x73b4..+0x73b8) and runs its mode 3 routine (a Blangonga
+looks around, actions 1:5 and 1:6), and 0x2bb680 empties the meter. At 240 fps (step 0.25) the -2 became 0, so a meter
+filled in the fight never drained: the monster fled to area 3, walked to its spot (action 2:20), started turning to face its
+sleeping direction (2:1) and noticed the hunter two areas away on the next update. Repro (scratch-sleep, quest 413 The New
+Tenant: start in area 6, Blangonga's HP poked to 400, hit until it flees, hunter stays in area 6): 6 of 6 runs at 240 fps
+looked around and walked off, 60, 120 and 30 fps slept every time; the meter sat at 20000 for the whole retreat. Fix
+(runtime/hle/hatestep.c, beside the attention scores): 0x2badac runs in 30 fps updates with the step 2.0, except while the
+reset flag (status +0x2bc) is set. With it the meter drains 120 a second away from the hunter, as at 30 fps, and 2 of 2
+runs at 240 fps slept. MHGU_NO_NOTICESTEP=1 turns it off (for comparing). Not checked: other areas and species (same
+code), Rathian in particular. Why area 7 sleepers were fine is not known (maybe their routine reaches the sleep action
+without an idle or move action in between).
 
 Monsters' stall timers and the frame rate (2026-11-05): fixed. Reported: above 30 fps large monsters "forget" how to close the gap,
 circle the hunter and run diagonally (Rathian). While a monster hunts a target it can see, 0x2c3d08 counts how long it has gone
@@ -683,11 +736,96 @@ Test setup (scratchpad, not in the repo): quest 404 (Hunt a Volvidon) moved to t
 stage from; the Arena's b_m09em062_00 spawn), MHGU_QUICKHUNT=404, then the hunter walks from the waiting room (north
 2 s, east 2.7 s, north through the gate: an area change, so the hunter can't be placed there by poking its position).
 
+Uroktor's leap out of the ground (2026-11-22): fixed. Reported: alone (not in multiplayer), an Uroktor (ems040, small
+monster, species 0x1028) that drills up out of the ground snaps from the drill into standing instead of leaping into the
+air and landing; its half-out spit attack is fine. Action 7:44 (update 0x13085e8, sub-state +0x1a1): when the drill
+motion ends it stores a launch speed (size x 12.5, 100 here) to the vertical velocity, moves once with it (0x27d718:
+pos += vel * t + acc * t^2 / 2, t = the monster's step +0x1c, 2 at 30 fps), then sets the velocity to 25 and the gravity
++0x24 to -0.6. The airborne sub-state lands (0x2bf5a0, then mode 0 via 0x2bc8b0 puts it on the ground height +0x5b4)
+as soon as it is below ground + size x a species height (~150), rising or not. At 30 fps the launch lifts it 200 and it
+arcs up to 724 (4.8 s action); at 240 fps it lifts 25 and lands the next update (peak 29, 3.4 s). Fix (emjump.c
+emjump_launch, gen.py PATCHES 0x1308838, the launch speed's store): the speed that makes that one move 2v + 2a, as long
+as the 30 fps update's; untouched at 30 fps and below; MHGU_NO_EMJUMP=1 turns it off too. Checked at 240 fps: five
+natural leaps peak at 724-726, 4.8 s, and the height every 100 ms matches the 30 fps run within 1-2 units. Seen right in
+game by the user. Searched: no other call of the one-update move (0x27d718 / 0x27d7c4, 131 calls) is followed by a reset of
+the vertical velocity. Rig (scratchpad, C:\MHGURecompile\scratch-urok): quest 427 (Uroktor quest, Volcano), start area 4,
+then out and back in (STICK_DOWN 700 / STICK_UP 900 at 240 fps): small monsters aren't spawned in the area a hunt starts
+in with MHGU_START_AREA, only after an area change. MHGU_EMTRACE_ZAKO=2, acts.py (per action: length, height range) and
+curve.py (height every 100 ms of the leap). Finding the code: the zako set lists (quest\zako\emSetList, "ESD" blocks per
+area, species byte = ems number) gave 0x28 for Volcano / Volcanic Hollow only; interpwatch on status +0x44 with the
+class's vtable entries (0x1a15944) as the function list showed the writers.
+
+Running with the Moofy (2026-11-22): fixed. Reported: in Bherna, carrying the Moofy and running (R held) is far too
+fast at 240 fps; walking with it is right. The carry run (action function 0x494200, motions 0xc91 / 0xc92) moves the
+hunter by the animation (cModel root motion, 0xb55aa0, step-based) and in its state 1, every update the stick is held,
+also pushes them along their facing: 0x494308, `pos += (sin, 0, cos) * 2.5` (angle = player +0xfec x 2pi / 65536), no
+frame step: 75 units a second at 30 fps, 600 at 240. Walking has no push. Fix (runtime/hle/plcarry.c, gen.py PATCHES
+0x49430c, the `vmov.f32 s6, #2.5`): 2.5 x the player's step +0x1c / 2; the same at 30 fps. 0x49028c is the same code
+with motion 0x138f (not identified), patched the same (0x490380). MHGU_NO_PLCARRY=1: the original. Measured (one game,
+fps switched live, the test save; the user picked the Moofy up): 405 units/s at 30, 60, 120 and 240 fps (the original
+at 240: ~930). A scan of the player code (0x470000-0x4d0000) for `pos += ...` stores without the step found only these
+two per-update pushes (0x4ae390, 0x4be178, 0x4c89dc are one-off placements). Found with interpwatch on player +0x40
+(the town hunter, r0 of 0x48d1f0) with the player's vtable entries (0x1948534) as the function list. Not checked: the
+0x138f twin in game, eggs carried in a hunt.
+
+Monster turns and the frame rate (2026-11-21): Duramboros fixed, Deviljho not reproduced. Reported: one of Duramboros'
+spinning attacks far too fast at high frame rates; a Deviljho bite (calm, not enraged; not confirmed by the reporter).
+Rig (scratchpad, C:\MHGURecompile\scratch-emspeed): quest 627 (Duramboros alone) / 1007 (Deviljho alone),
+MHGU_START_AREA=1, MHGU_SUMMON=1200, MHGU_EMTRACE=2 (now with the heading, status +0x54, and the motion speed, status
++0x398, every update), `emsweep 7 0 90` at 30 and 240 fps side by side, then per action: length, path, peak speed,
+total turn and peak turn rate. Duramboros 7:32 (a charge ending in a long turn on the spot): at 30 fps 225 degrees in
+all, peak 180 deg/s; at 240 fps 1168 degrees, peak 1308 deg/s. Writer (interpwatch on +0x54): 0x10dc75c, turning by
+`C / ((C2 / speed) * step / 2)` per update, where the block before it (0x10dc6a8) has `C / (C2 / speed) * step / 2`:
+the same at 30 fps, 8x per update (64x in real time) at 240. Fix (runtime/hle/emturn.c, tools/gen.py PATCHES
+0x10dc744, its vdiv): the quotient times (step / 2)^2, the integer fraction carried per monster; MHGU_NO_EMTURN=1 the
+original. Checked: 7:32 at 240 fps 224 degrees, peak 179 deg/s (3 runs); 30 fps unchanged (225, 180). The other
+group 7 actions of Duramboros last, move and turn the same at both rates. A scan of main for a division by
+something made from the step (vldr [rN, #0x68] then vdiv within 16 instructions) finds this one only in monster code;
+the other heading writes that use the step (0x109a0dc, 0x109a3e8, 0x10e8b0c) multiply. Deviljho (em043, action code
+around 0x1075000-0x1085000): all 91 group 7 actions at 30 and 240 fps last the same, have the same motion speeds,
+paths and turns (differences only where the AI-driven aim differs between runs); his turns and moves go through the
+shared 0x277114 (heading) and 0x2c2864 (root motion), both stepped; his own unscaled +0x54 / +0x40 writes (0x107ca6c,
+0x107d9c8, 0x1079b00, 0x1079da8) are one-off offsets when a motion starts. Not covered: actions the sweep plays with
+the hunter straight ahead, so a bite that homes in on a hunter at its side was not seen turning; enraged vs calm
+variants were not told apart.
+
+Hellblade Glavenus' tail slam (2026-11-25): no frame-rate difference found. Reported (the Pierce reporter, recomp at 60
+fps, a GIF): in the black-tail state, the overhead tail slam (rears back, pivots ~90 degrees, tail down beside the
+hunter) "loses its hit"; players also say Glavenus misses this slam slightly now and then on its own. Rig
+(C:\MHGURecompile\scratch-glav, run.sh <tag> <fps>): Hub quest 41201 can't start from the Village (0x2125b8 crash),
+so the scratch-qlist save goes to the Hunters' Pub (X, RIGHT, A, DOWN, A) and `depart 41201` from there;
+MHGU_START_AREA=1, MHGU_SUMMON=1200, MHGU_EMTRACE=2. New debug aids: MHGU_EMACT_PLACE="<cm>_<deg>;..." puts the monster
+that far from the hunter, the hunter that many degrees off its facing, before each emact (cycling the list); the
+[em] trace has the hunter's x z ("pl"); emact logs the monster's status block and scale (+0x60); MHGU_SUMMON logs
+"hunter hit" when the hunter lost HP (not the game's resets of HP to its maximum, +0x13d8). The slam is 7:82
+(2.9 s; two variants: ~240 units with a turn of up to ~50 degrees, or ~900 straight on). All 24 group 7 actions last
+the same at 30 and 240 fps. Moves first seemed 7% shorter at 60 / 240 fps (7:82 straight: 944 against 882), but
+that was the quest's random size: 7:82 at 900 cm straight on, 30 fps scale 1.177 path 942, 60 fps scale 1.133 path
+907, 800.3 / 800.5 per unit of scale; turns 24.8 / -10.9 against 24.8 / -10.4. Position writers (interpwatch): the
+motion's root motion 0x271e70 (from 0xb52c38), copied to status +0x40 at 0x2c2864, then the slope factor 0x4330b8
+(max(1 + dot(move dir, slope) * k, 0.1), direction only).
+Hits on the hunter, same day (follow-up report: "melee hit detection disappears for some monsters"): no difference.
+One run (same monster size) alternating 30 and 240 fps live (control "fps") between attempts, each from the same start
+(MHGU_EMACT_PLACE), hunter pinned with MHGU_SUMMON_HP=max (topped up to its own maximum, +0x13d8, every update; each
+loss below it logged as a hit; the default 5000 left the HUD's bar empty and hid most hits). Real hits only (more
+than 2 HP: Hellblade's fireblight ticks 2 every 0.67 s), 100 ms or more into the attempt: 7:15 (a tail attack)
+15/28 at 30 fps, 16/28 at 240; 7:82 (the slam) 16/28 and 17/28; 7:13 8/8 and 7/8; 7:20 8/8 and 8/8 with the same
+damage at the same times. A first small run (8 each) looked like fewer tail hits at 240 (3/8, 4/8): chance, gone with
+20 more each (9/20 vs 13/20, 10/20 vs 13/20). Hunter attacks for comparison: the attack object (0x368960 sets it up;
+player +0x3020) has +0x5c / +0x60 = frames to open / open, as floats from its data, counted down by the step (seen at
+240 fps: 10.0 down to -0.026, no whole numbers). Monster attacks don't go through 0x368960 (its callers: 0x4b737c,
+hunter; 0x1337300, kind 3) nor through 0x370968 against the hunter (MHGU_LOG_PLHITS=1 in hitsync.c logged none while
+the hunter lost HP); their timing wasn't traced, only measured as above. Scripts: scratch-glav run_fps.sh (ACTS,
+STARTS, REPS, GAP), hits2.py. Not covered: the black-tail state (the quest's Glavenus had its tail glowing from the
+start in every run), other monsters, 60 fps (only 30 and 240), the reporter's own setup.
+
+Start in an area (2026-11-18, debug, runtime/hle/quickhunt.c): MHGU_START_AREA=<n> starts every hunt in area n of its map, by replacing the area the random start picked (town +0xc9, copied to sGameControl +0x49 by the town's move 0x8bdfd0 when departing) for low rank's camp too. With MHGU_QUICKHUNT=<quest>, straight from start-up into that area, e.g. MHGU_QUICKHUNT=204 MHGU_START_AREA=8 (Harvest Tour: Arctic Ridge). Checked on that: the game's pick was area 0, the hunter arrived on the snowfield of area 8 ("hunter in area 8" in the camera trace). An area number the map doesn't have is not checked. Not a teleport: it only acts when departing.
+
 Training dummy (2026-11-02, debug, runtime/hle/dummy.c): MHGU_DUMMY=1 holds the zone's first large monster in front of the hunter (240 cm, or MHGU_DUMMY=<cm>), in the hunter's area, its motion stopped, outside the camp: nothing can be hit in the camp. Every hit on it takes 1 HP and logs the damage it would have done, so attacks can be tested without chasing a monster; GU has no training area. Tested hidden on the unmodded game, quest 404 (Volvidon), Charge Blade: walk out of camp, hits logged per part. What it rests on: a player's weapon attack is one object at player+0x3020 (+0xc owner, +0x34 u16 its number, +0x38 s16 its motion value: damage is proportional to it, +0x5c / +0x60 frames until its hitbox opens and how long it stays open). A monster remembers the numbers that hit it (status +0x448, a fixed list; 0x36ba4c checks it in the collision update 0x36b15c): one hit per number, so a new number makes a new hit while the hitbox is open.
 
 Buff icons and the frame rate (2026-10-28): fixed. Reported: with two or more buffs the icon beside a name on the HUD's status plates (yours, the other hunters', the Palicoes') takes turns far too fast at 240 fps. The plates (cUIOStatusPlate / cUIOStatusPlateGuests, update 0x834314) call 0x834d00 once per update for each of their two icon slots ({index, countdown, shown} at plate +0xf0 / +0xfc; tables of 54 and 36 icons at image 0x1839250 / 0x18395b0, tested against the player's buff flags +0x2840..+0x2864, rebuilt from the buff timers each update at 0x49f0xx): the countdown drops by 1 per update and is reloaded with 20, 0.67 s at 30 fps, 0.08 s at 240. Fix (runtime/hle/buffcycle.c, tools/gen.py PATCHES): the decrement (0x834d20) takes step / 2 updates (at most 1) in 1/65536 units and the reload (0x834ef4) is 20 of those. Checked at 240 fps (test save, quest 101, two buffs from their timers: player +0x287c and +0x2880 poked to 3000): the two icons change every 0.667 s, 12 times in 8 s.
 
-Camera stuck after a cut-in at high frame rates (2026-11-15): fixed, not yet confirmed by the reporter. Reported (also on emulators, only at high frame rates): a ledge breaking in the Ancestral Steppe's area 7 takes the camera for a cut-in, which then stays looking down at the area for the rest of the hunt. The Steppe is stage 11 (m11d; stage 22 is the Desert, 5 the old Desert): its breakable ledges (uKowareModel, listed by the gimmick manager *0x1a977a0 at +0x21c, count +0x27c; area +0x182, id +0x188 = the area's sub-area, type +0x189, state +0x184, machine 0x713260) are 2:1-4, 3:1, 4:1-2, 7:1 (type 6, 200 damage) and 9:1. They collapse from hits (+0xd0 adds to +0x180 against +0x17e, 0x715a54) or a command (0x714f9c; cmd 0x18 breaks an id 1 ledge at once). A monster in the ledge's area and sub-area is told to fall with it (0x2a5900, status +0x91b); a hunter there falls (0x13e51bc), and the cut-in comes from the common script's camera helper 0x5d6df0 (state s16 at r1: 0, 10 showing, 100 done): every update the script says "show" it pushes its view on the stage camera's stack (camera +0x490, push 0x2162a8, pop 0x21635c, count +0x39c; the quest camera only drives itself with the stack empty), and it pops once at the end. It never checks that its view is already up: at 30 fps the script says "show" for one update (1 push, 1 pop), at 240 fps for 4 (4 pushes, 1 pop), and the 3 views left hold the camera on the cut-in's view for good. Fix (runtime/hle/stageview.c, tools/gen.py PATCHES 0x5d6e74): in state 10 the push is skipped. Checked (quest 924 started in area 7, the hunter dropped into sub-area 1 at -437, 100, ledge 7:1 broken with cmd 0x18): 240 fps before, 4 pushes / 1 pop and the camera stuck looking down at the area (as in the report); after, 1 push / 1 pop and the camera back behind the hunter 1.5 s later; 30 fps, 1 / 1 before and after. MHGU_NO_STAGEVIEW=1: the original. Not tested: the other users of 0x5d6df0 (common script cameras: village NPC cameras, the other ledges), a real monster ramming the ledge, Hub / multiplayer. Ruled out on the way (all step-based): monster cut-ins (vfunc +0x1c0 / +0x1c4 0x26f87c, sequencer 0x26f3a4 with +0xb621 / +0xb622, slot 1 type 5), the motion camera slots (+0x230 / +0x2f0, play 0x21d4a0, stop 0x21d728), the hunter-driven modes +0xa98 / +0xacc / +0x470. Debug aid: MHGU_CAMTRACE=1 (runtime/hle/camtrace.c) logs every camera play / stop, stage view push / pop, mode change and ledge state with its caller; for tests MHGU_CAMTRACE_START_AREA=<n> (the hunt's random start area, town +0xc9 at 0x8bdfd0), MHGU_CAMTRACE_HUNTER_AT=<x>:<z>:<s>, MHGU_CAMTRACE_LEDGE=<area>:<id>:<cmd>:<s>, MHGU_CAMTRACE_SCAN=<s> (sub-areas on a grid), MHGU_CAMTRACE_MONTAGE=<s> (a monster cut-in).
+Camera stuck after a cut-in at high frame rates (2026-11-15): fixed, not yet confirmed by the reporter. Reported (also on emulators, only at high frame rates): a ledge breaking in the Ancestral Steppe's area 7 takes the camera for a cut-in, which then stays looking down at the area for the rest of the hunt. The Steppe is stage 11 (m11d; stage 22 is the Desert, 5 the old Desert): its breakable ledges (uKowareModel, listed by the gimmick manager *0x1a977a0 at +0x21c, count +0x27c; area +0x182, id +0x188 = the area's sub-area, type +0x189, state +0x184, machine 0x713260) are 2:1-4, 3:1, 4:1-2, 7:1 (type 6, 200 damage) and 9:1. They collapse from hits (+0xd0 adds to +0x180 against +0x17e, 0x715a54) or a command (0x714f9c; cmd 0x18 breaks an id 1 ledge at once). A monster in the ledge's area and sub-area is told to fall with it (0x2a5900, status +0x91b); a hunter there falls (0x13e51bc), and the cut-in comes from the common script's camera helper 0x5d6df0 (state s16 at r1: 0, 10 showing, 100 done): every update the script says "show" it pushes its view on the stage camera's stack (camera +0x490, push 0x2162a8, pop 0x21635c, count +0x39c; the quest camera only drives itself with the stack empty), and it pops once at the end. It never checks that its view is already up: at 30 fps the script says "show" for one update (1 push, 1 pop), at 240 fps for 4 (4 pushes, 1 pop), and the 3 views left hold the camera on the cut-in's view for good. Fix (runtime/hle/stageview.c, tools/gen.py PATCHES 0x5d6e74): in state 10 the push is skipped. Checked (quest 924 started in area 7, the hunter dropped into sub-area 1 at -437, 100, ledge 7:1 broken with cmd 0x18): 240 fps before, 4 pushes / 1 pop and the camera stuck looking down at the area (as in the report); after, 1 push / 1 pop and the camera back behind the hunter 1.5 s later; 30 fps, 1 / 1 before and after. MHGU_NO_STAGEVIEW=1: the original. Not tested: the other users of 0x5d6df0 (common script cameras: village NPC cameras, the other ledges), a real monster ramming the ledge, Hub / multiplayer. Ruled out on the way (all step-based): monster cut-ins (vfunc +0x1c0 / +0x1c4 0x26f87c, sequencer 0x26f3a4 with +0xb621 / +0xb622, slot 1 type 5), the motion camera slots (+0x230 / +0x2f0, play 0x21d4a0, stop 0x21d728), the hunter-driven modes +0xa98 / +0xacc / +0x470. Debug aid: MHGU_CAMTRACE=1 (runtime/hle/camtrace.c) logs every camera play / stop, stage view push / pop, mode change and ledge state with its caller; for tests MHGU_START_AREA=<n> (now in quickhunt.c: the hunt's random start area, town +0xc9 at 0x8bdfd0), MHGU_CAMTRACE_HUNTER_AT=<x>:<z>:<s>, MHGU_CAMTRACE_LEDGE=<area>:<id>:<cmd>:<s>, MHGU_CAMTRACE_SCAN=<s> (sub-areas on a grid), MHGU_CAMTRACE_MONTAGE=<s> (a monster cut-in).
 
 Oversized decorations crash the equipment view (2026-11-10): fixed, not tested in game. Reported from emulators: a hunter whose armor is modded for more slots slots a decoration bigger than the unmodded piece allows (a 3-slot decoration in a 2-slot piece); other hunters crash when they view that hunter's equipment in the UI (confirmed by the user on emulators; the console runs the same code). Cause, in the game's code: 0x2db66c gives a piece's free slots, its slot count (from your own unmodded data) minus each decoration's size (`subne r8, r1, r0` at 0x2db770), returned as a u8, so 2 - 3 = 255. The slot icons (0x750570) keep the piece's three slot widgets in an array on the stack (sp+0x10) and draw `free` empty slots after the decorations (loop 0x750680): 255 reads past the array, each word handed to the UI calls (0x76e6a8 / 0x76e6fc) as a widget. Nothing checks another hunter's decorations on arrival. Fix (tools/gen.py PATCHES): the free count is clamped at 0 at 0x2db778 (`ldrh r1, [r4, #0xa]`, which every subtraction reaches), so all of 0x2db66c's callers (0x750570, 0x780a60's slot widget, 0x5c1be0...) see 0. Such a piece then shows its decorations' icons without an empty slot; skills are unaffected (0x2ddd48 reads all three decoration ids without the slot count). Also covers your own save after a slot mod is removed. To test: two instances, one save with a 3-slot decoration in a 2-slot piece (decoration ids at the piece's entry +6/+8/+0xa), view that hunter's equipment from the other.
 
@@ -742,6 +880,10 @@ Lag compensation (2026-11-08, branch feat/lag-compensation, prototype, tested wi
 Lag compensation for bows and bowguns (2026-11-09, two instances on one PC, 30 fps, 640x360): the same design as melee, because shells go through the same 0x370968 on every game. An earlier note here said they are hit-checked on the owner only; the trace shows otherwise: 6 shots, 13 arrow hits on the shooter's game (+0x7420 0) and 13 on the owner's copy (+0x7420 1), each with attack +0x10 = 2, +0x6e = 0, +0x70 = the player, +0xc = the shell, and the same fields changed as a melee hit (status block +0x444, +0x484.., +0x4e4, +0x4f0, the per-swing list; +0x2cc changes too and is not reported, like a melee hit's). Reported per hit, so a Rapid shot's arrows or a Pierce shot's hits are counted one by one. Which shells: by vtable (SHOT_VT in hitsync.c), uShellPlw10_000 / _001 (bow) and uShellPlw04_000 / _100 / _101 (w04 for both bowguns); every other player shell stays as it was. A copy's arrows still fly and spark on the owner, with no damage. Mixed versions: shots are their own message kind (M_SHOT, which a melee-only build drops) and the Hello gets a fifth byte, caps bit 0 = this hunter reports shots (older builds send and read only four bytes); the owner ignores a copy's shots only from a hunter with that flag. Checked (host owns the monster, MHGU_DUMMY=300 + MHGU_DUMMY_SLOT=1 + MHGU_DUMMY_FACE=1, control "dummy 800 180" on both, the client shooting, 1 damage per hit): on / on, 8 shots: 24 reports sent, 24 applied, the owner's copy landed 16 hits, all ignored; owner HP -33 between the first and the last report = 23 reports + 10 Palico hits. Client off: no reports, nothing filtered. Owner off / client on: 19 sent, none applied. Melee-only owner (the build before this change) / this client: 21 sent, none applied, nothing filtered. This owner / melee-only client: no shot reports, nothing filtered. Not tested: a bowgun (the vtables come from the class list and the bow's was confirmed live; the only save had a bow), uShellPlw10_001, Pierce and other shot types, bow / bowgun Hunter Arts, real damage on a free monster or with added lag, 3-4 players, two PCs. Explosions that bowgun ammo may spawn through other shell classes (uShellPlEffect*) stay as they were. The user's bow save (run3/bowsave, Rapid bow) fires with X held about 1 s, then R; X alone only charges.
 
 Lag compensation in crossplay, with the emulators' Forge plugin (2026-11-10, branch feat/lagcomp-plugin-interop): hitsync.c ported to a Forge plugin for emulator players (lagcomp.nro, "Lag Compensation", kept outside this repo in C:\MHGURecompile\lagcomp-forge with its notes). The plugin can't use F_AUX, so it sends the same messages (magic 0xE7, Hello / Report / Shot, same layout) as UDP broadcasts on port 47318 of the local play network, through the game's own nn::socket; Ryujinx's LDN proxy carries any port. Now the port does the same in crossplay (ldn_crossplay(): a Ryujinx LDN lobby or a room): hitsync sends there with ldn_send (UDP broadcast, port HITSYNC_UDP_PORT) instead of ldn_send_aux, and vsock_deliver hands datagrams to that port to hitsync_aux_received; outside crossplay it stays F_AUX, so older builds keep working with this one. LagCompensation is no longer off in crossplay. A Hello or report carrying our own slot is dropped (a broadcast can come back). forge.c doesn't start a plugin named "Lag Compensation" (logged): the port has it built in, and with both on every hit would be reported twice. Checked: recomp-only hub, two instances, testsave/lagcomp_test/full.sh: 10 reports sent, 10 applied, 10 copy hits ignored, as before. Crossplay, one PC, this build with RyuServe = On as the LDN server and a Ryujinx 1.2.82 copy (C:\Ryujinx\lc1, Forge 1.5.1 + the plugin's test build that holds the monster like MHGU_DUMMY_SLOT=1), Great Sword, 1 HP per hit: the port's log "slot N reports its hits (crossplay, UDP)" and the plugin's Hello both ways. Port host owns the monster, Ryujinx swings: 6 reports sent by the plugin, 6 applied by the port, 6 copy hits ignored, HP -10 for 10 damage calls. Ryujinx posts the quest and owns it, the port's hunter swings: 9 sent by the port over UDP, 9 applied by the plugin, 9 copy hits ignored, each report consumed as one hunter damage call (3 more kind-1 calls of 10-13 damage on another part came with no swing, on both games: not weapon hits, left as they were). The plugin with the port's built-in one on the same machine: "plugin lagcomp.nro (Lag Compensation) not started". Not tested: suyu-style rooms, 3-4 players, two PCs.
+
+Lag compensation: hits from another quest in the same hub (2026-11-19). Reported against 0.17.7 as monsters "spamming one attack" in single player, and gone with LagCompensation off. The messages go to everyone in the hub (F_AUX, relayed by the host), not only to those in the quest, and a hunter keeps its hub slot in any quest. A report was matched only by monster network id, which is 0 for the first large monster of any quest, and by slot. So an owner alone in its own quest applied the reports of a hunter in another quest (one who doesn't run that quest's monster) to its own monster: damage, part damage on that monster's part numbers, KO and statuses, and the flinch with the other map's hit direction and position. Aggro for that slot stayed 0 (the game seems to drop aggro for a hunter not in the quest). Measured with three instances in one hub (testsave/lagcomp_test/three.sh, leak3.sh): host and joiner share the host's quest with the dummy held for the joiner, who swings; join2 posts its own quest and departs alone. Before: the joiner sent 70 reports, the host applied 70, and join2 applied 37 to its own monster, its HP falling. In a quest, sPlayer's slots (+0x1c) hold only that quest's hunters (join2: only slot 2; host and joiner: 0 and 1), so the owner now applies a report only from a slot that has a hunter in its quest (in_quest in hitsync.c), and drops the others (logged with MHGU_LOG_HITSYNC=1). Each game's own Hellos needed no change: an owner ignores only its copies of hunters in its quest, and a hunter's slot is unique in the hub. The emulators' Forge plugin (lagcomp-forge, outside this repo) has the same receive code and needs the same check. An A/B with the monster action trace (Hub 3 star Glavenus, free monster, HP topped up, 100 ms added each way, the joiner swinging, 20 min per arm, about 450 actions each) found no attack repeating with the setting on or off in a shared quest.
+
+Part breaks while a monster is down (2026-11-16, runtime/net/partsync.c; fixed 2026-11-17 after a report that it did nothing): the 0.17.6 version never applied anything on a client, for two reasons. 0x297ddc is only reached for a monster the game runs (the monster update branches off before 0x2a5900 -> 0x297ddc on a client), so packs waited there forever; and the vtable check used the heap range, but vtables are in main (0x019f1d44), so slot 0x428 would not have been called anyway. Now the client applies packs from an outer hook on the collision update 0x36b15c (every game, every update; dummy.c's hook sits behind it), finding the monster by id in sEnemy +0x1c. Tested (two instances, testsave/lagcomp_test rig, Glavenus held by MHGU_DUMMY, so one long action like a down; MHGU_LOG_PARTSYNC=1; the host's part 0 break count poked 0 -> 1): host "sent", client "received" then "applied, breaks now 1" within 3 s, and the client's party list showed the break icons at once. Before the fix the same run logged "received" and nothing more. Not tested: a real break by hits during a KO / trap / topple, the broken mesh itself (the head was off camera), a sever, 3-4 players. Original notes: Reported: in multiplayer a part broken while the monster is downed or staggered breaks at once on the host and only once the monster stands up on the clients. The original game does this: a client learns the parts only from netEmAction (dmPack[8] = break count << 12 | flinch HP & 0xfff, spPack[2] the same for the severs of the first two parts whose dtbase entry (monster +0x75ec, +0x68, 10 bytes each) has sever HP at +6), which the game running the monster sends from its set-action function 0x276154 (0x2765f8, through the type switch 0x2cafe8: type 1 = slot 0x42c 0x2cb330, packing at 0x2cb8a8) when an action starts. A break of a standing monster comes with a flinch (a new action); a down is one long action. The client's receive 0x2cc154 hands the packs to vtable slot 0x428 (0x2cb22c: the game's break 0x299d64 / 0x299f98 until each count, 0x29d428, is the received one; it stores the HPs) and then sets the action again (0x276154), so resending netEmAction would restart the knockdown. Fix: an outer hook on 0x297ddc (every game calls it for every large monster each update; hitsync.c's hook sits behind it): after it, the game that runs the monster (+0x7420) compares the 8 break counts (status block +0x3bc, 12-byte records) with the last update's and, when one went up, sends the packs as netEmAction would (F_AUX, magic 0xE8); before it, a game that doesn't run the monster takes a waiting pack with more breaks than it shows and calls slot 0x428 with it (dropped if +0x7424 names another slot as the owner). The next netEmAction then finds the counts there and breaks nothing twice. Older builds drop the message; off in crossplay (F_AUX). MHGU_NO_PARTSYNC=1: the original; MHGU_LOG_PARTSYNC=1 logs sends and applies. To test: two instances, a hunt, break a part while the monster is down (KO, trip, trap, mount topple) and watch the client; also a part break reward, a tail cut while down (the severs travel as in netEmAction, the cut itself is not part of this), the monster dying while down.
 
 Two-button inputs and the frame rate (2026-10-28): fixed. Reported: the Hunting Horn's X+A (and the Lance's R+X+A)
 need both buttons almost together at high frame rates. The player's input update (0x47ca28, every weapon; called
@@ -985,6 +1127,22 @@ itself has no networking for this and never changes: `mhgurecomp` always just st
     code comes back. A second check got a 304 from GitHub.
 - Not covered: a release that drops a file leaves the old copy behind, and a new `bonus/system` is never installed,
   since bonus/ belongs to the player.
+- Release notes (2026-11-19): after an install the updater writes `update/changelog.txt` from the release JSON it
+  installed (`body`, updater/json.c json_body; save_changelog in updater.c). Line 1 is the tag; the rest is the
+  notes up to the `## Installation` line, as plain text: the `# ` title, the `**This is a pre-release` line, `**`,
+  `*` and backticks are dropped, `## ` headings keep their words, `* ` bullets become `- `, CRLF becomes LF. No
+  extra request: it's the JSON the update check already fetched. The game's settings menu (Menu Options, General)
+  shows "What's new in <version>" only when line 1 equals MHGU_VERSION (runtime/settings_panel.cpp changelog(),
+  read once from the working folder, i.e. the game folder or MHGU_HOME). It opens View::Changelog: the notes in a box
+  that fits the window and scrolls (wheel, up / down, Page Up / Down), `- ` lines drawn as bullets indented by their
+  leading spaces, and Back. A release installed by hand, a pre-release, a development build or Android has no
+  matching file, so no row.
+  - Tested 2026-11-19: a fake release (0.99.0, the 0.17.9 notes with CRLF) served locally to a copy of the updater
+    with its error box turned off: installed, notes saved as intended. In the game with a matching file: the row,
+    the dialog, Back, and scrolling notes 4x as long at 1280x720. Not tested: Korean / Chinese / Spanish menus.
+  - Seen while testing: started from the Claude app's tools, `make`-built updaters (this change's and HEAD's alike)
+    and sometimes a hand-built one stop at "mhgurecomp.exe is not here" and create no update/ folder, though the
+    file is there; a hand-built copy succeeded in other runs. Not seen from Explorer so far; cause not found.
 
 ## Fixed (2026-10-28): Linux sleeps were busy loops
 
@@ -1192,6 +1350,23 @@ at 30 and 120 fps: 500 counts = 40.1 degrees aiming and charging, as out of aimi
 within 3 units of the aim while turning; pitch stops at +-56 degrees. Not tried by hand with a real mouse, nor with
 the Bowguns' aim (other modes; mode 1's pitch is +0x2714 instead), nor the aim invert settings.
 
+Aiming on the move (2026-11-24, report: with the mouse, LBG / HBG aim turned left and right while walking but not up
+and down; the stick did both): walking aimed (bowguns 0002:016, the Bow's R 0002:000) runs 0x4a1738 and then the
+camera's stick handler 0x2255cc in each update, so 0x4a1738's hook stood aside and the mouse went to the camera. Its
+yaw stays (the hunter follows the camera), but the aim camera 0x226e84 (r0 = the camera) still runs after them and puts
++0x9e8 back from the hunter's aim pitch, so the mouse's pitch was lost. 0x226e84 is hooked too: when it ran for the
+camera since the stick handler's last run, the stick handler's hook gives the mouse's pitch to the aim (as 0x4a1738's
+hook does, mode from its last call, the aim invert option) and the yaw to the camera as before. The Bow charging on the
+move (X held, 0010:002 / 0010:013) also runs both, but not the aim camera: its pitch is the camera's own and stays on
+the camera path. The yaw in that state went only to the camera, and the hunter's yaw and the eye's (+0x9dc) eased
+toward it over 10+ updates, still turning after the mouse stopped (the user: "floaty", like the stick); it now goes
+to both straight away too (traced per update in ttest.sh: the eye matches the camera's yaw every update and stops with
+the mouse; the hunter keeps the game's own small offset while walking). The user checked it by hand: feels right.
+Tested (scratch-hbg mtest.sh / ltest.sh / btest.sh, `MHGU_MOUSECAM_LOG=1`, W held + mousemove 0 -400):
+HBG walking aimed, camera pitch 0439 -> 1683 (was stuck at 0442 before); LBG (control `weapon 6 1` in town, then
+`depart 101`) 0445 -> 1688, mode 0 as the HBG; Bow R walking 043a -> 167a (was stuck too); Bow charging walk still on
+the camera path; standing aim unchanged. Not tested: the aim invert settings, a real mouse by hand.
+
 ## Mouse wheel on the item bar (2026-10-31)
 
 The captured mouse's wheel turns the item bar directly (runtime/hle/itembar.c): up the item to the left, down to the
@@ -1316,6 +1491,64 @@ old way while on.
   tail-call threaded ops (each handler jumping to the next) might give another ~1.5x; matching an emulator would take a
   JIT (AArch32 -> x86-64 and -> AArch64), a project of its own.
 
+## Interpreter: JIT on x86-64 and AArch64 (2026-11-24)
+
+Report: every loading screen slow with MHGU Definitive Edition 3.1.0 (MH4U Port renamed; now 15 monster entries).
+Its quest_group_fix hook (quest_group_rename, module/quest.c, the quest list loader step 0x3b7de8: every list entry
+against every monster's 12 slots, ~2 M instructions a call, ~1000 calls a town load, ~2.2 G instructions in all) made
+the town's load (title -> town, quickhunt) 18.6 s without the mod -> 23.5 s with it, 18.9 s with only that patch
+taken out of the IPS. A fix is the mod's (slot pairs made once, an ID range check first: a PR to its author). Since
+bigger code mods will come, the interpreted code now runs as x86-64 code (runtime/interp_jit.h, included by interp.c;
+runtime/jit_mem.c the executable memory):
+- Blocks are interp.c's (block_build's rules, the same decode_op), translated: data processing (every shift form;
+  register-specified shifts unless their carry is needed), MOVW / MOVT, every LDR / STR / LDRB / STRB / LDRH / STRH /
+  LDRSB / LDRSH / LDRD / STRD addressing mode, LDM / STM, B / BL / BX / BLX, MUL / MLA / MLS / UMULL / SMULL / UMLAL /
+  SMLAL, CLZ, SXTB / SXTH / UXTB / UXTH (+ add), REV, UBFX / SBFX / BFI / BFC, conditions. Anything else (VFP, NEON,
+  SVC, exclusives, MRS / MSR ...) is a call from the block to the interpreter's own op for it. All state stays in the
+  Cpu (registers, 0 / 1 flag words) as before, so the two mix freely. Baseline x86-64 only (no LZCNT / BMI).
+- jit_run is interp_run_inner's loop around them. A direct branch's exit is patched into a jump to its target's block
+  once the loop has found the target interpreted (chaining), after a check of the run's return address (it ends the
+  run, as in the interpreter) and, going backward, of g_code_gen; indirect branches go back to the loop. Each block
+  compares its guest words on entry (as each op did) and is rebuilt when one changed; the old one jumps to the new.
+- Per thread: an 8 MiB arena (freed at thread exit), started over when full or for a new code generation, but only
+  while none of the thread's blocks is running (a nested run then uses the interpreter). Windows: the arena has a
+  function table entry (one frame layout), so ExitThread's longjmp unwinds through a block (tested: without it, a
+  crash).
+- Bad accesses: gchk's checks with g_ip_pc set, except for sp-based ones; g_ip_last is the block's first instruction.
+  Flags are read back a byte at a time: a dword load of a byte SETcc just stored stalls (no store forwarding), which
+  first made it only 2.3x the interpreter, then 5.4x after that change.
+- Measured (Ryzen 7 9800X3D, testsave/save_0, quickhunt, two runs each): title -> town 18.6 s without the mod, 23.5 s
+  with it interpreted, 19.2 s with the JIT. The quest list thread 21 -> 1.1 Gcycles (~0.5 cycles an instruction). In a
+  hunt with the Stygian Zinogre quest (1023) the mod's code 82 -> 36 ms a second (callees included), the same
+  instruction counts. Forge plugins (KatLib, KatSmithy in the second plugin region, KatEquipmentBox, Ninja Style,
+  key-quest-markers, better-inputs, NoFlinch) together with the mod: no faults, plugin logs the same.
+- Checked: tools/test_lift.py --jit (each instruction as a block of its own) against Unicorn, 4000-instruction runs on
+  four seeds of main: none different (a planted ADD -> SUB was caught at once); a JIT vs interpreter-op comparison on
+  random states, Windows and Linux (archlinux WSL, the System V calls), 18000 runs: none different.
+- MHGU_JIT=0: the interpreter alone. MHGU_JIT_DUMP=<file>: every block's code (for a disassembler, with MHGU_SAMPLE).
+- Not done: registers kept in host registers across a block (the next big step if a mod needs it); not tried on a
+  laptop CPU or by hand in a fight.
+
+AArch64 back end (2026-11-24, same day): Android phones (and AArch64 Linux) get the JIT too. interp_jit.h is now the
+shared part (arena, blocks, run loop); interp_jit_x64.h and interp_jit_a64.h emit the code, the same translations
+one for one. AArch64 notes: AArch32's condition codes and carry are AArch64's, so ADDS / SUBS / ADCS / SBCS leave the
+guest's NZCV in the host's flags (CSET stores them, a byte each); guest memory is [x20, wN, uxtw]; a block's words
+are checked against a literal pool after it, two at a time; written or patched code gets an instruction cache flush;
+x18 is left alone. Not on Apple hosts (MAP_JIT and write protection per thread: for the Mac port); a device that
+refuses RWX memory keeps the interpreter (jit_tls, logged).
+- Also fixed in both: LDM / STM / LDRD / STRD stepped their addresses in 64 bits (a block near the top of the 4 GB
+  window ran past it); each word's address now wraps at 32 bits as the guest's.
+- Checked: tools/test_jit.py (new: tools/test_jit.c), the JIT against the interpreter: `words`, instruction words of
+  main as blocks of their own on random states (registers, flags, VFP, memory), and `prog`, whole runs from main's
+  function entries on random registers and memory, forked, once interpreted and once JITted, results compared (Linux).
+  --a64 cross-builds with clang + the aarch64-linux-gnu sysroot and runs under qemu-aarch64; --wsl archlinux from
+  here (pacman: aarch64-linux-gnu-gcc, qemu-user). AArch64: 18000 word runs and 700 whole runs, none different (a
+  planted ADD -> SUB gave 1991 differences); x86-64 (Windows, Linux): the same, and 1100 whole runs with one
+  difference, explained: random pointers had a loop store into its own block (the interpreter checks each word before
+  it runs, a block its words on entry). Android x86_64 in the emulator: the JIT runs (Definitive Edition, town and
+  quest 1023). The arm64 APK can't be tried there: the emulator's arm64 translation (berberis) aborts on the game's
+  first SIGSEGV with or without the JIT ("Cannot process signal 11"), so a real phone is the open check.
+
 ## Even letter spacing in the game's text: [Graphics] FixKerning (2026-11-07)
 
 - The UI text (cGUI, font_festa.gfd) looked unevenly spaced, on the console too. Three causes, all fixed with
@@ -1363,6 +1596,118 @@ old way while on.
   Stereo -> 5.1 and 5.1 -> Stereo through the menu with Save, reopened, no underruns. Not yet heard on real surround
   speakers (the user's other PC, before release). Without speakers: the WAV dump, or Windows Sonic for Headphones
   (the device then reports 7.1 and SDL places the 5.1 on it).
+
+## Anisotropic filtering: [Graphics] AnisotropicFiltering (2026-11-16)
+
+- What GU does (MHGU_SAMPLER_LOG=1, title screen then quest 101): the game makes ~14 samplers; one (LINEAR_MIPMAP_LINEAR,
+  repeat) asks for 16x, every other one 1x (plain trilinear). The 16x one is the terrain's: the debug control "af 0"
+  (no anisotropy at all, not even the game's) blurs the ground in quest 101, so vanilla already has 16x on the ground.
+- AnisotropicFiltering = Off (the game's own), 2x, 4x, 8x, 16x (aliases Anisotropy, AF; env MHGU_AF): textures.c
+  sampler_aniso raises, never lowers, the game's value on mipmapped samplers with a linear min filter (3 / 5), not on
+  depth compares or point-sampled ones, within maxSamplerAnisotropy (1 without the samplerAnisotropy feature: the game's
+  16x was passed to Vulkan unchecked before). Live: vk_sampler keys VkSamplers by desc + anisotropy + FSR LOD bias, so a
+  change picks other samplers (created once, reused; never destroyed). Settings menu Graphics & Audio > Anisotropic filtering.
+- Checked here: control "af 16" turned the four 1x trilinear samplers in quest 101 into 16x, "af 1" took the cached ones
+  back; at 16x the camp view looked the same as Off (the ground was already 16x). Not measured: GPU cost on the R9.
+- Only on depth-tested draws (2026-11-17): the loading screen's backdrop showed light vertical seams where its tiles
+  meet, flickering as they scroll (reported at the tile line about a quarter in from the left). The tiles come from one
+  1024x1024 mipmapped atlas through the game's trilinear repeat sampler, slightly minified, and the setting made it 16x.
+  exec.c draw_aniso: a draw without a depth test (HUD, menus, loading screen) keeps the game's own anisotropy; the same
+  sampler still gets the setting on 3D draws (MHGU_SAMPLER_LOG: "used 1" in the loading screen, "used 16" in town).
+  Checked with frames shot every 0.12 s at 16x: before, 3 of 5 loading frames had a seam; after, 0 of 16.
+
+## Pause/Suspend: [Controls] PauseKey (2026-11-22)
+
+- runtime/pause.c: the key (Pause by default; Esc and Enter also resume) holds the game's render thread in
+  nvnQueuePresentTexture after its present. The main thread then waits for it within a frame: a player-update fntrace
+  sent while paused fired only after the resume. The held thread presents the same image again at 60 Hz and builds the
+  overlay's frames itself (overlay_frame with its cpu), so the F1 menu and Forge's work meanwhile; the plugins'
+  forge_onNvnRender is not called for those (they would draw into the image again). PAUSED over a dimmed picture:
+  overlay.cpp draw_paused, on ImGui's background list (under the menus).
+- The guest's clock stops: rt_ticks reads pause_clock_ns (a seqlock over the paused time; now is read inside it, so a
+  time is never earlier than the stop). Checked: the game's frame step (Forge's dt, app +0x68) was 0.25 right after a
+  5.4 s pause at 240 fps. The audio mixer renders nothing while held (voices keep their place; the game's audio thread
+  still gets its events): the mixer's frame counter did not advance over a 6.9 s pause in quest 101.
+- Refused (a notice says why): ldn_offline false - a network in any state past Initialize, and for 15 s after one
+  closes, since Hunter Search closes its network for each scan and opens it again - or fs_writing (files open for
+  writing, a save mount with uncommitted changes, a commit and its backup). Checked: refused with Hunter Search on (12
+  presses over 24 s), allowed 16 s after turning it off; a press during Quit Game's save was refused, the next one after
+  it paused. Not checked: in an online Hub (same ldn state check), a movie, an area load.
+- Settings: the Pause/Suspend row in Keybinds and in Game actions' Keys (capture view CAPTURE_PAUSE = -2; Esc, Enter,
+  mouse buttons and the recomp's keys refused), shown on the keyboard drawing, red when the chat key or a keybind has
+  the same key. Forge's setKeybind refuses it as it does the chat key. Not on a controller (by design).
+- tests/test_settings_panel.cpp stops at its "fps" focus assertion; it does so on HEAD before this change too.
+
+## Android: CPU and GPU work not overlapping on an Adreno 725 (issue #444, 2026-11-22; workaround 2026-11-24)
+
+- Report: POCO F5 (Turnip fork PurpleVK on KGSL), 37.7 fps in the village while the GPU is 69% busy and the submitting
+  thread waits in the GPU fence wait 67% of the time. CPU clocks barely change the frame rate.
+- Measured here (scratch-subs rig, town, MHGU_VK_STATS plus temporary counters, since removed): the game makes 2
+  submissions a frame (its command list, then our present), so the 8-slot submission ring (exec.c SUBS) is 4 frames
+  deep and never waited. Its one nvnSyncWait a frame comes right after submitting frame N and waits for frame N-1's
+  present submission: one frame of overlap, as on the Switch. With a temporary CPU spin and GPU buffer fills in
+  backend_execute, 10 ms CPU + 11 ms GPU ran at 89 fps (11 ms alone: 89), and 6 ms + ~17 ms at 58.7 fps at the 60
+  cap: frame time is max(CPU, GPU) here, and no snapping to 30 fps. A thread blocked 67% in the fence wait is also
+  what an overlapped GPU-bound frame looks like. What doesn't fit is the 31% of the phone's GPU time that is idle.
+- Mesa's Turnip on KGSL emulates timeline semaphores, which puts its queue in deferred submit mode; deferral only
+  holds submissions that wait on a timeline, and ours wait on nothing but the acquire semaphore, so nothing there
+  explains it either (read, not run).
+- MHGU_CONTROL `gpuprof` now covers two frames and every submission: a top-of-pipe timestamp where each main command
+  buffer begins ("GPU idle: waiting for this submission", shown when it's 0.5 µs or more), the end of each submission
+  and of the present's, per-frame "GPU busy / idle", and the CPU's submit times and its GPU waits in that time.
+  Frame 2's idle time before the game's work is the number that says whether the CPU keeps the GPU fed; idle before
+  the present submission points at the acquire semaphore (the display) instead. At the 60 cap on the desktop: 15.4 ms
+  idle before the game's work, as expected for 1.1 ms of GPU work. Next: that output from the reporter's phone.
+- Cause (the reporter, 2026-11-23, frame-pointer simpleperf on 0.18.3): a Turnip driver bug. On KGSL, Turnip emulates
+  timeline semaphores, and vkGetSemaphoreCounterValue checks each pending point with a 0 timeout, which the kernel
+  takes as "wait forever" until Mesa e984ef29 (26.3.0). PurpleVK 26.3.0-devel (git-62ac221a33) lacks it, and so do the
+  newest public purple-turnip (T30) and AdrenoToolsDrivers (v26.0.0 R8). Our vk_collect_dead check after each
+  submission waited there for the GPU: 66% of the submitting thread. With a Turnip that has the fix: 59.8-60.0 fps
+  at 2400x1080 (35.3 before), CPU game submit -> present submit 0.3 ms (19.7), kgsl busy 95%.
+- Workaround (g_vk.no_poll, exec.c "No status polls"): on Turnip on Android (driverID MESA_TURNIP), or with
+  MHGU_VK_NO_POLL=1, no completion check reaches the driver. Fences per submission (the Vulkan 1.1 path), and a
+  thread waits for them in order and moves fence_done; vk_completed_seq only reads it. Not the timeline: Mesa's
+  vkWaitSemaphores checks every pending point the same way before it waits (read in vk_sync_timeline.c, not run),
+  and vkGetFenceStatus does too. Checked on the desktop with MHGU_VK_NO_POLL=1: town at 60 (gpuprof as before), a hunt
+  at 240 fps with memory flat over a minute (the transient memory and dead objects are freed). Not checked: a phone
+  with the old driver (the reporter can), the game's own quit with the thread waiting (it exits by _exit after
+  vkDeviceWaitIdle; the thread doesn't wait once vk_exiting).
+- PurpleVK's timestampPeriod is 33.11 ns where its counter runs at 19.2 MHz (52.08 ns): gpuprof reads 1.57x too low
+  there. A driver bug; nothing for us to do.
+- FSR 3.1 fails with -7 on both drivers (FFX_VK_PORTABLE_ERROR_BACKEND: every FidelityFX code the wrapper doesn't
+  list). Now logged: each FFX_ERROR_BACKEND_API_ERROR's file:line (third_party/fsr-vulkan/src/ffx_error_site.hpp, a
+  macro over the enum value, -include'd into every FSR C++ source), the raw FidelityFX code, a pass shader whose
+  resources couldn't be reflected, and FidelityFX's own messages (MHGU_FSR_DEBUG=1), which went to stderr with
+  fwprintf before and so never reached log.txt or logcat. The Makefile now rebuilds the FSR C++ objects when those
+  forced headers change (header dependencies aren't tracked). Next: that log from the reporter.
+
+## Steam Deck: terrain flickering black in Deserted Island area 6 (issue #232, fixed 2026-11-25)
+
+- Symptom (RADV only: Steam Deck, Mesa 26.0.0-devel VANGOGH): terrain and its decals, sometimes parts of monsters,
+  flicker black for a frame, two or three times every few seconds. Either a square around the hunter or everything but
+  that square: one shadow cascade at a time. Needs shadow casters at ground level: small monsters in the area (it
+  stopped when they died), and more of it once area 6's breakable rock has sunk into the ground. It keeps going on the
+  pause screen. Repro: MHGU_QUICKHUNT=837 (The Way of the Nargacuga, Village high rank) MHGU_START_AREA=6, no monster
+  debug options (MHGU_SUMMON pins the hunter in place).
+- Debugged live on the user's Deck over SSH (the game started by `systemd-run --user` with a scratch MHGU_HOME and save,
+  driven through MHGU_CONTROL). Screenshots, bursts (up to 300 frames) and pass dumps never caught it.
+- Ruled out on the Deck: fast clears, DCC and HiZ (RADV_DEBUG=nofastclears / nohiz; early runs without them looked
+  clean only because the rock wasn't broken yet), colour and depth clears done as draws, zeroing of new images, FXAA,
+  FMZ (0 x Inf) on every fragment-shader multiply, the depth bias representation alone (D24 steps for decals vs. the
+  default for the terrain, PR 235), and waiting for the GPU after each frame or each submission.
+- RADV_DEBUG=syncshaders (idle after every draw) hid it: a race between draws inside one render pass, where the port
+  puts no barriers. Bisected with temporary barrier modes, toggled live in the same flickering pause screen: a new
+  pass (full barrier) before every draw hid it; before only the draws that sample rendered textures didn't; only in
+  depth-only passes did, only in colour passes didn't; only where the polygon offset or polygon state (st.poly:
+  offset enable, culling, winding) differs from the draw before did, and in depth-only passes alone too. Sending all
+  pipeline and dynamic state again at those draws without a barrier didn't. Each result checked by switching back.
+  Likely a RADV bug: depth bias changes between draws of a depth-only pass (the shadow cascades, the depth pre-pass)
+  should not need a barrier.
+- Workaround (g_vk.bias_sync, device.c / exec.c draw): on RADV (driverID MESA_RADV), in a depth-only pass, a draw whose
+  polygon offset or polygon state differs from the draw before starts a new render pass behind a full barrier.
+  MHGU_VK_BIAS_SYNC=1 / 0 turns it on / off on any driver. Cost on the Deck (paused in area 6, gpuprof): GPU busy
+  5.34 -> 5.92 ms a frame, 60 fps unchanged. Off on the R9 (AMD's Windows driver). Checked on the Deck: rock broken,
+  small monsters around, the pause screen: no flicker.
 
 ## Next steps
 1. Modding tools: decode resident.arc tables (weapon00..14 Base/Level data: record layouts derivable from the game
@@ -1435,7 +1780,8 @@ old way while on.
    (the bowgun's reticle, lock-on markers) is not stretched and scales about the centre; the bowgun's ammo list (layer 103, right side below y 300; above it the HP and stamina bars' end pieces, at x 1062 when full) goes with the item
    bar; a window's pieces up to 470 apart are one group (the Weapon Controls sheet's back parchment, 436 high), and a window stacked right on another of its layer
    that went the other way takes the pair's anchor with it (the chat log's "Chat" label over its box)
-   (the Palico Scout's "Rotate" prompt). MHGU_CONTROL `hudtrace` logs a frame's HUD quads and their anchors. Left: the HUD's layout elsewhere (title, town, quest board, item box) unverified; at Edges
+   (the Palico Scout's "Rotate" prompt); text of layer 94 drawn on a 97 window right after it, inside it, is part of
+   that window (the Hub Info's Canteen rows went Centre, out of their Top box at 16:10, 2026-11-24). MHGU_CONTROL `hudtrace` logs a frame's HUD quads and their anchors. Left: the HUD's layout elsewhere (title, town, quest board, item box) unverified; at Edges
    the Hunter Arts prompt goes right with its layer; whether an off-screen 3D view (equipment box preview, guild
    card) uses one of the three cameras (they are left alone unless 16:9).
 10. Keyboard remapping: an ini [Keyboard] section, one line per Switch button (`A = Mouse2`, `B = Space`; SDL key
@@ -1587,6 +1933,46 @@ being a submodule there is 1.92.8 by its header only).
 Extras beyond Fexty's exported.txt, kept as harmless: forge_log_trace(format, ...) (printed at any level, as [DEBUG]), forge_graphics_isInitialized, forge_graphics_isMenuOpen. MHGU_FORGE_LOG=debug|info|warn|error (default info; overrides the file when it names a level). Install = the mod's folder in mods\ (Forge itself is not needed). Log: "[forge] plugin ...",
 the plugin's own messages as "[forge] [INFO] ..." (Forge's tags). Plugins are built -mfloat-abi=softfp, as
 Forge is: floats in core registers (forge_onUpdate's dt in r0; until 2026-10-23 it went in s0 only).
+
+Save commits from plugins (2026-11-24): nn::fs aborts a commit while any file of the save is open for writing (2002-6457,
+WriteModeFileNotClosed). Plugins commit the save on the main thread (forge_fs_unmountSaveData always commits, as Forge's
+does; plugins that keep settings in the save also call CommitSaveData themselves, some every few seconds), and the game
+writes its save on another thread: a player with 15 plugins had the game close at the end of a hunt. Reproduced with a
+plugin committing every frame and the game saving (Quit Game > Save). FileSystemAccessor::Commit now has a host layer
+(services/fs.c, commit_guard) that waits, up to 10 s, until no other thread has a save file open for writing (by the
+SDK's own open-file list and the host's), and save files opened for writing by other threads wait while it commits; a
+thread's own open file is not waited for (nn::fs aborts as on the console). A wait is logged ("[fs] a save commit ...
+waited N ms ..."; 17-19 ms in the test). MHGU_NO_COMMIT_GUARD=1 turns it off. Every abort also logs the files open for
+writing and those closed in the last 5 s (path, guest thread, the game's and plugins' calls that opened them), plugins'
+files from forge_fs_openFile still open, and Forge plugins' code on the stack.
+
+Forge 2.0.0 (2026-11-19; was 1.5.1, the same API plus what 2.0.0 adds): the port reports 2.0.0, so plugins asking for 2.0
+start (1.x ones still do). Files: forge_fs_openFile(path, mode, u32 *handle) / getFileSize / readFile(handle, s64 offset, buf,
+size) / closeFile are the game's own nn::fs OpenFile / GetFileSize / ReadFile / CloseFile (any mount the game has: "app:/"
+is the RomFS with the mods' files over it, "savedata:/" while forge_fs_mountSaveData holds it), false on a failed Result,
+the handle nn::fs's. As on the console, a Result nn::fs doesn't let the caller handle aborts the game (reading past the
+end: 2002-3005, wholly past it or partly); a missing file is just false. The abort's own lines name no file or plugin, so
+readFile first checks the read against GetFileSize and logs "FATAL: Tried to read past the end of a file! Plugin <file>
+(<its name>) read N bytes at offset X of <path>, which is M bytes long ..." (and a Forge [ERROR] line), and the abort
+handler (hle/abort.c) adds "[abort] inside a Forge mod's file call: <call, path, plugin>" for any abort inside
+openFile / readFile / closeFile (forge_abort_context; the paths by handle, from openFile; the plugin from lr). Rendering (runtime/nvn/objects.c tells forge.c what the game made):
+forge_onNvnInit(getProcAddress, device, queue) and forge_onNvnReady() at the first present after the plugins started
+(Forge: at its first present, with forge_onImGuiInit between them; here forge_onImGuiInit comes with the overlay's first
+frame on the game's thread), forge_onNvnRender(window, index) at every nvnQueuePresentTexture before the picture goes out,
+on the presenting thread. getProcAddress is the game's nvnDeviceGetProcAddress, so a plugin's NVN calls are the port's
+NVN layer, as the game's are. forge_graphics_getSwapChainTextures(&n) is a copy of the array nvnWindowBuilderSetTextures got
+(3 textures). forge_graphics_registerTexture(texture, view) returns a tag (0x7E57... | slot, 256 slots) for igImage /
+AddImage: each present, device.c makes the texture current outside the render pass (uploaded or MSAA-resolved) and looks up
+its sampled 2D view with the registered NVNtextureView (read at registration, as Forge's pool does); overlay_draw draws the
+tag as an ImGui Vulkan descriptor set for that view (made again when the view changes; old sets and those of unregistered
+textures are freed 10 presents later). A tag with no texture behind it (unregistered, or finalized first) draws nothing.
+Tested with a test plugin (C:\MHGURecompile\scratch-forge2, outside this repo; built like lagcomp-forge, softfp) with Key
+Quest Markers r20 beside it: fileExists / openFile / getFileSize / readFile of its own .nro in a mod's romfs ("NRO0" at
+0x10, MOD0 offset 0x1000, size 12288), a missing file false; onNvnInit with the device and queue, nvnDeviceGetInteger through
+its getProcAddress (API 53.207); 3 swap chain textures; the first one registered and drawn with igImage in a window of the
+plugin (the game's picture as a thumbnail, upright), unregistered after 14400 presents (the window then empty, the game
+going on), an unknown id's unregister a WARN line. Not tested: a plugin that makes its own NVN textures or draws into the
+swap chain texture from forge_onNvnRender (it would go through the same NVN layer as the game's own drawing).
 
 Forge's ImGui overlay (runtime/overlay.cpp, forge_imgui.c, tools/imgui_thunks.py; 2026-10-23): Forge's "forge"
 window (About, Loaded Plugins, Plugin UI = each plugin's forge_onImGuiRender) and forge_onImGuiFreeRender, on Dear

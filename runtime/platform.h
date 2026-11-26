@@ -55,8 +55,19 @@ int plat_count_files(const char *dir);
 // A folder the player named (UTF-8, as the settings file has it), created if missing, as a path the runtime's file
 // functions can open: Windows' narrow ones take the ANSI code page, so one it can't spell becomes its 8.3 short form.
 bool plat_use_folder(const char *utf8, char *buf, size_t size);
+// A path (or name) the runtime's file functions use - what readdir and the narrow Windows calls give, in the ANSI code
+// page there (GBK on a Chinese Windows) - as UTF-8, for what wants that instead: ImGui (its text, and its file opens,
+// which go through _wfopen), SDL's files, FFmpeg. Returns buf (the path as it is when it doesn't convert or fit);
+// elsewhere the path is UTF-8 already: copied.
+const char *plat_utf8_path(const char *path, char *buf, size_t size);
+// Whether path is a folder (dir) or a regular file (!dir) itself, not a symlink, junction or other link to one
+// (services/fs.c: save backups only ever delete what really is in the backup folder).
+bool plat_plain_entry(const char *path, bool dir);
 void plat_error_box(const char *msg);
 void plat_fatal_notice(void);
+// The window's X11 Display (SDL_PROP_WINDOW_X11_DISPLAY_POINTER), once it is made: a device unplugged while SDL
+// still asks X about it is not a reason to close the game (linux.c). Nothing to do elsewhere.
+void plat_x11_display(void *display);
 
 // ---- diagnostics
 const char *plat_symbol(uint64_t pc, uint64_t *offset);

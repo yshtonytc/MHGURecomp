@@ -25,6 +25,9 @@
 #include <climits>
 #include <cstring>
 #include <deque>
+#ifdef MHGU_DUAL_SCREEN
+#include <dirent.h>  // (the bottom screen's wallpapers folder)
+#endif
 #include <functional>
 #include <map>
 #include <memory>
@@ -33,8 +36,10 @@
 #include <thread>
 #include <vector>
 
+extern "C" const char *plat_utf8_path(const char *path, char *buf, size_t size);  // (runtime/platform.h)
+
 namespace {
-enum class View { Main, Keyboard, CloseChanges, Exit, Restart, Reset, Move, Conflicts, KeyCapture, Keybinds, Actions };
+enum class View { Main, Keyboard, CloseChanges, Exit, Restart, Reset, Move, Conflicts, KeyCapture, Keybinds, Actions, Changelog, OfflineFriends };
 enum class Command { None, Save };
 struct Row {
     std::string id, title, value;
@@ -98,7 +103,7 @@ struct State {
     bool dragged = false;  // (the press moved the menu: the tab under it is not chosen when it lets go)
     float header_bottom = 0;  // (the top part that moves the menu, from the window's top: last frame's)
     bool position_override = false;
-    int capture_bind = -1;     // the keybind (BIND_*) a key is being chosen for; -1: the chat key
+    int capture_bind = -1;     // the keybind (BIND_*) a key is being chosen for; -1: the chat key, -2 the pause key
     bool capture_add = false;  // the key chosen is that keybind's second, else its only one
     bool capture_from_actions = false;  // the keybind or chat key is being chosen from the Game actions screen (Keys)
 } s;
@@ -123,6 +128,13 @@ ActionTab &acts() {
 std::atomic<int> captured_key{-1};
 bool forge_requested;  // the Mods tab's "Open the Forge menu" (game thread, as the rest of the panel)
 const char *tr(const char *text) { return settings_text(s.draft.language, text); }
+// A language's own name in the Language list, or its English one while the menus' font has no glyph for it (no
+// release font beside the program: the system's is merged once the language is picked, runtime/overlay.cpp)
+std::string language_name(const char *own, const char *english, ImWchar probe) {
+    ImFont *font = ImGui::GetCurrentContext() ? ImGui::GetIO().FontDefault : nullptr;
+    if (!font && ImGui::GetCurrentContext() && ImGui::GetIO().Fonts->Fonts.Size) font = ImGui::GetIO().Fonts->Fonts[0];
+    return font && font->IsGlyphInFont(probe) ? own : english;
+}
 std::string fmt(const char *text, ...) {
     char buffer[512];
     va_list args;
@@ -168,9 +180,10 @@ const Theme &theme() {
 ImVec4 vec(ImU32 c) { return ImGui::ColorConvertU32ToFloat4(c); }
 // The Mods tab: the mods folder's state (modorder.h), which is saved with the rest of the settings
 #ifdef __ANDROID__
-constexpr int PAGES = 9, MODS_PAGE = 5, CHEATS_PAGE = 6, APP_PAGE = 7, ANDROID_PAGE = 8;  // (Android: the tab for its own settings)
+constexpr int PAGES = 10, FRIENDS_PAGE = 4, MISC_PAGE = 5, MODS_PAGE = 6, CHEATS_PAGE = 7, APP_PAGE = 8,
+              ANDROID_PAGE = 9;  // (Android: the tab for its own settings)
 #else
-constexpr int PAGES = 8, MODS_PAGE = 5, CHEATS_PAGE = 6, APP_PAGE = 7;
+constexpr int PAGES = 9, FRIENDS_PAGE = 4, MISC_PAGE = 5, MODS_PAGE = 6, CHEATS_PAGE = 7, APP_PAGE = 8;
 #endif
 struct ScanResult {
     std::vector<std::string> names;  // (the order ModConflict's indexes are in)
@@ -237,6 +250,13 @@ int mod_index(const std::string &name) {
         if (name == mods.draft[i].name)
             return i;
     return -1;
+}
+// A mod's name as the menu shows it. The name is its folder's, as readdir gives it - in the ANSI code page on Windows
+// (GBK on a Chinese one), where ImGui reads UTF-8 (a name in Chinese was ???) - and also the folder the mod loads from,
+// so ModEntry keeps it as it is.
+std::string mod_title(const std::string &name) {
+    char buf[512];
+    return plat_utf8_path(name.c_str(), buf, sizeof buf);
 }
 bool dirty();
 // The tab that shows the build's version (MHGU_VERSION, the Makefile's VERSION) in the bottom right corner
@@ -350,6 +370,7 @@ bool equal(const Config &a, const Config &b) {
     SAME(vsync);
     SAME(shader_prewarm);
     SAME(draw_distance);
+    SAME(aniso);
     SAME(smooth_gradients);
     SAME(fix_kerning);
     SAME(bold_text);
@@ -379,7 +400,14 @@ bool equal(const Config &a, const Config &b) {
     SAME(sync_small_monsters);
     SAME(lag_compensation);
     SAME(ldn_direct);
+    SAME(ldn_ryu_serve);
+    SAME(ldn_ryu_serve_port);
+    SAME(ldn_room_serve);
+    SAME(ldn_room_serve_port);
+    SAME(ldn_room_host);
     SAME(bonus_content);
+    SAME(backups_on);
+    SAME(save_backups);
     SAME(village_in_hub);
     SAME(quest_hold_send);
     SAME(share_urgent);
@@ -388,6 +416,7 @@ bool equal(const Config &a, const Config &b) {
     SAME(mouse_invert_y);
     SAME(mouse_smoothing);
     SAME(mouse_capture);
+    SAME(menu_mouse);
     SAME(aspect_ratio);
     SAME(fov);
     SAME(ui_anchor);
@@ -406,7 +435,9 @@ bool equal(const Config &a, const Config &b) {
     SAME(confirm_exit);
     SAME(show_fps);
     SAME(menu_chord);
+    SAME(title_back_exit);
     SAME(show_battery);
+    SAME(show_temperature);
     SAME(updates);
     SAME(hp.village);
     SAME(hp.quests);
@@ -414,8 +445,18 @@ bool equal(const Config &a, const Config &b) {
     if (memcmp(a.binds, b.binds, sizeof a.binds))
         return false;
     if (strcmp(a.ldn_join, b.ldn_join) || strcmp(a.ldn_server, b.ldn_server) || strcmp(a.ldn_key, b.ldn_key) ||
-        strcmp(a.chat_key, b.chat_key) || strcmp(a.save_dir, b.save_dir) || strcmp(a.save_location, b.save_location) || strcmp(a.game_dir, b.game_dir))
+        strcmp(a.chat_key, b.chat_key) || strcmp(a.pause_key, b.pause_key) || strcmp(a.save_dir, b.save_dir) || strcmp(a.save_location, b.save_location) || strcmp(a.backup_location, b.backup_location) || strcmp(a.game_dir, b.game_dir))
         return false;
+    if (strcmp(a.ldn_ryu_servers, b.ldn_ryu_servers) || strcmp(a.ldn_ryu_host, b.ldn_ryu_host) ||
+        strcmp(a.ldn_ryu_pass, b.ldn_ryu_pass) || strcmp(a.ldn_room_server, b.ldn_room_server) ||
+        strcmp(a.ldn_room_pass, b.ldn_room_pass) || strcmp(a.ldn_room_nick, b.ldn_room_nick) ||
+        strcmp(a.audio_device, b.audio_device))
+        return false;
+#ifdef MHGU_DUAL_SCREEN
+    if (a.second_display != b.second_display || strcmp(a.bottom_panels, b.bottom_panels) || a.bottom_background != b.bottom_background ||
+        strcmp(a.bottom_wallpaper, b.bottom_wallpaper))
+        return false;
+#endif
     for (int n = 0; n < 4; ++n)
         if (a.hp.scale[n] != b.hp.scale[n])
             return false;
@@ -685,6 +726,73 @@ void action(std::vector<Row> &rows, const std::string &id, const std::string &na
     r.enabled = enabled;
     rows.push_back(std::move(r));
 }
+// This version's release notes (Application: What's new): update/changelog.txt, which the updater writes when it installs
+// a release (updater/updater.c save_changelog), as plain text after the version on its first line. Empty: there are
+// none, or they are another version's (a release installed by hand). Read once: only the updater changes the file.
+const std::string &changelog() {
+    static std::string notes;
+    static bool read = false;
+    if (!read) {
+        read = true;
+        size_t n = 0;
+        char *data = (char *)SDL_LoadFile("update/changelog.txt", &n);
+        if (data) {
+            std::string all(data, n);
+            SDL_free(data);
+            size_t nl = all.find('\n');
+            std::string version = all.substr(0, nl);
+            if (!version.empty() && version.back() == '\r')
+                version.pop_back();
+            if (nl != std::string::npos && version == MHGU_VERSION)
+                notes = all.substr(nl + 1);
+        }
+    }
+    return notes;
+}
+// The notes in a box under the view's title, at most room high: it scrolls with the mouse wheel, up / down (the D-pad,
+// the left stick, the arrow keys) and Page Up / Page Down. "- " lines are bullets, indented by their leading spaces.
+void changelog_box(float room) {
+    const std::string &notes = changelog();
+    float font = ImGui::GetFontSize();
+    ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(FLT_MAX, std::max(room, font * 6)));
+    if (ImGui::BeginChild("##changelog", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoNav)) {
+        for (size_t i = 0; i < notes.size();) {
+            size_t j = notes.find('\n', i);
+            if (j == std::string::npos)
+                j = notes.size();
+            std::string line = notes.substr(i, j - i);
+            i = j + 1;
+            size_t lead = line.find_first_not_of(" \t");
+            if (lead == std::string::npos) {
+                ImGui::Dummy(ImVec2(1, font * .4f));
+                continue;
+            }
+            int spaces = 0;
+            for (size_t k = 0; k < lead; ++k)
+                spaces += line[k] == '\t' ? 4 : 1;
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (spaces + 2) / 4 * font * 1.5f);
+            if (!line.compare(lead, 2, "- ")) {
+                ImGui::Bullet();  // (it stays on the line: the text wraps under its own first word)
+                ImGui::TextWrapped("%s", line.c_str() + lead + 2);
+            } else
+                ImGui::TextWrapped("%s", line.c_str() + lead);
+        }
+        float dy = 0, step = font * 25 * ImGui::GetIO().DeltaTime;
+        if (ImGui::IsKeyDown(ImGuiKey_DownArrow) || ImGui::IsKeyDown(ImGuiKey_GamepadDpadDown) ||
+            ImGui::IsKeyDown(ImGuiKey_GamepadLStickDown))
+            dy += step;
+        if (ImGui::IsKeyDown(ImGuiKey_UpArrow) || ImGui::IsKeyDown(ImGuiKey_GamepadDpadUp) ||
+            ImGui::IsKeyDown(ImGuiKey_GamepadLStickUp))
+            dy -= step;
+        if (ImGui::IsKeyPressed(ImGuiKey_PageDown))
+            dy += ImGui::GetWindowHeight() * .9f;
+        if (ImGui::IsKeyPressed(ImGuiKey_PageUp))
+            dy -= ImGui::GetWindowHeight() * .9f;
+        if (dy)
+            ImGui::SetScrollY(std::clamp(ImGui::GetScrollY() + dy, 0.f, ImGui::GetScrollMaxY()));
+    }
+    ImGui::EndChild();
+}
 // A text setting (a char array of the draft, size bytes) typed on the on-screen keyboard; shown: its row's value
 void text(std::vector<Row> &rows, const char *id, const char *name, char *field, size_t size, const std::string &shown,
           const char *key) {
@@ -737,13 +845,212 @@ void hub_check(std::vector<Row> &rows) {
     r.activate = []() { ldn_hub_check(s.draft.ldn_server, s.draft.ldn_key); };
     rows.push_back(std::move(r));
 }
+// Session codes and friends (runtime/net/ldn.c, link version 4): the code of the hub you're in and the friend code to
+// share (Confirm copies them), join by code, and the friends with what they're doing (Confirm on one in a hub joins
+// it the way a code does). Remove friends turns Confirm on a friend into removing it. Offline friends have a submenu of
+// their own (View::OfflineFriends), so a long list doesn't bury the ones you can play with.
+bool removing;  // (Remove friends: on the Friends tab and in Offline friends alike)
+// The session code of the hub you're in as the friends list has them (no dash), "" when none
+std::string my_hub_code() {
+    char code[32] = "";
+    if (!ldn_session_code(code, sizeof code)) return "";
+    std::string raw;
+    for (const char *c = code; *c; c++)
+        if (*c != '-') raw += *c;
+    return raw;
+}
+// A friend's row; after removing one the focus goes to the Remove friends row given (the removed row is gone). A friend
+// in the hub you're in has nothing to join.
+void friend_row(std::vector<Row> &rows, const LdnFriend &f, const char *remove_row, const std::string &my_hub) {
+    Row r;
+    r.id = std::string("friend.") + f.code;
+    r.title = f.name;
+    bool here = f.hub[0] && !SDL_strcasecmp(f.hub, my_hub.c_str());
+    bool hub = f.hub[0] && !here;
+    switch (f.state) {
+    case LDN_FRIEND_ONLINE: r.value = tr("Online"); break;
+    case LDN_FRIEND_HOSTING: r.value = hub ? tr("Hosting a hub (Confirm joins)") : tr("Hosting a hub"); break;
+    case LDN_FRIEND_IN_HUB: r.value = hub ? tr("In a hub (Confirm joins)") : tr("In a hub"); break;
+    case LDN_FRIEND_OFFLINE: r.value = tr("Offline"); break;
+    default: r.value = "..."; break;
+    }
+    if (here) r.value = tr("In your hub");
+    if (removing) r.value = tr("Confirm removes");
+    r.help = f.code;
+    std::string fc = f.code, hc = f.hub, after = remove_row;
+    r.enabled = removing || hub;
+    r.activate = [fc, hc, after]() {
+        if (removing) {
+            ldn_friend_remove(fc.c_str());
+            focus(after);
+        } else if (!hc.empty())
+            ldn_join_code(hc.c_str(), nullptr);
+    };
+    rows.push_back(std::move(r));
+}
+void remove_friends_row(std::vector<Row> &rows, const char *id) {
+    action(rows, id, tr(removing ? "Done removing" : "Remove friends"), []() { removing = !removing; });
+}
+// The Offline friends submenu: Remove friends first (the friends' rows are disabled unless removing), Back last
+void offline_friends_rows(std::vector<Row> &rows) {
+    static LdnFriend list[LDN_FRIENDS_MAX];
+    int n = ldn_friends(list, LDN_FRIENDS_MAX, nullptr);
+    remove_friends_row(rows, "offline.remove");
+    for (int i = 0; i < n; i++)
+        if (list[i].state == LDN_FRIEND_OFFLINE) friend_row(rows, list[i], "offline.remove", "");
+    action(rows, "offline.back", tr("Back"), []() { pop(); });
+}
+void friends_rows(std::vector<Row> &rows) {
+    static uint64_t copied_at;
+    static std::string copied;
+    auto copy_row = [&](const char *id, const char *title, const std::string &code, const char *none, const char *help) {
+        Row r;
+        r.id = id;
+        r.title = tr(title);
+        bool shown = !copied.empty() && copied == code && SDL_GetTicks() - copied_at < 2000;
+        r.value = code.empty() ? std::string(tr(none)) : shown ? std::string(tr("Copied")) : code;
+        r.help = tr(help);
+        r.enabled = !code.empty();
+        r.activate = [code]() {
+            if (code.empty()) return;
+            SDL_SetClipboardText(code.c_str());
+            copied = code, copied_at = SDL_GetTicks();
+        };
+        rows.push_back(std::move(r));
+    };
+    header(rows, "codes.header", tr("Session Codes"));
+    char code[32] = "";
+    copy_row("code.mine", "Session code", ldn_session_code(code, sizeof code) ? code : "", "No hub",
+             "The code of the hub you host or joined through the hub server. Others enter it in Join by code to find the hub, with or without your matchmaking key. Confirm copies it.");
+    Row j;
+    j.id = "code.join";
+    j.title = tr("Join by code");
+    switch (ldn_invite_state(code, sizeof code)) {
+    case LDN_INVITE_SEARCHING: j.value = tr("Searching..."); break;
+    case LDN_INVITE_READY: j.value = fmt("%s: in Join Hub", code); break;
+    case LDN_INVITE_NOT_FOUND: j.value = fmt("%s: no such hub", code); break;
+    case LDN_INVITE_OLD_SERVER: j.value = tr("The hub server is too old"); break;
+    case LDN_INVITE_FAILED: j.value = tr("No answer"); break;
+    default: j.value = tr("Enter a code"); break;
+    }
+    j.help = tr("Enter a hub's session code: the hub server finds the hub, and it comes first in Join Hub for the next 10 minutes. Then search for hubs in the game and pick it.");
+    j.activate = []() {
+        keyboard(tr("Join by code"), "", 12, [](const std::string &typed, std::string &error) {
+            if (ldn_join_code(typed.c_str(), nullptr)) return true;
+            error = tr("That is not a session code: 8 letters and digits.");
+            return false;
+        });
+    };
+    rows.push_back(std::move(j));
+
+    header(rows, "friends.header", tr("Friends"));
+    add_bool(rows, "friend.requests", "Friend requests", &s.draft.ldn_friend_requests, ini("FriendRequests"));
+    rows.back().help = tr("Players can send you friend requests, and the other hunters in your hub see your friend code to add you. A request you reject stays rejected until the game restarts, unless you add that player yourself. Off: no requests, and your code isn't shared in hubs; you can still add friends by their code.");
+    add_bool(rows, "friend.online", "Friend online notices", &s.draft.ldn_friend_online_notices, ini("FriendOnlineNotices"));
+    rows.back().help = tr("A notice when one of your friends comes online.");
+    add_bool(rows, "friend.hubs", "Friend hub notices", &s.draft.ldn_friend_hub_notices, ini("FriendHubNotices"));
+    rows.back().help = tr("A notice when one of your friends opens a hub. The Friends tab still shows who is hosting.");
+    char mine[32];
+    ldn_my_friend_code(mine, sizeof mine);
+    copy_row("friend.mine", "Your friend code", mine, "None",
+             "Give this code to friends to add you. You see each other once both of you added the other. It is kept with your saves. Confirm copies it.");
+    action(rows, "friend.add", tr("Add a friend"), []() {
+        keyboard(tr("Friend code and name"), "", 60, [](const std::string &typed, std::string &error) {
+            if (const char *why = ldn_friend_add(typed.c_str())) {
+                error = tr(why);
+                return false;
+            }
+            return true;
+        });
+    });
+    rows.back().help = tr("Their friend code, then a space and the name you want to see for them (for example ABCD-EFGH-JKMN-PQRS Mia).");
+    // friend requests: Accept adds them, Reject keeps them out until the game restarts
+    LdnRequest reqs[8];
+    int nr = ldn_friend_requests(reqs, 8);
+    for (int i = 0; i < nr; i++) {
+        std::string code = reqs[i].code, name = reqs[i].name;
+        // (the request's rows go once answered: the focus moves to Add a friend, above the friends; a friend's own row
+        // can't take it while it has no hub to join, being disabled)
+        action(rows, "req.accept." + code, fmt("Accept %s", name.c_str()), [code]() {
+            ldn_friend_request_answer(code.c_str(), true);
+            focus("friend.add");
+        });
+        rows.back().help = tr("A friend request: they added you. Accept adds them to your friends list.");
+        action(rows, "req.reject." + code, fmt("Reject %s", name.c_str()), [code]() {
+            ldn_friend_request_answer(code.c_str(), false);
+            focus("friend.add");
+        });
+        rows.back().help = tr("Their request stays rejected until the game restarts, unless you add them yourself.");
+    }
+    // the other hunters in this hub (games that shared their friend code): Confirm adds one, which sends them a request.
+    // Friends among them are left to the friends list below.
+    LdnHunter hunters[8];
+    int nh = ldn_hub_hunters(hunters, 8);
+    bool hub_header = false;
+    for (int i = 0; i < nh; i++) {
+        if (hunters[i].state == LDN_HUNTER_FRIEND) continue;
+        if (!hub_header) header(rows, "hunters.header", tr("Hunters in your hub")), hub_header = true;
+        Row r;
+        r.id = std::string("hunter.") + hunters[i].code;
+        r.title = hunters[i].name;
+        r.value = hunters[i].state == LDN_HUNTER_ADDED ? tr("Request sent") : tr("Add friend");
+        r.help = tr("A hunter in your hub. Confirm adds them as a friend: they get a friend request, and once they accept you see each other.");
+        r.enabled = hunters[i].state == LDN_HUNTER_ADD;
+        std::string typed = std::string(hunters[i].code) + " " + hunters[i].name;
+        r.activate = [typed]() {  // (the row turns disabled once added: the focus to Add a friend)
+            ldn_friend_add(typed.c_str());
+            focus("friend.add");
+        };
+        rows.push_back(std::move(r));
+    }
+    // the friends list: the ones online (or not known yet) here, the offline ones in their own submenu
+    static LdnFriend list[LDN_FRIENDS_MAX];
+    int server = HUB_UNKNOWN;
+    int n = ldn_friends(list, LDN_FRIENDS_MAX, &server);
+    if (!n && !removing)
+        return;
+    header(rows, "friends.list.header", tr("Friends list"));
+    if (server != HUB_ONLINE && server != HUB_UNKNOWN) {
+        Row w;
+        w.id = "friend.server";
+        w.title = tr("Hub server");
+        w.value = server == HUB_OFF ? tr("No hub server") : server == HUB_VERSION ? tr("The hub server is too old")
+                                                                                 : tr("Hub server unreachable");
+        w.warn = true;
+        w.enabled = false;
+        rows.push_back(std::move(w));
+    }
+    int shown = 0, offline = 0;
+    std::string my_hub = my_hub_code();
+    for (int i = 0; i < n; i++) {
+        if (list[i].state == LDN_FRIEND_OFFLINE)
+            offline++;
+        else
+            friend_row(rows, list[i], "friend.remove", my_hub), shown++;
+    }
+    if (!shown && n) {
+        Row none;
+        none.id = "friend.none";
+        none.title = tr("No friends online");
+        none.enabled = false;
+        rows.push_back(std::move(none));
+    }
+    if (offline) {
+        action(rows, "friend.offline", std::string(tr("Offline friends")) + " (" + std::to_string(offline) + ")",
+               []() { push(View::OfflineFriends, "offline.remove"); });
+        rows.back().help = tr("Your friends who aren't playing online right now, and the ones who haven't added you back yet.");
+    }
+    if (shown || removing)
+        remove_friends_row(rows, "friend.remove");
+}
 // The keybinds' rows (config.h BIND_*): what each is called
 const char *const bind_titles[BINDS] = {"Move forward", "Move back", "Move left", "Move right", "Walk", "A", "B", "X",
                                         "Y", "L", "R", "ZL", "ZR", "Plus", "Minus", "D-pad up", "D-pad down",
                                         "D-pad left", "D-pad right", "Left stick click", "Right stick click",
                                         "Item left", "Item right"};
+const int CAPTURE_CHAT = -1, CAPTURE_PAUSE = -2;  // (s.capture_bind: the chat key, the pause key)
 // What else a key (or KEY_MOUSE + a mouse button) does: one of the recomp's own keys (keymap.h), a keybind other than
-// skip, or (for a keybind's) the chat key; nullptr: nothing
+// skip, the chat key or the pause key (but skip's own: CAPTURE_*); nullptr: nothing
 const char *key_use(int code, int skip) {
     if (const char *use = code < KEY_MOUSE ? key_reserved(code) : nullptr)
         return tr(use);
@@ -751,11 +1058,13 @@ const char *key_use(int code, int skip) {
         for (int k = 0; k < BIND_KEYS; k++)
             if (i != skip && (s.draft.binds[i][k] == code || (config_mod_bound(i) && config_live_bind(i, k) == code)))
                 return tr(bind_titles[i]);
-    if (skip >= 0 && code == (int)SDL_GetScancodeFromName(s.draft.chat_key))
+    if (skip != CAPTURE_CHAT && code == (int)SDL_GetScancodeFromName(s.draft.chat_key))
         return tr("Chat key");
+    if (skip != CAPTURE_PAUSE && code == (int)SDL_GetScancodeFromName(s.draft.pause_key))
+        return tr("Pause/Suspend");
     return nullptr;
 }
-// Choosing a key: for a keybind (BIND_*, add: its second key) or the chat key (-1)
+// Choosing a key: for a keybind (BIND_*, add: its second key), the chat key or the pause key (CAPTURE_*)
 void capture(int bind, bool add) {
     acts().capture = -1;
     s.capture_bind = bind;
@@ -776,7 +1085,22 @@ void chat_key_row(std::vector<Row> &rows) {
         r.value += std::string(" (") + tr("in use:") + " " + use + ")";
         r.warn = true;
     }
-    r.activate = []() { capture(-1, false); };
+    r.activate = []() { capture(CAPTURE_CHAT, false); };
+    rows.push_back(std::move(r));
+}
+// Pause/Suspend's key (runtime/pause.h); red when something else already uses it
+void pause_key_row(std::vector<Row> &rows) {
+    Row r;
+    r.id = "pause.key";
+    r.title = tr("Pause/Suspend");
+    keyed(r, ini("PauseKey"));
+    SDL_Scancode key = SDL_GetScancodeFromName(s.draft.pause_key);
+    r.value = key != SDL_SCANCODE_UNKNOWN ? s.draft.pause_key : tr("None");
+    if (const char *use = key != SDL_SCANCODE_UNKNOWN ? key_use((int)key, CAPTURE_PAUSE) : nullptr) {
+        r.value += std::string(" (") + tr("in use:") + " " + use + ")";
+        r.warn = true;
+    }
+    r.activate = []() { capture(CAPTURE_PAUSE, false); };
     rows.push_back(std::move(r));
 }
 // One keybind as a row (the Keybinds submenu's, and the Keys of the Game actions screen)
@@ -835,10 +1159,13 @@ void keybind_rows(std::vector<Row> &r) {
     }
     header(r, "bind.other", tr("Chat"));
     chat_key_row(r);
+    header(r, "bind.pause", tr("Pause/Suspend"));
+    pause_key_row(r);
     action(r, "bind.reset", tr("Reset keybinds"), []() {
         Config f = config_defaults();
         memcpy(s.draft.binds, f.binds, sizeof f.binds);
         SDL_strlcpy(s.draft.chat_key, f.chat_key, sizeof s.draft.chat_key);
+        SDL_strlcpy(s.draft.pause_key, f.pause_key, sizeof s.draft.pause_key);
     });
     action(r, "bind.back", tr("Back"), []() { pop(); });
 }
@@ -971,7 +1298,7 @@ const char *scheme_name(int dev) { return tr(dev == 0 ? "Controller" : "Keyboard
 const char *action_note(int id) {
     switch (id) {
     case ACT_CROUCH:
-        return "B while the hunter stands still. Give it an input of its own and it is told apart from the roll: with the weapon away it works only standing still and Dodge only while moving. It cannot share an input with Interact.";
+        return "B while the hunter stands still with the weapon away (the only time a hunter can crouch). Give it an input of its own and it is told apart from the roll: it works only standing still and Dodge only while moving. It may share an input with Attack A, never with Interact.";
     case ACT_DODGE:
         return "With Crouch bound, or Dodge and Interact on one input, Dodge works only while moving when the weapon is away (the roll); weapon B-actions with the weapon out are as before.";
     case ACT_INTERACT:
@@ -984,10 +1311,11 @@ const char *action_note(int id) {
     }
 }
 // Two actions of one context on one input by design (not a conflict): Interact with Dodge, Crouch with Dodge (the game's
-// own B), AttackA with Interact; the item bar's two actions are a state of their own
+// own B), AttackA with Interact or Crouch (weapon out / weapon away); the item bar's two actions are a state of their own
 bool shares_by_design(int a, int b, bool sheathed_attack) {
     auto pair = [&](int x, int y) { return (a == x && b == y) || (a == y && b == x); };
-    if (pair(ACT_INTERACT, ACT_DODGE) || pair(ACT_CROUCH, ACT_DODGE) || (!sheathed_attack && pair(ACT_ATTACK_A, ACT_INTERACT)))
+    if (pair(ACT_INTERACT, ACT_DODGE) || pair(ACT_CROUCH, ACT_DODGE) ||
+        (!sheathed_attack && (pair(ACT_ATTACK_A, ACT_INTERACT) || pair(ACT_ATTACK_A, ACT_CROUCH))))
         return true;
     bool bar_a = a == ACT_ITEMBAR_RIGHT || a == ACT_ITEMBAR_LEFT, bar_b = b == ACT_ITEMBAR_RIGHT || b == ACT_ITEMBAR_LEFT;
     return (bar_a || bar_b) && !(bar_a && bar_b);
@@ -1080,6 +1408,8 @@ void key_rows(std::vector<Row> &r) {
         r.push_back(bind_row(i, "key." + std::to_string(i)));
     header(r, "key.h.chat", tr("Chat"));
     chat_key_row(r);
+    header(r, "key.h.pause", tr("Pause/Suspend"));
+    pause_key_row(r);
     if (!simple) {
         header(r, "key.h.buttons", tr("Buttons"));
         for (int i = BIND_A; i <= BIND_RSTICK; i++)
@@ -1257,6 +1587,33 @@ void action_rows(std::vector<Row> &r) {
         add_choice(r, "act.tab", "Show", a.tab, names, [](int v) { acts().tab = v; });
         r.back().help = tr("What the list and the drawing show: one part of the game at a time. L1 / R1 on a controller go through them. Keys: the keys that are not actions (movement, the item bar, chat).");
     }
+    if (kind == TAB_HUNT)
+        toggle("act.arts", "Hunter Art keys", &p.art_keys,
+               "On: each Hunter Art has an input of its own (keyboard: 1, 2 and 3 unless rebound below), whatever buttons the game's Control Type gives them; those keep working too. On keyboard and mouse the HUD shows these keys for them, whatever the Control Type.");
+    if (kind == TAB_HUNT) {
+        // the categories OpenTalk is for: a comma list, read off log.txt with Target log on
+        char list[160];
+        act_format_targets(p.confirm_mask, list, sizeof list);
+        Row row;
+        row.id = "act.targets";
+        row.title = tr("Open / talk targets");
+        row.value = list[0] ? list : tr("None");
+        row.help = tr("The interactable categories the Open / talk action opens or talks to, by number. Only used once Open / talk has an input of its own. With Target log on, walk up to each kind once and read its number in log.txt. Empty: Open / talk never presses anything.");
+        row.activate = [list = std::string(list)]() {
+            keyboard(tr("Open / talk targets"), list, 120, [](const std::string &typed, std::string &error) {
+                uint64_t mask = 0;
+                if (!act_parse_targets(typed.c_str(), &mask)) {
+                    error = tr("Numbers from 1 to 63, separated by commas.");
+                    return false;
+                }
+                acts().draft.confirm_mask = mask;
+                return true;
+            });
+        };
+        r.push_back(std::move(row));
+        toggle("act.targetlog", "Target log", &p.target_log,
+               "On: one line per change of the interactable's category in log.txt, for filling the list above in: walk up to each kind once. Off: nothing is written.");
+    }
     if (kind == TAB_KEYS)
         key_rows(r);
     else if (!simple) {
@@ -1287,6 +1644,7 @@ void action_rows(std::vector<Row> &r) {
 // What the focused row (or the one being set) reads is lit on it with an arrow to its label; the row under the pointer is
 // ringed; every input down right now glows; an input clicked on it goes to the row being set.
 const int BV_KEY_CHAT = 999;  // (the chat key's id among the keys of the Keys tab)
+const int BV_KEY_PAUSE = 998;  // (the pause key's)
 bool g_bv_pointing;           // the pointer is on the drawing: a click there is the drawing's, not a button chosen
 std::string g_bv_help;        // the help of the row focused or pointed at, under the drawing
 std::string short_label(const std::string &full) {
@@ -1335,7 +1693,7 @@ void default_inputs(int id, int dev, std::vector<int> &out) {
 }
 // What a row of the list is: an action (Advanced), a merged row (Simple), a keybind or the chat key (Keys)
 struct FocusTarget {
-    int kind;  // 0 none, 1 action, 2 merged row, 3 keybind, 4 chat key
+    int kind;  // 0 none, 1 action, 2 merged row, 3 keybind, 4 chat key, 5 pause key
     int key;
 };
 FocusTarget focus_target(const std::string &id) {
@@ -1351,12 +1709,14 @@ FocusTarget focus_target(const std::string &id) {
         return {3, atoi(id.c_str() + 4)};
     else if (id == "chat.key")
         return {4, BV_KEY_CHAT};
+    else if (id == "pause.key")
+        return {5, BV_KEY_PAUSE};
     return {0, -1};
 }
 int key_of(const std::string &id, int kind) {
     FocusTarget t = focus_target(id);
     if (kind == TAB_KEYS)
-        return t.kind == 3 || t.kind == 4 ? t.key : -1;
+        return t.kind == 3 || t.kind == 4 || t.kind == 5 ? t.key : -1;
     if (acts().layout == ACT_LAYOUT_SIMPLE)
         return t.kind == 2 ? t.key : -1;
     return t.kind == 1 ? t.key : -1;
@@ -1366,7 +1726,7 @@ int selected_key(int kind) {
     if (s.view == View::KeyCapture) {
         if (a.capture >= 0)
             return a.capture_row >= 0 ? a.capture_row : a.capture;
-        return s.capture_bind >= 0 ? s.capture_bind : BV_KEY_CHAT;
+        return s.capture_bind >= 0 ? s.capture_bind : s.capture_bind == CAPTURE_PAUSE ? BV_KEY_PAUSE : BV_KEY_CHAT;
     }
     return key_of(s.focus, kind);
 }
@@ -1374,7 +1734,7 @@ std::string key_label(int key, int kind) {
     if (key < 0)
         return "";
     if (kind == TAB_KEYS)
-        return key == BV_KEY_CHAT ? tr("Chat key") : tr(bind_titles[key]);
+        return key == BV_KEY_CHAT ? tr("Chat key") : key == BV_KEY_PAUSE ? tr("Pause/Suspend") : tr(bind_titles[key]);
     if (acts().layout == ACT_LAYOUT_SIMPLE)
         return short_label(tr(act_row(key)->label));
     return short_label(tr(act_label(key)));
@@ -1416,6 +1776,9 @@ void bv_collect(BvStore &st, int kind, int sel_key) {
         SDL_Scancode chat = SDL_GetScancodeFromName(s.draft.chat_key);
         if (chat != SDL_SCANCODE_UNKNOWN)
             add((int)chat, BV_KEY_CHAT, tr("Chat key"), BV_KEY_CHAT);
+        SDL_Scancode pause = SDL_GetScancodeFromName(s.draft.pause_key);
+        if (pause != SDL_SCANCODE_UNKNOWN)
+            add((int)pause, BV_KEY_PAUSE, tr("Pause/Suspend"), BV_KEY_PAUSE);
     } else {
         struct Item {
             int key, from;
@@ -1522,8 +1885,8 @@ void bv_click(int code) {
         action_take(code);
         a.capture = -1;
         a.capture_row = -1;
-    } else if (t.kind == 3 || t.kind == 4) {
-        s.capture_bind = t.kind == 3 ? t.key : -1;
+    } else if (t.kind == 3 || t.kind == 4 || t.kind == 5) {
+        s.capture_bind = t.kind == 3 ? t.key : t.kind == 5 ? CAPTURE_PAUSE : CAPTURE_CHAT;
         s.capture_add = false;
         bind_take(code);
         s.capture_bind = -1;
@@ -1644,6 +2007,12 @@ void reset_section() {
         c.aspect_ratio = f.aspect_ratio;
         c.fov = f.fov;
         c.ui_anchor = f.ui_anchor;
+#if defined(MHGU_DUAL_SCREEN) && !defined(__ANDROID__)  // (Android: on its own tab)
+        c.second_display = f.second_display;
+        SDL_strlcpy(c.bottom_panels, f.bottom_panels, sizeof c.bottom_panels);
+        c.bottom_background = f.bottom_background;
+        SDL_strlcpy(c.bottom_wallpaper, f.bottom_wallpaper, sizeof c.bottom_wallpaper);
+#endif
         break;
     case 1:
         c.fsr = f.fsr;
@@ -1654,10 +2023,12 @@ void reset_section() {
         c.fsr_animsurf = f.fsr_animsurf;
         c.show_fps = f.show_fps;
         c.show_battery = f.show_battery;
+        c.show_temperature = f.show_temperature;
         c.fps = f.fps;
         c.vsync = f.vsync;
         c.shader_prewarm = f.shader_prewarm;
         c.draw_distance = f.draw_distance;
+        c.aniso = f.aniso;
         c.smooth_gradients = f.smooth_gradients;
         c.fix_kerning = f.fix_kerning;
         c.bold_text = f.bold_text;
@@ -1684,19 +2055,23 @@ void reset_section() {
         c.volume = f.volume;
         c.mute_in_background = f.mute_in_background;
         c.audio_output = f.audio_output;
+        SDL_strlcpy(c.audio_device, f.audio_device, sizeof c.audio_device);
         break;
     case 2:
         c.face_buttons = f.face_buttons;
         c.background_input = f.background_input;
         c.kbm_prompts = f.kbm_prompts;
         c.menu_chord = f.menu_chord;
+        c.title_back_exit = f.title_back_exit;
         c.combo_window = f.combo_window;
         c.mouse_sensitivity = f.mouse_sensitivity;
         c.mouse_sensitivity_y = f.mouse_sensitivity_y;
         c.mouse_invert_y = f.mouse_invert_y;
         c.mouse_smoothing = f.mouse_smoothing;
         c.mouse_capture = f.mouse_capture;
+        c.menu_mouse = f.menu_mouse;
         SDL_strlcpy(c.chat_key, f.chat_key, sizeof c.chat_key);
+        SDL_strlcpy(c.pause_key, f.pause_key, sizeof c.pause_key);
         memcpy(c.binds, f.binds, sizeof c.binds);
         break;
     case 3:
@@ -1705,8 +2080,24 @@ void reset_section() {
         SDL_strlcpy(c.ldn_server, f.ldn_server, sizeof c.ldn_server);
         SDL_strlcpy(c.ldn_key, f.ldn_key, sizeof c.ldn_key);
         c.ldn_direct = f.ldn_direct;
+        c.ldn_ryu_serve = f.ldn_ryu_serve;
+        c.ldn_ryu_serve_port = f.ldn_ryu_serve_port;
+        c.ldn_room_serve = f.ldn_room_serve;
+        c.ldn_room_serve_port = f.ldn_room_serve_port;
+        c.ldn_room_host = f.ldn_room_host;
+        SDL_strlcpy(c.ldn_ryu_servers, f.ldn_ryu_servers, sizeof c.ldn_ryu_servers);
+        SDL_strlcpy(c.ldn_ryu_host, f.ldn_ryu_host, sizeof c.ldn_ryu_host);
+        SDL_strlcpy(c.ldn_ryu_pass, f.ldn_ryu_pass, sizeof c.ldn_ryu_pass);
+        SDL_strlcpy(c.ldn_room_server, f.ldn_room_server, sizeof c.ldn_room_server);
+        SDL_strlcpy(c.ldn_room_pass, f.ldn_room_pass, sizeof c.ldn_room_pass);
+        SDL_strlcpy(c.ldn_room_nick, f.ldn_room_nick, sizeof c.ldn_room_nick);
         break;
-    case 4:
+    case FRIENDS_PAGE:  // (the friends list and code live in the save folder, not here: only the requests switch)
+        c.ldn_friend_requests = f.ldn_friend_requests;
+        c.ldn_friend_online_notices = f.ldn_friend_online_notices;
+        c.ldn_friend_hub_notices = f.ldn_friend_hub_notices;
+        break;
+    case MISC_PAGE:
         c.sync_small_monsters = f.sync_small_monsters;
         c.lag_compensation = f.lag_compensation;
         c.village_in_hub = f.village_in_hub;
@@ -1728,7 +2119,15 @@ void reset_section() {
 #ifdef __ANDROID__
     case ANDROID_PAGE:
         SDL_strlcpy(c.save_dir, f.save_dir, sizeof c.save_dir);
+        c.backups_on = f.backups_on;
+        c.save_backups = f.save_backups;
         SDL_strlcpy(c.game_dir, f.game_dir, sizeof c.game_dir);
+#ifdef MHGU_DUAL_SCREEN
+        c.second_display = f.second_display;
+        SDL_strlcpy(c.bottom_panels, f.bottom_panels, sizeof c.bottom_panels);
+        c.bottom_background = f.bottom_background;
+        SDL_strlcpy(c.bottom_wallpaper, f.bottom_wallpaper, sizeof c.bottom_wallpaper);
+#endif
         break;
 #endif
     case APP_PAGE:
@@ -1737,6 +2136,11 @@ void reset_section() {
         c.menu_scale = f.menu_scale;
         c.menu_confirm = f.menu_confirm;
         SDL_strlcpy(c.save_location, f.save_location, sizeof c.save_location);
+#ifndef __ANDROID__  // (Android: on its own tab)
+        c.backups_on = f.backups_on;
+        c.save_backups = f.save_backups;
+#endif
+        SDL_strlcpy(c.backup_location, f.backup_location, sizeof c.backup_location);
         c.button_icons = f.button_icons;
         c.confirm_exit = f.confirm_exit;
         c.updates = f.updates;
@@ -1794,17 +2198,18 @@ void conflict_rows(std::vector<Row> &r) {
             continue;
         if (ia > ib)
             std::swap(ia, ib);
-        const char *first = mods.draft[ia].name, *second = mods.draft[ib].name;
-        std::string text = fmt("%s and %s both change %d file(s); %s is used", first, second, c.replaced, second);
-        std::string a = first, b = second;
+        std::string a = mods.draft[ia].name, b = mods.draft[ib].name;
+        std::string first = mod_title(a), second = mod_title(b);
+        std::string text = fmt("%s and %s both change %d file(s); %s is used", first.c_str(), second.c_str(), c.replaced,
+                               second.c_str());
         action(r, "mods.conflict." + std::to_string(k), text, []() {});
         {  // select it to choose which of the two is used: that one moves below the other
             Row &row = r.back();
             Row copy = row;
             copy.title = tr("Which mod is used?");
             row.menu = true;
-            row.activate = [copy, a, b]() {
-                choices(copy, {fmt("Use %s", a.c_str()), fmt("Use %s", b.c_str())}, 1, [a, b](int v) {
+            row.activate = [copy, a, b, first, second]() {
+                choices(copy, {fmt("Use %s", first.c_str()), fmt("Use %s", second.c_str())}, 1, [a, b](int v) {
                     int ia = mod_index(a), ib = mod_index(b), win = v ? ib : ia, lose = v ? ia : ib;
                     if (ia < 0 || ib < 0 || win > lose)
                         return;
@@ -1881,7 +2286,7 @@ void mods_rows(std::vector<Row> &r) {
             }
         Row row;
         row.id = "mod." + name;
-        row.title = name;
+        row.title = mod_title(name);
         row.value = std::string(tr(on ? "On" : "Off")) + (clash ? " !" : "");
         row.cold = true;
         auto set_on = [name](bool v) {
@@ -1961,6 +2366,119 @@ void mods_rows(std::vector<Row> &r) {
     action(r, "mods.forge", tr("Open the Forge menu"), []() { forge_requested = true; }, plugins);
     r.back().help = tr("The Forge plugins' own settings, over this menu. Cancel (the button that goes back in the game's menus) or Start + Back closes it and comes back here. On a keyboard the Forge menu key (Insert) opens and closes it.");
 }
+// The playback devices plugged in now, by the names [Audio] Device keeps (looked up once a second: the rows are
+// rebuilt every frame). Left out: a name the file couldn't hold or read back.
+std::vector<std::string> playback_devices() {
+    static std::vector<std::string> list;
+    static Uint64 when;
+    if (when && SDL_GetTicks() - when < 1000)
+        return list;
+    when = SDL_GetTicks();
+    list.clear();
+    int n = 0;
+    SDL_AudioDeviceID *ids = SDL_GetAudioPlaybackDevices(&n);  // (none before the game opens its audio)
+    for (int i = 0; ids && i < n; ++i) {
+        const char *name = SDL_GetAudioDeviceName(ids[i]);
+        if (name && *name && strlen(name) < sizeof s.draft.audio_device && !strpbrk(name, "\r\n;#") &&
+            SDL_strcasecmp(name, "Default") && std::find(list.begin(), list.end(), name) == list.end())
+            list.push_back(name);
+    }
+    SDL_free(ids);
+    return list;
+}
+#ifdef MHGU_DUAL_SCREEN
+// The Dual Screen rows (Android tab; PC: Display tab): on / off, and the bottom screen's panels from a list of MHXX-style layouts
+// (bottom_hud.c). A list in the ini that is none of these shows as "Custom" and is kept until another is picked.
+struct BottomLayout {
+    const char *name, *panels;
+};
+const BottomLayout bottom_layouts[] = {
+    {"MHXX: item, map, Hunter Arts right", BOTTOM_PANELS_DEFAULT},
+    {"Map, target camera, Hunter Arts right", "map@0,0 target@0,2 arts3v@2,0"},
+    {"Hunter Arts left, map, target camera", "arts3v@0,0 map@2,0 target@2,2"},
+    {"Hunter Arts in a row, map, item bar, target", "arts3h@0,0 map@0,1 itembar@2,1 target@2,2"},
+    {"Status, item bar, target, map", "status@0,0 itembar@0,1 target@0,2 map@2,1"},
+    {"Status, Hunter Arts in a row, item bar, target", "status@0,0 arts3h@0,1 itembar@0,2 target@2,2"},
+    {"MHXX default: Hunter Arts, D-pad, target", "arts3v@0,0 dpad@2,0 target@2,2"},
+};
+// The BMPs in wallpapers/ in the app's files (second_display_android.c loads the chosen one from there), sorted by name;
+// looked up once a second (the rows are rebuilt every frame).
+std::vector<std::string> wallpaper_files() {
+    static std::vector<std::string> files;
+    static Uint64 when;
+    if (when && SDL_GetTicks() - when < 1000)
+        return files;
+    when = SDL_GetTicks();
+    files.clear();
+    if (DIR *d = opendir("wallpapers")) {
+        while (struct dirent *e = readdir(d)) {
+            size_t n = strlen(e->d_name);
+            if (n > 4 && n < sizeof s.draft.bottom_wallpaper && !strcasecmp(e->d_name + n - 4, ".bmp"))
+                files.push_back(e->d_name);
+        }
+        closedir(d);
+    }
+    std::sort(files.begin(), files.end());
+    return files;
+}
+void dual_screen_rows(std::vector<Row> &r) {
+    Config &c = s.draft;
+    header(r, "dual.header", tr("Dual screen"));
+    bool there = config_second_display_available();
+#ifdef __ANDROID__
+    add_bool(r, "dual", "Bottom screen (dual-screen handheld)", &c.second_display, ini("SecondDisplay"));
+    r.back().help = tr("MHXX's bottom screen on this device's second screen: the item bar, the map, the Hunter Arts and the other panels you pick leave the main screen and show there, and touching them works like on the 3DS (use a Hunter Art, the item, switch the target). For dual-screen handhelds such as the AYN Thor; needs a device with a second screen.");
+#else
+    add_bool(r, "dual", "Bottom screen (second monitor)", &c.second_display, ini("SecondDisplay"));
+    r.back().help = tr("MHXX's bottom screen on another monitor than the game's: the item bar, the map, the Hunter Arts and the other panels you pick leave the game's window and fill that monitor, and touching or clicking them works like on the 3DS (use a Hunter Art, the item, switch the target). For a small touch screen or a dual-screen handheld's second panel; needs a second monitor.");
+#endif
+    if (!there) {  // (no second display: greyed out, the setting kept as it is)
+        r.back().enabled = false;
+#ifdef __ANDROID__
+        r.back().value = tr("No second screen");
+#else
+        r.back().value = tr("No second monitor");
+#endif
+        return;
+    }
+    if (!c.second_display) return;  // (its options only while it is on)
+    constexpr int n = (int)(sizeof bottom_layouts / sizeof bottom_layouts[0]);
+    std::vector<std::string> names;
+    int now = n;
+    for (int i = 0; i < n; i++) {
+        names.push_back(tr(bottom_layouts[i].name));
+        if (!strcmp(c.bottom_panels, bottom_layouts[i].panels)) now = i;
+    }
+    if (now == n) names.push_back(tr("Custom (from mhgurecomp.ini)"));
+    add_choice(
+        r, "dual.panels", "Bottom screen panels", now, names,
+        [](int v) {
+            constexpr int count = (int)(sizeof bottom_layouts / sizeof bottom_layouts[0]);
+            if (v < count) SDL_strlcpy(s.draft.bottom_panels, bottom_layouts[v].panels, sizeof s.draft.bottom_panels);
+        },
+        ini("Panels"));
+    add_choice(
+        r, "dual.background", "Bottom screen background", c.bottom_background, {tr("Wallpaper"), tr("Dark"), tr("Black (OLED: off)")},
+        [](int v) { s.draft.bottom_background = v; }, ini("Background"));
+    if (c.bottom_background != BOTTOM_BG_WALLPAPER) return;
+    std::vector<std::string> files = wallpaper_files();
+    files.insert(files.begin(), "");
+    auto at = std::find(files.begin(), files.end(), std::string(c.bottom_wallpaper));
+    if (at == files.end()) at = files.insert(files.end(), c.bottom_wallpaper);
+    std::vector<std::string> shown;
+    for (const std::string &f : files)
+        shown.push_back(f.empty() ? tr("Change every 30 seconds") : f.size() > 4 ? f.substr(0, f.size() - 4) : f);
+    add_choice(
+        r, "dual.wallpaper", "Bottom screen wallpaper", (int)(at - files.begin()), shown,
+        [files](int v) { SDL_strlcpy(s.draft.bottom_wallpaper, files[(size_t)v].c_str(), sizeof s.draft.bottom_wallpaper); },
+        ini("Wallpaper"));
+#ifdef __ANDROID__
+    r.back().help = tr("Your own pictures: put 24-bit BMP files in the wallpapers folder in the app's files (Files folder above lets you reach it). They are scaled to cover the bottom screen.");
+#else
+    r.back().help = tr("Your own pictures: put 24-bit BMP files in the wallpapers folder beside the game. They are scaled to cover the bottom screen.");
+#endif
+}
+#endif
 std::vector<Row> main_rows() {
     std::vector<Row> r;
     Config &c = s.draft;
@@ -2002,6 +2520,9 @@ std::vector<Row> main_rows() {
         add_choice(
             r, "anchor", "HUD anchor", c.ui_anchor - 1, {"16:9", "21:9", "32:9", tr("Edges")},
             [](int v) { c.ui_anchor = v + 1; }, ini("UIAnchor"));
+#if defined(MHGU_DUAL_SCREEN) && !defined(__ANDROID__)  // (Android: on its own tab)
+        dual_screen_rows(r);
+#endif
         break;
     case 1:
         header(r, "audio.header", tr("Audio"));
@@ -2010,12 +2531,35 @@ std::vector<Row> main_rows() {
         add_choice(r, "audio.output", "Output", c.audio_output, {tr("Stereo"), tr("5.1 surround")},
                    [](int v) { c.audio_output = v; }, ini("Output"));
         r.back().help = tr("5.1 surround sends the game's own 5.1 mix (front, center, subwoofer, rear) to a surround system; Stereo folds it down to two speakers or headphones. With 5.1 on a stereo device, the system folds it down instead.");
+        {  // [Audio] Device: Default, the devices plugged in now, and the chosen one also while it isn't
+            std::vector<std::string> devs = playback_devices();
+            const char *now = SDL_GetAudioDeviceName(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK);
+            std::vector<std::string> names{now && *now ? std::string(tr("Default")) + " (" + now + ")" : tr("Default")};
+            for (const std::string &d : devs)
+                names.push_back(d);
+            int sel = 0;
+            if (*c.audio_device && SDL_strcasecmp(c.audio_device, "Default")) {
+                auto it = std::find(devs.begin(), devs.end(), std::string(c.audio_device));
+                sel = 1 + (int)(it - devs.begin());
+                if (it == devs.end()) {
+                    devs.push_back(c.audio_device);
+                    names.push_back(std::string(c.audio_device) + " (" + tr("not plugged in") + ")");
+                }
+            }
+            add_choice(r, "audio.device", "Device", sel, names,
+                       [devs](int v) { SDL_strlcpy(c.audio_device, v > 0 ? devs[v - 1].c_str() : "", sizeof c.audio_device); },
+                       ini("Device"));
+            r.back().help = tr("Where the game's sound plays. Default follows the system's default device, also when it changes while the game runs. A device chosen here is always used: while it is unplugged there is no sound, and it comes back when the device does.");
+        }
         header(r, "graphics.header", tr("Graphics"));
         add_bool(r, "show.fps", "FPS counter", &c.show_fps, ini("ShowFPS"));
 #ifdef __ANDROID__
         add_choice(r, "show.battery", "Battery indicator", c.show_battery, {tr("Off"), tr("With FPS counter"), tr("By itself")},
                    [](int v) { c.show_battery = v; }, ini("ShowBattery"));
         r.back().help = tr("The battery's charge, in the FPS counter's box or in a box of its own (drag it like the FPS counter).");
+        add_choice(r, "show.temperature", "Temperature", c.show_temperature, {tr("Off"), tr("Celsius"), tr("Fahrenheit")},
+                   [](int v) { c.show_temperature = v; }, ini("ShowTemperature"));
+        r.back().help = tr("The device's temperature (its battery's) under the FPS counter, or in a box of its own when the FPS counter is off.");
 #endif
         number(r, "fps", "Frame rate limit", &c.fps, (int)lo("FPS"), (int)hi("FPS"), 1, ini("FPS"));
         {  // left / right: one frame per second more or less; Confirm: the common ones
@@ -2071,6 +2615,13 @@ std::vector<Row> main_rows() {
                ini("DrawDistance"));
         if (c.draw_distance == 0)
             r.back().value = tr("No limit");
+        add_choice(r, "aniso", "Anisotropic filtering",
+                   c.aniso >= 16  ? 4
+                   : c.aniso >= 8 ? 3
+                   : c.aniso >= 4 ? 2
+                   : c.aniso >= 2 ? 1
+                                  : 0,
+                   {tr("Off"), "2x", "4x", "8x", "16x"}, [](int v) { c.aniso = 1 << v; }, ini("AnisotropicFiltering"));
         add_bool(r, "smooth", "Smooth gradients", &c.smooth_gradients, ini("SmoothGradients"));
         add_bool(r, "kerning", "Fix kerning", &c.fix_kerning, ini("FixKerning"));
         add_bool(r, "boldtext", "Bold text", &c.bold_text, ini("BoldText"));
@@ -2127,12 +2678,15 @@ std::vector<Row> main_rows() {
         number(r, "mouse.smooth", tr("Mouse smoothing"), &c.mouse_smoothing, lo("MouseSmoothing"), hi("MouseSmoothing"), .05f, ini("MouseSmoothing"));
         add_choice(r, "mouse.capture", "Mouse capture", c.mouse_capture, {tr("Click"), tr("Hunt")},
                    [](int v) { c.mouse_capture = v; }, ini("MouseCapture"));
+        add_bool(r, "mouse.menus", "Mouse in menus", &c.menu_mouse, ini("MenuMouse"));
         action(r, "keybinds", tr("Keybinds"), []() { push(View::Keybinds, "bind.0"); });
         r.back().help = tr("The keys and mouse buttons for the Switch controller's buttons, for moving and for the item bar, and the chat key.");
         action(r, "actions", tr("Game actions"), []() { push(View::Actions, "act.enable"); });
         r.back().help = tr("Rebind the game itself: every action of a hunt, of the town and of the menus on the controller button, key or mouse button you choose, also per weapon, with the controller or the keyboard drawn beside the list. The keys for moving, the item bar and chat are there too (Keys). Off by default.");
         add_bool(r, "menu.chord", "Plus + Minus opens this menu", &c.menu_chord, ini("MenuChord"));
         r.back().help = tr("Pressing Plus and Minus together (Start + Back on a controller) opens this menu. Turn it off to keep that combination for the game or a cheat, for example when you play with a keyboard and mouse. F1 still opens the menu.");
+        add_bool(r, "title.back", "Back on the Main Menu asks to quit", &c.title_back_exit, ini("TitleBackExit"));
+        r.back().help = tr("Pressing Back on the title screen's Main Menu asks whether to quit the game. Turn it off if a mod swaps the menus' Confirm and Back, so that confirming there no longer asks. Closing the window still asks.");
         break;
     case 3:
         number(r, "port", "Host port (TCP / UDP)", &c.ldn_port, (int)lo("Port"), (int)hi("Port"), 1, ini("Port"));
@@ -2141,19 +2695,55 @@ std::vector<Row> main_rows() {
              !*c.ldn_server ? std::string(tr("Default")) + (*LDN_DEFAULT_SERVER ? " (" LDN_DEFAULT_SERVER ")" : "")
                             : c.ldn_server,
              ini("Server"));
-#ifdef __ANDROID__
-        text(r, "key", "Matchmaking key", c.ldn_key, sizeof c.ldn_key, *c.ldn_key ? c.ldn_key : tr("Public (Android players only)"), ini("Key"));
-#else
         text(r, "key", "Matchmaking key", c.ldn_key, sizeof c.ldn_key, *c.ldn_key ? c.ldn_key : tr("Public"), ini("Key"));
-#endif
         hub_check(r);
         add_bool(r, "direct", "Direct connections", &c.ldn_direct, ini("Direct"));
         r.back().help = tr("In an internet hub, your game and the host's send their packets straight to each other when both routers let them, for a lower ping; else through the hub server. The other player's game then sees your IP address. Off: always through the hub server.");
+        // (all of them take effect at the next start: config.c marks them restart)
+        header(r, "crossplay.header", tr("Emulator Crossplay"));
+        add_bool(r, "ryu.serve", "Host for Ryujinx players", &c.ldn_ryu_serve, ini("RyuServe"));
+        r.back().help = tr("While local play is open, this game runs a Ryujinx LDN server itself. Ryujinx and Ryubing players set their LDN server to this PC's address and the port below, then search for hubs in Local Play. Hubs you create are made on it. For the internet, forward the port (TCP) or use a VPN such as Radmin.");
+        if (c.ldn_ryu_serve) {
+            number(r, "ryu.serve.port", "Ryujinx server port (TCP)", &c.ldn_ryu_serve_port, 1, (int)hi("RyuServePort"), 1,
+                   ini("RyuServePort"));
+            r.back().help = tr("The port Ryujinx players connect to. Default: 30456, the one Ryujinx's own LDN server uses.");
+        }
+        add_bool(r, "room.serve", "Host for suyu / Eden / Citron players", &c.ldn_room_serve, ini("RoomServe"));
+        r.back().help = tr("While local play is open, this game runs a multiplayer room itself. suyu, yuzu, Eden and Citron players join a room at this PC's address and the port below, with the room password if there is one. Hubs you create are shared with the room, and with Ryujinx players too when both are on. For the internet, forward the port (UDP) or use a VPN.");
+        if (c.ldn_room_serve) {
+            number(r, "room.serve.port", "Room port (UDP)", &c.ldn_room_serve_port, 1, (int)hi("RoomServePort"), 1,
+                   ini("RoomServePort"));
+            r.back().help = tr("The port room players connect to. Default: 24872, the multiplayer rooms' usual port.");
+        }
+        text(r, "room.pass", "Room password", c.ldn_room_pass, sizeof c.ldn_room_pass,
+             *c.ldn_room_pass ? std::string(strlen(c.ldn_room_pass), '*') : std::string(tr("None")), ini("RoomPassword"));
+        r.back().help = tr("The password of the room this game hosts, or of the room server below that it joins. Empty: no password.");
+        text(r, "ryu.pass", "Ryujinx passphrase", c.ldn_ryu_pass, sizeof c.ldn_ryu_pass,
+             *c.ldn_ryu_pass ? c.ldn_ryu_pass : tr("Public"), ini("RyuPassphrase"));
+        r.back().help = tr("For a private group with Ryujinx players: Ryujinx- followed by exactly 8 hex digits (for example Ryujinx-1a2b3c4d), the same one the Ryujinx players enter. Anything else, a typo too, counts as none: your lobbies are public.");
+        text(r, "ryu.servers", "Ryujinx servers to search", c.ldn_ryu_servers, sizeof c.ldn_ryu_servers,
+             *c.ldn_ryu_servers ? c.ldn_ryu_servers : tr("None"), ini("RyuServers"));
+        r.back().help = tr("Ryujinx LDN servers whose hubs show up in Search Hubs, as host or host:port (default port 30456), separated by commas. To join a player on this port who hosts with Ryujinx players, enter their address. Please don't use Ryujinx's own public server.");
+        text(r, "ryu.host", "Ryujinx server for your hubs", c.ldn_ryu_host, sizeof c.ldn_ryu_host,
+             *c.ldn_ryu_host ? std::string(c.ldn_ryu_host) : std::string(tr(c.ldn_ryu_serve ? "This PC" : "None")),
+             ini("RyuHost"));
+        r.back().help = tr("A Ryujinx LDN server that hubs you create are made on, so Ryujinx players on it can join them. Not needed when this game hosts for Ryujinx players itself.");
+        text(r, "room.server", "Room server", c.ldn_room_server, sizeof c.ldn_room_server,
+             *c.ldn_room_server ? c.ldn_room_server : tr("None"), ini("RoomServer"));
+        r.back().help = tr("A suyu-style multiplayer room (host or host:port, default port 24872) this game joins while local play is open: the emulator players' hubs show up in Search Hubs.");
+        add_bool(r, "room.host", "Host hubs in the room", &c.ldn_room_host, ini("RoomHost"));
+        r.back().help = tr("Hubs you create live in the room server above, so its players can search and join them. Not needed when this game hosts the room itself.");
+        text(r, "room.name", "Name in the room", c.ldn_room_nick, sizeof c.ldn_room_nick,
+             *c.ldn_room_nick ? c.ldn_room_nick : "MHGU Player", ini("RoomName"));
+        r.back().help = tr("Your name in the room server above.");
         header(r, "discord.header", "Discord");
         add_bool(r, "discord", "Discord Rich Presence", &c.discord, ini("RichPresence"));
         add_bool(r, "discord.hunter", "Show hunter name and HR", &c.discord_hunter, ini("ShowHunter"));
         break;
-    case 4: {
+    case FRIENDS_PAGE:
+        friends_rows(r);
+        break;
+    case MISC_PAGE: {
         const char *per_quest =
             tr("HP multipliers for single quests, by their quest ID: in those quests they are used instead of the ones above.");
         header(r, "hub.header", tr("Hub"));
@@ -2233,7 +2823,8 @@ std::vector<Row> main_rows() {
         break;
     case APP_PAGE:
         header(r, "look.header", tr("Appearance"));
-        add_choice(r, "language", "Language", c.language, {"English", "Español", "简体中文"},
+        add_choice(r, "language", "Language", c.language,
+                   {"English", "Español", language_name("中文", "Chinese", 0x4E2D), language_name("한국어", "Korean", 0xD55C)},
                    [](int v) { c.language = v; }, ini("Language"));
         add_choice(r, "theme", "Menu theme", c.menu_theme, {tr("Gold"), tr("Blue"), tr("Hunter")},
                    [](int v) { c.menu_theme = v; }, ini("Theme"));
@@ -2264,6 +2855,10 @@ std::vector<Row> main_rows() {
         add_bool(r, "confirm.exit", "Confirm exit", &c.confirm_exit, ini("ConfirmExit"));
         add_choice(r, "updates", "Updates", c.updates, {tr("Ask"), tr("Auto"), tr("Off")},
                    [](int v) { c.updates = v; }, ini("Updates"));
+        if (!changelog().empty()) {
+            action(r, "changelog", fmt("What's new in %s", MHGU_VERSION), []() { push(View::Changelog, "changelog.back"); });
+            r.back().help = tr("This version's changes, from its release notes. The updater saved them when it installed this version.");
+        }
         add_bool(r, "bonus", "Bonus content", &c.bonus_content, ini("BonusContent"));
 #ifndef __ANDROID__  // (Android: its own tab's Save folder)
         header(r, "save.header", tr("Save data"));
@@ -2275,6 +2870,18 @@ std::vector<Row> main_rows() {
         action(r, "save.location.reset", tr("Use the default folder"), []() { s.draft.save_location[0] = 0; },
                *c.save_location != 0);
         r.back().help = tr("Keeps the save in the default folder again (%APPDATA%\\MHGURecomp\\save on Windows, ~/.local/share/MHGURecomp/save on Linux) after Save and a restart. The save in the other folder is left where it is.");
+        add_bool(r, "backups", "Save backups", &c.backups_on, ini("Backups"));
+        r.back().help = tr("Each time the game saves, the save's files are copied to a folder named after the date and time. To restore one, close the game and copy its files into save_0. Off: no backups are made; those already made stay where they are.");
+        number(r, "backups.kept", "Backups to keep", &c.save_backups, (int)lo("BackupsKept"), (int)hi("BackupsKept"), 1, ini("BackupsKept"));
+        r.back().help = tr("How many save backups are kept: past this many, the oldest is deleted.");
+        text(r, "backup.location", "Backup folder", c.backup_location, sizeof c.backup_location,
+             *c.backup_location ? c.backup_location : tr("In the save folder"), ini("BackupLocation"));
+        r.back().help = tr("Where the save backups go, for example on another drive or in a folder you sync. Empty: a backups folder in the save folder, beside save_0. Type a path, or use Choose folder. Press Save, then restart the game. Backups already made stay where they are.");
+        action(r, "backup.location.pick", tr("Choose folder"), []() { ui_request_import(11); });
+        r.back().help = tr("Opens your system's folder picker to choose the backup folder.");
+        action(r, "backup.location.reset", tr("Use the save folder"), []() { s.draft.backup_location[0] = 0; },
+               *c.backup_location != 0);
+        r.back().help = tr("Puts the save backups in a backups folder in the save folder again, after Save and a restart. Backups in the other folder are left where they are.");
 #endif
         break;
 #ifdef __ANDROID__
@@ -2294,6 +2901,10 @@ std::vector<Row> main_rows() {
         r.back().help = tr("Where the save is kept, so syncing software can keep it the same on your devices: pick the same folder on each. The folder holds save_0, like the PC version's save folder. Android asks for \"All files access\" so the app can use a folder outside its own. Press Save, then restart the app. Your current save is not moved: use Export save first to put it there.");
         action(r, "save.folder.reset", tr("Use the app's folder"), []() { s.draft.save_dir[0] = 0; }, *c.save_dir != 0);
         r.back().help = tr("Keeps the save in the app's own folder again (after Save and a restart). The save in the other folder is left where it is.");
+        add_bool(r, "backups", "Save backups", &c.backups_on, ini("Backups"));
+        r.back().help = tr("Each time the game saves, the save's files are copied to a folder named after the date and time. To restore one, close the game and copy its files into save_0. Off: no backups are made; those already made stay where they are.");
+        number(r, "backups.kept", "Backups to keep", &c.save_backups, (int)lo("BackupsKept"), (int)hi("BackupsKept"), 1, ini("BackupsKept"));
+        r.back().help = tr("How many save backups are kept: past this many, the oldest is deleted.");
         action(r, "import.save", tr("Import save"), []() { ui_request_import(2); });
         r.back().help = tr("Copies a save's system and system_backup files into the app from any folder on this device. Your current save is kept. The app closes afterwards.");
         action(r, "export.save", tr("Export save"), []() { ui_request_import(3); });
@@ -2311,6 +2922,9 @@ std::vector<Row> main_rows() {
         r.back().help = tr("Adds a mod from a folder anywhere on this device. The app checks the folder's layout and offers to fix it if the game couldn't find the mod's files. Close and reopen the app to load it.");
         action(r, "import.game", tr("Import game files"), []() { ui_request_import(1); });
         r.back().help = tr("Copies the exefs and romfs folders into the app from any folder on this device, replacing the game files it has, and uses them from now on. The app closes afterwards.");
+#ifdef MHGU_DUAL_SCREEN
+        dual_screen_rows(r);
+#endif
         break;
     }
 #endif
@@ -2373,6 +2987,14 @@ bool save() {
         acts().saved = acts().draft;
     }
     s.saved = s.draft;
+#ifdef MHGU_DUAL_SCREEN
+    // (the bottom screen's settings apply at once: bottom_hud.c and second_display_android.c read them from g_config)
+    g_config.second_display = s.draft.second_display;
+    SDL_strlcpy(g_config.bottom_panels, s.draft.bottom_panels, sizeof g_config.bottom_panels);
+    g_config.bottom_background = s.draft.bottom_background;
+    SDL_strlcpy(g_config.bottom_wallpaper, s.draft.bottom_wallpaper, sizeof g_config.bottom_wallpaper);
+    config_second_display_request();  // (applied by the UI thread: nvn/vulkan/second_display*.c)
+#endif
     s.saved_notice = true;
     s.error.clear();
     if (acts().layout == ACT_LAYOUT_SIMPLE && acts().draft.enable) {  // (saved all the same: the player may mean it)
@@ -2389,7 +3011,8 @@ bool save() {
     }
     return true;
 }
-// Takes a key (or a mouse button) for the keybind (s.capture_bind) or the chat key (-1) being chosen. false: refused
+// Takes a key (or a mouse button) for the keybind (s.capture_bind), the chat key or the pause key (CAPTURE_*) being
+// chosen. false: refused
 bool bind_take(int key) {
     const char *name = key > 0 && key < KEY_MOUSE ? SDL_GetScancodeName((SDL_Scancode)key) : "";
     const char *reserved = key > 0 && key < KEY_MOUSE ? key_reserved(key) : nullptr;
@@ -2408,6 +3031,22 @@ bool bind_take(int key) {
         else if (keys[0] != key)
             keys[1] = key;
         return true;
+    }
+    if (s.capture_bind == CAPTURE_PAUSE && key > 0) {
+        if (reserved) {
+            s.error = fmt("That key is the recomp's own (%s).", tr(reserved));
+            return false;
+        }
+        if (key == SDL_SCANCODE_RETURN || key == SDL_SCANCODE_KP_ENTER) {  // (Enter resumes, as Esc does)
+            s.error = tr("That key can't be used.");
+            return false;
+        }
+        if (*name && strlen(name) < sizeof s.draft.pause_key && !strpbrk(name, ";#")) {
+            SDL_strlcpy(s.draft.pause_key, name, sizeof s.draft.pause_key);
+            return true;
+        }
+        s.error = tr("That key can't be used.");
+        return false;
     }
     if (key > 0 && *name && strlen(name) < sizeof s.draft.chat_key && !strpbrk(name, ";#")) {
         SDL_strlcpy(s.draft.chat_key, name, sizeof s.draft.chat_key);
@@ -2454,6 +3093,10 @@ std::vector<Row> rows_for_view(bool *open) {
         keybind_rows(r);
     } else if (s.view == View::Actions) {
         action_rows(r);
+    } else if (s.view == View::Changelog) {
+        action(r, "changelog.back", tr("Back"), []() { pop(); });
+    } else if (s.view == View::OfflineFriends) {
+        offline_friends_rows(r);
     } else if (s.view == View::KeyCapture && acts().capture >= 0) {
         action_capture_rows(r);
     } else if (s.view == View::KeyCapture) {
@@ -2466,6 +3109,8 @@ std::vector<Row> rows_for_view(bool *open) {
             action(r, "capture.none", tr("None"), []() {
                 if (s.capture_bind >= 0)
                     s.draft.binds[s.capture_bind][0] = s.draft.binds[s.capture_bind][1] = 0;
+                else if (s.capture_bind == CAPTURE_PAUSE)
+                    s.draft.pause_key[0] = 0;
                 else
                     s.draft.chat_key[0] = 0;
                 pop();
@@ -2539,7 +3184,11 @@ std::string help_text(const Row &r) {
         if (j == std::string::npos)
             j = at->second.size();
         line = at->second.substr(i, j - i);
-        out += (out.empty() ? "" : "\n") + std::string(tr(line.c_str()));
+        // "Default: x" is made by config_help, not a line of the ini: its words go through settings_locale.h on their own
+        if (!line.compare(0, 9, "Default: "))
+            out += (out.empty() ? "" : "\n") + std::string(tr("Default")) + ": " + tr(line.c_str() + 9);
+        else
+            out += (out.empty() ? "" : "\n") + std::string(tr(line.c_str()));
     }
     return out;
 }
@@ -2899,6 +3548,7 @@ bool settings_panel_take_forge() {
 }
 bool settings_panel_dirty() { return is_dirty.load(); }
 int settings_panel_theme() { return s.editing ? s.draft.menu_theme : config_editable().menu_theme; }
+int settings_panel_language() { return s.editing ? s.draft.language : config_editable().language; }
 bool settings_panel_confirming() { return is_confirming.load() || request_exit.load(); }
 bool settings_panel_key(int scancode) {
     if (!is_capturing.load())
@@ -3104,7 +3754,8 @@ void settings_panel(bool *open) {
             first_page((s.page + 1) % PAGES);
         if (pressed(ImGuiKey_GamepadL1))
             first_page((s.page + PAGES - 1) % PAGES);
-        const char *pages[] = {"Display", "Graphics & Audio", "Controls", "Network", "Misc", "Mods", "Cheats", "Menu Options"
+        const char *pages[] = {"Display", "Graphics & Audio", "Controls", "Network", "Friends", "Misc", "Mods", "Cheats",
+                               "Menu Options"
 #ifdef __ANDROID__
                                , "Android"
 #endif
@@ -3116,7 +3767,7 @@ void settings_panel(bool *open) {
         ImGui::SetCursorScreenPos(tabs_start);
         float gutter = fw * 2.1f;
         float tabs_width = avail - gutter * 2;
-        int columns = tabs_width / fw < 50 ? 4 : PAGES;
+        int columns = tabs_width / fw < 50 ? (PAGES + 1) / 2 : PAGES;  // (narrow: two lines)
         float tabw = (tabs_width - ImGui::GetStyle().ItemSpacing.x * (columns - 1)) / columns;
         float tabh = fw * (columns == PAGES ? 2.7f : 2.1f);
         int lines = (PAGES + columns - 1) / columns;
@@ -3199,6 +3850,7 @@ void settings_panel(bool *open) {
                                                       : "Press a key or mouse button for: %s (Esc: cancel)",
                                       tr(acts().capture_row >= 0 ? act_row(acts().capture_row)->label : act_label(acts().capture)))
                             : s.view == View::Actions ? fmt("Game actions: %s", scheme_name(acts().dev))
+                            : s.view == View::Changelog ? fmt("What's new in %s", MHGU_VERSION)
                             : s.view == View::KeyCapture && s.capture_bind >= 0
                                 ? fmt("Press a key or mouse button for %s (Esc: cancel)", tr(bind_titles[s.capture_bind]))
                                 : tr(s.view == View::Exit         ? "Exit game?"
@@ -3206,11 +3858,16 @@ void settings_panel(bool *open) {
                                      : s.view == View::Reset      ? "Reset this tab?"
                                      : s.view == View::Move       ? "Move menu"
                                      : s.view == View::Conflicts  ? "Mod conflicts"
+                                     : s.view == View::OfflineFriends ? "Offline friends"
                                      : s.view == View::Keybinds   ? "Keybinds"
+                                     : s.view == View::KeyCapture && s.capture_bind == CAPTURE_PAUSE
+                                         ? "Press the key for Pause/Suspend (Esc: cancel)"
                                      : s.view == View::KeyCapture ? "Press the key for chat (Esc: cancel)"
                                                                   : "Unsaved changes");
         ImGui::TextWrapped("%s", title.c_str());
     }
+    if (s.view == View::Changelog)  // (the room under the title the window has, less the Back row's)
+        changelog_box(vp->WorkSize.y - 2 * margin - ImGui::GetCursorPosY() - ImGui::GetFontSize() * 4);
     if (s.view == View::Keyboard) {
         ImGuiIO &io = ImGui::GetIO();
         for (ImWchar ch : io.InputQueueCharacters) {
@@ -3314,6 +3971,9 @@ void settings_panel(bool *open) {
 #else
         Config temp = s.draft;  // (a folder whose path the settings file can't hold, with ';' or '#', is not taken)
         if (which == 4 && SDL_strlcpy(temp.save_location, folder, sizeof temp.save_location) < sizeof temp.save_location &&
+            config_validate(&temp, nullptr, 0))
+            s.draft = temp;
+        if (which == 11 && SDL_strlcpy(temp.backup_location, folder, sizeof temp.backup_location) < sizeof temp.backup_location &&
             config_validate(&temp, nullptr, 0))
             s.draft = temp;
 #endif

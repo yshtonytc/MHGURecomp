@@ -4,6 +4,7 @@
 #include "app_actions.h"
 #include "overlay.h"
 #include "modorder.h"
+#include "net/net.h"
 #include "imgui_internal.h"
 #include <SDL3/SDL.h>
 #include <cassert>
@@ -33,10 +34,24 @@ extern "C" int ui_take_picked_folder(char *out, size_t size) {
     if (!picked_folder) return 0;
     SDL_strlcpy(out, picked_folder, size);
     picked_folder = nullptr;
-    return 4;
+    return import_requested == 11 ? 11 : 4;  // (the picker last asked for: the save's folder or the backups')
+}
+extern "C" const char *plat_utf8_path(const char *path, char *buf, size_t size) {  // (runtime/platform: the same on Linux)
+    SDL_strlcpy(buf, path, size);
+    return buf;
 }
 extern "C" int ldn_hub_status(const char *, const char *, int *, int *) { return 0; }
 extern "C" void ldn_hub_check(const char *, const char *) {}
+extern "C" bool ldn_session_code(char *, size_t) { return false; }
+extern "C" bool ldn_join_code(const char *, const char *) { return true; }
+extern "C" int ldn_invite_state(char *code, size_t size) { if (code) snprintf(code, size, "ABCD-EFGH"); return 0; }
+extern "C" void ldn_my_friend_code(char *out, size_t size) { snprintf(out, size, "ABCD-EFGH-JKMN-PQRS"); }
+extern "C" int ldn_friends(LdnFriend *, int, int *server_state) { if (server_state) *server_state = 0; return 0; }
+extern "C" const char *ldn_friend_add(const char *) { return nullptr; }
+extern "C" void ldn_friend_remove(const char *) {}
+extern "C" int ldn_friend_requests(LdnRequest *, int) { return 0; }
+extern "C" void ldn_friend_request_answer(const char *, bool) {}
+extern "C" int ldn_hub_hunters(LdnHunter *, int) { return 0; }
 extern "C" bool forge_plugins_have(int) { return false; }  // (no Forge plugins started)
 extern "C" int forge_plugin_titles(const char **, int) { return 0; }
 // (cheats.c: two cheats, a master code and one that can be turned off)
@@ -227,7 +242,7 @@ int main() {
     selected("face");
     // The Keybinds submenu: a key chosen for B, then a mouse button as its second; the recomp's own keys refused
     press(ImGuiKey_Home);
-    down(9);  // (background, keyboard prompts, combo, mouse, vertical, invert, smoothing, capture, keybinds)
+    down(10);  // (background, keyboard prompts, combo, mouse, vertical, invert, smoothing, capture, mouse in menus, keybinds)
     selected("keybinds");
     confirm();
     selected("bind.0");  // (past the section's title)
@@ -280,7 +295,7 @@ int main() {
     assert(config_live_bind(BIND_B, 0) == SDL_SCANCODE_G && config_live_bind(BIND_B, 1) == KEY_MOUSE + SDL_BUTTON_MIDDLE);
     assert(config_live_bind(BIND_X, 0) == KEY_MOUSE + SDL_BUTTON_X1);
     press(ImGuiKey_Home);
-    down(9);
+    down(10);  // (keybinds)
     confirm();
     press(ImGuiKey_End);
     press(ImGuiKey_GamepadDpadUp);
@@ -324,8 +339,10 @@ int main() {
     selected("face");
     tab();
     tab();
+    selected("code.join");  // (the Friends tab: Session code is disabled without a hub)
+    tab();
     selected("sync");  // (the Hub heading first)
-    down(4);  // (lag compensation, village quests, urgent quests, then the HP heading is passed)
+    down(5);  // (lag compensation, village quests, urgent quests, hold A, then the HP heading is passed)
     selected("hp.0");
     tab();
     selected("mod.Aaa");
@@ -532,7 +549,8 @@ int main() {
     tab();
     tab();
     tab();
-    tab();  // (Misc, Mods, Cheats, Menu Options)
+    tab();
+    tab();  // (Friends, Misc, Mods, Cheats, Menu Options)
     selected("language");
     // The menu's confirm button (Menu controls): saved, it applies to the menu right away
     down(4);  // (theme, scale, detach, menu.confirm)
@@ -614,7 +632,7 @@ int main() {
     press(ImGuiKey_GamepadL1);
     press(ImGuiKey_GamepadL1);  // (Cheats, Mods, Misc)
     selected("sync");  // (the Hub heading first)
-    down(4);  // (lag compensation, village quests, urgent quests, then the HP heading is passed)
+    down(5);  // (lag compensation, village quests, urgent quests, hold A, then the HP heading is passed)
     selected("hp.0");
     down(5);
     confirm();
@@ -650,8 +668,10 @@ int main() {
     press(ImGuiKey_GamepadL1);
     press(ImGuiKey_GamepadL1);
     press(ImGuiKey_GamepadL1);
+    press(ImGuiKey_GamepadL1);  // (Friends, Network, Controls, Graphics & Audio)
     selected("volume");
-    down(14);  // (mutebg, audio.output, show.fps, fps, vsync, prewarm, msaa, fxaa, fxaamode, drawdist, smooth, kerning, boldtext, fsr)
+    down(15);  // (mutebg, audio.output, show.fps, fps, vsync, prewarm, msaa, fxaa, fxaamode, drawdist, aniso, smooth, kerning,
+               // boldtext, fsr)
     selected("fsr");
     confirm();
     assert(settings_panel_dirty());

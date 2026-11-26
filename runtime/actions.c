@@ -59,6 +59,10 @@ static const ActDef defs[ACT_COUNT] = {
     [ACT_ITEM_USE] = {"ItemUse", ACT_VIEW_MB1, S_Y, 0, S_Y, NOFB, "Use item / sheathe (Y)", ""},
     [ACT_CHORD_XA] = {"ChordXA", ACT_VIEW_MB1, S_X, 0x2000, -1, NOFB, "X + A together on one input", ""},
     [ACT_INTERACT] = {"Interact", ACT_VIEW_MB1, S_A, 0, S_A, FB1(ACT_ATTACK_A), "Gather / open / talk, weapon away (A)", ""},
+    // the confirm key: A only while the hunter stands by an interactable whose category ConfirmTargets lists (a box, a
+    // bed, an NPC). Default: the game's A button, like Interact, so that with no rebinding nothing changes; give it an
+    // input of its own and that input confirms where Interact's keeps gathering, climbing and the like.
+    [ACT_OPEN_TALK] = {"OpenTalk", ACT_VIEW_MB1, S_A, 0, S_A, NOFB, "Open / talk (default same as gather)", ""},
     [ACT_FIELD_L] = {"FieldL", ACT_VIEW_MB1, S_L, 0, S_L, NOFB, "L button: camera, item select (L)", ""},
     [ACT_FIELD_ZL] = {"FieldZL", ACT_VIEW_MB1, S_ZL, 0, S_ZL, NOFB, "ZL button (ZL)", ""},
     [ACT_FIELD_ZR] = {"FieldZR", ACT_VIEW_MB1, ROLE_OTHER, 0, ACT_KCZR, NOFB, "ZR button (ZR)", ""},
@@ -104,12 +108,16 @@ static const ActDef defs[ACT_COUNT] = {
     [ACT_TOWN_R3] = {"TownR3", ACT_VIEW_TOWN, S_RSTICK, 0, S_RSTICK, NOFB, "Right stick click in town (R3)", ""},
     [ACT_TOWN_PLUS] = {"TownPlus", ACT_VIEW_TOWN, S_PLUS, 0, S_PLUS, NOFB, "Start menu in town (+)", ""},
     [ACT_TOWN_MINUS] = {"TownMinus", ACT_VIEW_TOWN, S_MINUS, 0, S_MINUS, NOFB, "Minus button in town (-)", ""},
+    // the Hunter Arts: no button of their own, a press asks for the Art itself (hle/input_view.c pl_no_input)
+    [ACT_ART1] = {"HunterArt1", ACT_VIEW_MB1, ROLE_VIRTUAL, 0, -1, NOFB, "Hunter Art 1", ""},
+    [ACT_ART2] = {"HunterArt2", ACT_VIEW_MB1, ROLE_VIRTUAL, 0, -1, NOFB, "Hunter Art 2", ""},
+    [ACT_ART3] = {"HunterArt3", ACT_VIEW_MB1, ROLE_VIRTUAL, 0, -1, NOFB, "Hunter Art 3", ""},
 };
 // The order a controls screen lists them in
 static const int order[] = {
-    ACT_ATTACK_X, ACT_ATTACK_A, ACT_CHORD_XA, ACT_DODGE, ACT_CROUCH, ACT_ITEM_USE, ACT_INTERACT, ACT_DASH, ACT_WEAPON_R, ACT_FIELD_ZR, ACT_FIELD_L,
+    ACT_ATTACK_X, ACT_ATTACK_A, ACT_CHORD_XA, ACT_DODGE, ACT_CROUCH, ACT_ITEM_USE, ACT_INTERACT, ACT_OPEN_TALK, ACT_DASH, ACT_WEAPON_R, ACT_FIELD_ZR, ACT_FIELD_L,
     ACT_ITEMBAR_RIGHT, ACT_ITEMBAR_LEFT, ACT_FIELD_ZL, ACT_CROSS_UP, ACT_CROSS_DOWN, ACT_CROSS_LEFT, ACT_CROSS_RIGHT, ACT_FIELD_L3, ACT_FIELD_R3, ACT_PAUSE,
-    ACT_MAP,
+    ACT_MAP, ACT_ART1, ACT_ART2, ACT_ART3,
     ACT_MENU_CONFIRM, ACT_MENU_CANCEL, ACT_MENU_X, ACT_MENU_Y, ACT_MENU_UP, ACT_MENU_DOWN, ACT_MENU_LEFT, ACT_MENU_RIGHT,
     ACT_MENU_TAB_L, ACT_MENU_TAB_R, ACT_MENU_PAGE_L, ACT_MENU_PAGE_R, ACT_MENU_PLUS, ACT_MENU_MINUS, ACT_MENU_L3, ACT_MENU_R3,
     ACT_TOWN_INTERACT, ACT_TOWN_CANCEL, ACT_TOWN_X, ACT_TOWN_Y, ACT_TOWN_RUN, ACT_TOWN_ZR, ACT_TOWN_L, ACT_TOWN_ZL,
@@ -120,15 +128,20 @@ static const int order[] = {
 // them) and for which bits of its own (0: all of them); in any other state those bits are silent. This is how one game
 // bit (A: attack, interact, the item bar's next item; Y: use item, the bar's previous item; B: dodge, crouch) is told apart by what
 // the game is doing with it, with no timing involved.
-enum { ST_OUT = 1, ST_AWAY = 2, ST_BAR = 4, ST_MOVING = 8, ST_STILL = 16, ST_AWAY_MOVING = 32, ST_AWAY_STILL = 64 };
+enum { ST_OUT = 1, ST_AWAY = 2, ST_BAR = 4, ST_MOVING = 8, ST_STILL = 16, ST_AWAY_MOVING = 32, ST_AWAY_STILL = 64,
+       ST_CONFIRM = 128 };  // (the hunter stands by an interactable whose category ConfirmTargets lists: act_set_target)
 typedef struct { uint8_t req, forbid; uint32_t bits; } ActScope;
 static const ActScope scopes[ACT_COUNT] = {
     [ACT_ATTACK_A] = {0, ST_BAR, 0x2000},          // (A with the weapon away: act_view's draw-attack rule)
     [ACT_CHORD_XA] = {0, ST_BAR, 0x2000},          // (its X is not the bar's)
-    [ACT_INTERACT] = {ST_AWAY, ST_BAR, 0x2000},    // (gather, carve, talk: weapon away)
+    [ACT_INTERACT] = {ST_AWAY, ST_BAR, 0x2000},    // (gather, carve, talk, open: weapon away; at an open/talk target
+                                                   //  OpenTalk presses A instead, see scoped_bits)
     [ACT_ITEM_USE] = {0, ST_BAR, 0x8000},         // (Y: the bar's previous item while it is open)
     [ACT_ITEMBAR_RIGHT] = {ST_BAR, 0, 0x2000},
     [ACT_ITEMBAR_LEFT] = {ST_BAR, 0, 0x8000},
+    // (a confirm target: OpenTalk delivers A there; Dodge and Crouch step aside only when the confirm key is the
+    // one held - see scoped_bits)
+    [ACT_OPEN_TALK] = {ST_AWAY | ST_CONFIRM, ST_BAR, 0x2000},
 };
 static const char *const weapon_names[ACT_WEAPONS] = {"GreatSword", "SnS", "Hammer", "Lance", "HBG", "LBG", "LongSword",
                                                       "SwitchAxe", "Gunlance", "Bow", "DualBlades", "Horn",
@@ -146,11 +159,15 @@ const int *act_fallbacks(int id) { return defs[id].fb; }
 // Keyboard and mouse defaults that are not Tier 0's button: in the menus (dialogs too) and in a town or the Hub the mouse
 // works as the menu pointer does, left click confirms / talks and right click backs out, and Space is X (the World Map,
 // a menu's X action). Tier 0 alone would give right click (A), Space (B) and left click (X) there; the hunt keeps them.
+// [Mouse] MenuMouse = Off drops them: Tier 0's everywhere, as before 0.17.
 static const ActBinding kbm_left = {true, 1, {{1, {KEY_MOUSE + SDL_BUTTON_LEFT}}}};
 static const ActBinding kbm_right = {true, 1, {{1, {KEY_MOUSE + SDL_BUTTON_RIGHT}}}};
 static const ActBinding kbm_space = {true, 1, {{1, {SDL_SCANCODE_SPACE}}}};
+// The Hunter Arts on 1, 2 and 3 (HunterArtKeys; the controller has no default: its own Control Type is there)
+static const ActBinding kbm_art[3] = {{true, 1, {{1, {SDL_SCANCODE_1}}}}, {true, 1, {{1, {SDL_SCANCODE_2}}}}, {true, 1, {{1, {SDL_SCANCODE_3}}}}};
 const ActBinding *act_default_binding(int id, int dev) {
-    if (dev != 1) return NULL;
+    if (dev == 1 && id >= ACT_ART1 && id <= ACT_ART3) return &kbm_art[id - ACT_ART1];
+    if (dev != 1 || !config_live_menu_mouse()) return NULL;
     switch (id) {
     case ACT_TOWN_INTERACT: case ACT_MENU_CONFIRM: return &kbm_left;
     case ACT_TOWN_CANCEL: case ACT_MENU_CANCEL: return &kbm_right;
@@ -370,10 +387,25 @@ static bool parse_bool(const char *v) { return !strcasecmp(v, "1") || !strcasecm
 static bool actions_section(const char *name) {  // "Actions" or "Actions.<...>"
     return !strncasecmp(name, "Actions", 7) && (!name[7] || name[7] == '.' || name[7] == ']');
 }
+// "5,8,9,13" -> the categories 5, 8, 9 and 13 (0 is "nothing to interact with", never one of them)
+static uint64_t parse_categories(const char *v) {
+    uint64_t m = 0;
+    while (*v) {
+        while (*v && (isspace((unsigned char)*v) || *v == ',' || *v == ';' || *v == '|')) v++;
+        if (!*v) break;
+        char *end = NULL;
+        unsigned long c = strtoul(v, &end, 0);
+        if (end == v) break;
+        if (c > 0 && c < 64) m |= 1ull << c;
+        v = end;
+    }
+    return m;
+}
 
 void act_parse(const char *text, ActProfile *p) {
     memset(p, 0, sizeof *p);
     p->enable = p->menus = true;  // (on unless the ini says 0: with no bindings it plays as the game, but for act_default_binding)
+    p->confirm_mask = ACT_CONFIRM_TARGETS;
     enum { NONE, MAIN, DEV } kind = NONE;
     int dev = 0, wc = -1;  // wc: the weapon class of the section, -1 none
     int line_no = 0;
@@ -421,6 +453,10 @@ void act_parse(const char *text, ActProfile *p) {
             else if (same_name(key, "Pointer")) p->pointer = parse_bool(val);
             else if (same_name(key, "SplitDashWeaponR")) p->split = parse_bool(val);
             else if (same_name(key, "SheathedAttackA")) p->sheathed_attack = parse_bool(val);
+            else if (same_name(key, "HunterArtKeys")) p->art_keys = parse_bool(val);
+            else if (same_name(key, "ConfirmTargets")) p->confirm_mask = parse_categories(val);
+            else if (same_name(key, "OpenTalkAlsoInteract")) p->open_talk_union = parse_bool(val);
+            else if (same_name(key, "TargetLog")) p->target_log = parse_bool(val);
             else if (same_name(key, "SharedInteractFrames")) p->shared_frames = atoi(val) < 0 ? 0 : atoi(val) > 30 ? 30 : atoi(val);
             else if (same_name(key, "Log")) p->log = parse_bool(val);
             else if (same_name(key, "Scheme"))
@@ -471,6 +507,23 @@ size_t act_format(const ActProfile *p, char *buf, size_t size) {
     if (p->pointer) PUT("Pointer=1\n");
     if (p->split) PUT("SplitDashWeaponR=1\n");
     if (p->sheathed_attack) PUT("SheathedAttackA=1\n");
+    if (p->art_keys) PUT("HunterArtKeys=1\n");
+    if (p->open_talk_union) PUT("OpenTalkAlsoInteract=1\n");
+    if (p->target_log) PUT("TargetLog=1\n");
+    // (a comment, not a setting: the default categories are built in, so an ini that changes nothing stays short; the
+    //  OpenTalk action is off with an empty ConfirmTargets)
+    PUT("; ConfirmTargets: the interactable categories OpenTalk opens or talks to, e.g. 5,8,9,13,17\n");
+    PUT(";   5 the supply box, 8 a bed, 9 the delivery box, 13 an NPC, 17 the carrier (those are the default);\n");
+    PUT(";   empty: OpenTalk off\n");
+    PUT("; OpenTalkAlsoInteract=1: the interact key presses A at an open/talk target too (default: it gives it up)\n");
+    PUT("; TargetLog=1: log the interactable's category as it changes, for filling ConfirmTargets in\n");
+    if (p->confirm_mask != ACT_CONFIRM_TARGETS) {
+        PUT("ConfirmTargets=");
+        bool first = true;
+        for (int c = 1; c < 64; c++)
+            if (p->confirm_mask >> c & 1) { PUT("%s%d", first ? "" : ",", c); first = false; }
+        PUT("\n");
+    }
     if (p->shared_frames) PUT("SharedInteractFrames=%d\n", p->shared_frames);
     if (p->log) PUT("Log=1\n");
     if (p->scheme) PUT("Scheme=%s\n", p->scheme == ACT_SCHEME_PAD ? "Controller" : "Keyboard");
@@ -552,6 +605,22 @@ static atomic_bool crouch_split_on;  // act_crouch_split_in(prof)
 static atomic_bool crouch_clash;     // Interact and Crouch end up on one input for some device or weapon class
 static atomic_ullong share_tab[ACT_VARS];  // act_interact_share, per weapon variant
 static atomic_int shared_frames_now = 1;
+// the interactable the hunter stands by (player+0x32B4): its category, -1 for none (0 is "none" in the game's field)
+static atomic_int target_category = -1;
+static atomic_ullong confirm_mask_now;  // ConfirmTargets, as loaded
+static atomic_bool open_talk_union_on;  // OpenTalkAlsoInteract, as loaded
+// OpenTalk has a binding of its own on some device or weapon class. Without one the split is off (no ST_CONFIRM):
+// Interact presses A everywhere as before OpenTalk existed, so an ini that moved Interact to another input keeps
+// opening boxes and talking with it (#417)
+static atomic_bool open_talk_bound;
+static bool open_talk_bound_in(const ActProfile *p) {
+    for (int d = 0; d < 2; d++) {
+        if (p->dev[d].base[ACT_OPEN_TALK].set) return true;
+        for (int w = 0; w < ACT_WEAPONS; w++)
+            if (p->dev[d].weapon[w][ACT_OPEN_TALK].set) return true;
+    }
+    return false;
+}
 static atomic_flag prof_lock = ATOMIC_FLAG_INIT;
 static void lock(void) { while (atomic_flag_test_and_set_explicit(&prof_lock, memory_order_acquire)) {} }
 static void unlock(void) { atomic_flag_clear_explicit(&prof_lock, memory_order_release); }
@@ -579,6 +648,7 @@ static uint64_t share_in(const ActProfile *p, int v) {
         if (!bi) continue;
         for (int j = 0; j < ACT_COUNT; j++) {
             if (j == ACT_INTERACT || j == ACT_ATTACK_A || defs[j].view != ACT_VIEW_MB1 || j == ACT_WEAPON_R) continue;
+            if (j == ACT_OPEN_TALK) continue;  // (the confirm key shares A with Interact by design: no gate on it)
             if (split && (j == ACT_DODGE || j == ACT_CROUCH)) continue;  // (told apart by the stick: nothing to try first)
             int fj = j;
             const ActBinding *bj = binding_in(p, d, j, v, &fj);
@@ -660,6 +730,9 @@ void act_use_profile(const ActProfile *p) {
     atomic_store(&crouch_clash, act_crouch_clash_in(p, NULL));
     for (int v = 0; v < ACT_VARS; v++) atomic_store(&share_tab[v], share_in(p, v));
     atomic_store(&shared_frames_now, p->shared_frames > 0 ? p->shared_frames : 1);
+    atomic_store(&confirm_mask_now, p->confirm_mask);
+    atomic_store(&open_talk_union_on, p->open_talk_union);
+    atomic_store(&open_talk_bound, open_talk_bound_in(p));
     unlock();
 }
 // Dash and the weapon R-action are one game input (the R-role getter) unless the profile asks for two: the flag, or a
@@ -710,6 +783,40 @@ bool act_crouch_split(void) { return prof_on && atomic_load(&crouch_split_on); }
 
 uint32_t act_virtual_bits(uint64_t active) {
     return act_split() && (active >> ACT_WEAPON_R & 1) ? ACT_VBIT_WEAPON_R : 0;
+}
+bool act_art_keys(void) { return prof_on && prof.art_keys; }
+bool act_target_log(void) { return prof_on && prof.target_log; }
+void act_format_targets(uint64_t mask, char *buf, size_t size) {
+    if (!size) return;
+    size_t n = 0;
+    buf[0] = 0;
+    for (int c = 1; c < 64; c++) {
+        if (!(mask >> c & 1)) continue;
+        int w = snprintf(buf + n, size - n, "%s%d", n ? "," : "", c);
+        if (w < 0 || (size_t)w >= size - n) break;
+        n += (size_t)w;
+    }
+}
+// (strict, for the settings screen: only numbers 1-63 and separators, so a typo is an error rather than a list that
+// silently drops what follows it)
+bool act_parse_targets(const char *text, uint64_t *mask) {
+    for (const char *s = text; *s;) {
+        if (isspace((unsigned char)*s) || *s == ',' || *s == ';' || *s == '|') { s++; continue; }
+        if (!isdigit((unsigned char)*s)) return false;
+        char *end = NULL;
+        unsigned long c = strtoul(s, &end, 10);
+        if (c < 1 || c > 63) return false;
+        s = end;
+    }
+    *mask = parse_categories(text);
+    return true;
+}
+// The confirm key's target: one category, 0 (nothing to interact with) is never a confirm target
+void act_set_target(uint32_t category) { atomic_store(&target_category, category && category < 64 ? (int)category : -1); }
+static bool target_is_confirm(void) {
+    if (!atomic_load(&open_talk_bound)) return false;  // (OpenTalk unbound: no split, Interact as it always was)
+    int c = atomic_load(&target_category);
+    return c > 0 && (atomic_load(&confirm_mask_now) >> c & 1);
 }
 void act_get_profile(ActProfile *out) {
     lock();
@@ -768,6 +875,16 @@ int act_validate(const ActProfile *p) {
                     if ((fi != i || fj != j) && defs[fi].view == defs[fj].view) continue;
                     // (A with the weapon out and A with it away are never read together)
                     if (!p->sheathed_attack && ((i == ACT_ATTACK_A && j == ACT_INTERACT) || (i == ACT_INTERACT && j == ACT_ATTACK_A))) continue;
+                    // (nor A with the weapon out and Crouch, which is weapon away only)
+                    if (!p->sheathed_attack && ((i == ACT_ATTACK_A && j == ACT_CROUCH) || (i == ACT_CROUCH && j == ACT_ATTACK_A))) continue;
+                    // (Interact, OpenTalk, Dodge and Crouch share A on purpose: the target and the stick decide which one
+                    // delivers it - see scopes[])
+                    {
+                        int a = i, b = j;
+                        bool pair = ((a == ACT_INTERACT || a == ACT_DODGE || a == ACT_CROUCH) && b == ACT_OPEN_TALK) ||
+                                    (a == ACT_OPEN_TALK && (b == ACT_INTERACT || b == ACT_DODGE || b == ACT_CROUCH));
+                        if (pair) continue;
+                    }
                     for (int a = 0; a < bi->n; a++)
                         for (int e = 0; e < bj->n; e++) {
                             const ActChord *x = &bi->alt[a], *y = &bj->alt[e];
@@ -827,6 +944,7 @@ static const ActRow rows[] = {
     {"ItemBarLeft", "Item bar: previous item, L held (Y)", 0, ACT_ITEMBAR_LEFT, {-1, -1, -1}},
     {"ItemUse", "Use item / sheathe (Y)", 0, ACT_ITEM_USE, {ACT_TOWN_Y, -1, -1}},
     {"Interact", "Gather / open / talk, weapon away (A)", 0, ACT_INTERACT, {-1, -1, -1}},
+    {"OpenTalk", "Open / talk (default same as gather)", 0, ACT_OPEN_TALK, {-1, -1, -1}},
     {"Sprint", "Sprint (R)", 0, ACT_DASH, {ACT_TOWN_RUN, -1, -1}},
     {"WeaponR", "Weapon action: guard, charge, aim (R)", 0, ACT_WEAPON_R, {-1, -1, -1}},
     {"FieldL", "L button: camera, item select (L)", 0, ACT_FIELD_L, {ACT_TOWN_L, -1, -1}},
@@ -838,6 +956,9 @@ static const ActRow rows[] = {
     {"CrossRight", "D-pad right", 0, ACT_CROSS_RIGHT, {ACT_TOWN_RIGHT, -1, -1}},
     {"FieldL3", "Left stick click (L3)", 0, ACT_FIELD_L3, {ACT_TOWN_L3, ACT_MENU_L3, -1}},
     {"FieldR3", "Right stick click (R3)", 0, ACT_FIELD_R3, {ACT_TOWN_R3, ACT_MENU_R3, -1}},
+    {"HunterArt1", "Hunter Art 1", 0, ACT_ART1, {-1, -1, -1}},
+    {"HunterArt2", "Hunter Art 2", 0, ACT_ART2, {-1, -1, -1}},
+    {"HunterArt3", "Hunter Art 3", 0, ACT_ART3, {-1, -1, -1}},
     // menus and talking
     {"MenuConfirm", "Confirm / talk / examine (A)", 1, ACT_MENU_CONFIRM, {ACT_TOWN_INTERACT, -1, -1}},
     {"MenuCancel", "Cancel / back (B)", 1, ACT_MENU_CANCEL, {ACT_TOWN_CANCEL, -1, -1}},
@@ -915,18 +1036,25 @@ static bool shares_input(const ActBinding *a, const ActBinding *b) {
     return false;
 }
 // Rows a and b are read in a common context, and Simple should keep them apart
-static bool rows_overlap(int a, int b) {
+static bool rows_overlap(int a, int b, bool sheathed_attack) {
     if (a == b || !(act_row_views(a) & act_row_views(b))) return false;
     int ha = rows[a].head, hb = rows[b].head;
     if ((ha == ACT_CROUCH && hb == ACT_DODGE) || (ha == ACT_DODGE && hb == ACT_CROUCH)) return false;  // (the game's own B: roll moving, crouch standing)
+    if ((ha == ACT_CROUCH && hb == ACT_ATTACK_A) || (ha == ACT_ATTACK_A && hb == ACT_CROUCH))
+        return sheathed_attack;  // (Crouch with the weapon away, AttackA with it out - unless AttackA also presses A with it away)
     if ((ha == ACT_CROUCH && hb == ACT_INTERACT) || (ha == ACT_INTERACT && hb == ACT_CROUCH)) return true;  // (never share)
+    // (the open/talk key is meant to share an input with the roll or the interact key: no clash, and setting one does not
+    // take the input from the other - the target decides which of them the press is)
+    if ((ha == ACT_OPEN_TALK && (hb == ACT_DODGE || hb == ACT_CROUCH)) ||
+        (hb == ACT_OPEN_TALK && (ha == ACT_DODGE || ha == ACT_CROUCH))) return false;
+    if ((ha >= ACT_ART1 && ha <= ACT_ART3) || (hb >= ACT_ART1 && hb <= ACT_ART3)) return true;  // (an Art's input is its own)
     if (ha == ACT_ITEMBAR_RIGHT || ha == ACT_ITEMBAR_LEFT || hb == ACT_ITEMBAR_RIGHT || hb == ACT_ITEMBAR_LEFT)
         return (ha == ACT_ITEMBAR_RIGHT && hb == ACT_ITEMBAR_LEFT) || (ha == ACT_ITEMBAR_LEFT && hb == ACT_ITEMBAR_RIGHT);  // (a state of its own: only the bar's two clash)
     if (ha == ACT_INTERACT || hb == ACT_INTERACT) return false;  // (shares by design: the gate, or Dodge once Crouch is split)
     return true;
 }
 bool act_rows_clash(const ActProfile *p, int dev, int a, int b) {
-    if (!rows_overlap(a, b)) return false;
+    if (!rows_overlap(a, b, p->sheathed_attack)) return false;
     int fa = rows[a].head, fb2 = rows[b].head;
     const ActBinding *x = binding_in(p, dev, rows[a].head, 0, &fa), *y = binding_in(p, dev, rows[b].head, 0, &fb2);
     if (!x || !y || fa != rows[a].head || fb2 != rows[b].head) return false;  // (a default, or one that follows another)
@@ -937,7 +1065,7 @@ uint64_t act_row_claim(ActProfile *p, int dev, int row, int code, int (*sw_sourc
                        void *user, bool dash_zr) {
     uint64_t changed = 0;
     for (int o = 0; o < act_row_count(); o++) {
-        if (!rows_overlap(row, o)) continue;
+        if (!rows_overlap(row, o, p->sheathed_attack)) continue;
         int from = rows[o].head;
         const ActBinding *b = binding_in(p, dev, rows[o].head, 0, &from);
         if (from != rows[o].head) continue;  // (it follows another row: that one is the owner)
@@ -1017,6 +1145,9 @@ static void claims_of(int view, int v, Claims *cl) {
     cl->n = 0;
     for (int i = 0; i < ACT_COUNT; i++) {
         if (claim_group(i) != view) continue;
+        // (the confirm key is meant to share its input with the roll: it must not take that input away from Dodge's
+        // default, or giving it A would stop A rolling - the target decides which of the two the press is)
+        if (i == ACT_OPEN_TALK) continue;
         for (int d = 0; d < 2; d++) {
             const ActBinding *b = binding_of(d, i, v);
             for (int a = 0; b && a < b->n; a++)
@@ -1120,7 +1251,7 @@ uint32_t act_view_managed(int view, bool dash_zr) {
 // With the weapon away and Crouch split from Dodge (act_crouch_split): B comes from Crouch while the left stick is
 // not pushed (the crouch) and from Dodge while it is (the roll). Where Interact and Crouch are on one input, Interact
 // wins: that press is only A. With the weapon out Dodge still delivers B standing (weapon B-actions need it), and Crouch
-// delivers it standing but never while the stick is pushed.
+// on an input of its own delivers nothing (the hunter can't crouch then).
 static uint32_t state_of(int view, uint32_t ew, bool bar) {
     uint32_t st = 0;
     if (view == ACT_VIEW_MB1 || view == ACT_VIEW_HUNT_ANY) st |= ST_OUT;
@@ -1128,24 +1259,35 @@ static uint32_t state_of(int view, uint32_t ew, bool bar) {
     if (bar) st |= ST_BAR;
     st |= (ew & ACT_STICK_L_DIRS) ? ST_MOVING : ST_STILL;
     if (view == ACT_VIEW_SHEATHED) st |= (ew & ACT_STICK_L_DIRS) ? ST_AWAY_MOVING : ST_AWAY_STILL;  // (not when the state is a guess)
+    // (weapon away only: with it out the hunter cannot confirm anything, and whatever the player bound to that input
+    // keeps working there)
+    if ((st & ST_AWAY) && target_is_confirm()) st |= ST_CONFIRM;
     return st;
 }
 // The bits of action i that count in this state (see scopes[]); where Crouch is split from Dodge the weapon-away
 // state also tells them apart by the stick, and Interact wins an input it has with Crouch
 static uint32_t scoped_bits(int i, uint32_t bits, uint32_t st, uint64_t active) {
+    // A confirm target, and the confirm key is the one held: that press is the confirm, not the roll, even where the
+    // two are on one input (the roll and the crouch step aside). With OpenTalk on an input of its own this never
+    // happens, and the roll stays as it was.
+    if ((st & ST_CONFIRM) && (active >> ACT_OPEN_TALK & 1) && (i == ACT_DODGE || i == ACT_CROUCH)) return 0;
     ActScope s = scopes[i];
-    uint32_t forbid = s.forbid;
+    uint32_t forbid = s.forbid, req = s.req;
+    // (at an open/talk target the interact key gives the press up to OpenTalk, unless the profile wants both keys there)
+    if (i == ACT_INTERACT && !atomic_load(&open_talk_union_on)) forbid |= ST_CONFIRM;
     if (act_crouch_split()) {
         if (i == ACT_DODGE) forbid |= ST_AWAY_STILL;
         if (i == ACT_CROUCH) {
             forbid |= ST_AWAY_MOVING;
-            // (only when Crouch has a binding of its own: then with the stick pushed it never fires, weapon out or
-            // away, and Dodge is the roll. Crouch following Dodge's input is not touched: that would stop the roll)
-            if (atomic_load(&crouch_own_on)) forbid |= ST_MOVING;
+            // (only when Crouch has a binding of its own: then with the stick pushed it never fires, and Dodge is the
+            // roll; nor with the weapon out, where the hunter can't crouch and B is a dodge - Crouch's input would be a
+            // second Dodge there, so it may share one with AttackA. Crouch following Dodge's input is not touched: that
+            // would stop the roll)
+            if (atomic_load(&crouch_own_on)) forbid |= ST_MOVING, req |= ST_AWAY;
             if ((st & ST_AWAY_STILL) && (active >> ACT_INTERACT & 1) && atomic_load(&crouch_clash)) forbid |= ST_AWAY_STILL;
         }
     }
-    bool ok = (st & s.req) == s.req && !(st & forbid);
+    bool ok = (st & req) == req && !(st & forbid);
     return ok ? bits : bits & ~(s.bits ? s.bits : bits);
 }
 

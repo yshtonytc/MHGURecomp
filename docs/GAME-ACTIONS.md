@@ -153,6 +153,71 @@ This replaced the "Interact first" delay for Dodge: it was tried first for `Shar
 went through, and at a chest 1 update was not enough (the hunter crouched). The gate (`act_gate`, `SharedInteractFrames`) is
 kept only for Interact sharing an input with other hunt actions that have no state to tell them apart (`AttackX` ...).
 
+## The open/talk key (`OpenTalk`, `ConfirmTargets`)
+
+One button of the game is many things: with the weapon away A gathers, carves, opens a box, talks, lies in a bed and
+starts a climb. The layer had one `Interact` action for all of them, so a player who wants A to be the roll (as in the
+later games) cannot also have A open a box: A and B together are the game's roll.
+
+Everything here is in terms of the layer's *actions*, not of the pad's letters: which action a button has is the
+player's binding (`[Actions.Pad]`), and a profile that puts Dodge on the bottom button and AttackA on the right one is
+as much a case as the game's own.
+
+What the hunter stands by is readable: `player+0x32B4` (u32) is the category of the interactable in range, 0 when there
+is none. Found by diffing player memory snapshots (`MHGU_PLSNAP`) taken by a supply box, beds, an NPC and gather points:
+every gather point gives 1, the supply boxes 5 and 9, a bed 8, an NPC 13, the carrier 17, and nothing in range 0. Different objects of
+one kind give the same value, so it is a category, not an object id.
+
+`[Actions] ConfirmTargets` lists the categories that are "open / talk"; the ones measured so far are the default, so
+an ini only needs the line to change them (an empty value turns `OpenTalk` off). They split the one A button in two: at
+such a target (with the weapon away) `OpenTalk` presses A and `Interact` is silent; anywhere else `Interact` presses A
+(gather, carve, climb, the wall jump) and `OpenTalk` is silent. A category that is not listed keeps the interact key -
+the list is a set of exceptions, not a complete map of the game's interactables.
+
+The split is on only while `OpenTalk` has a binding of its own (for either device, base or a weapon class). Without
+one there is no open/talk target anywhere: `Interact` presses A at a box as it always did, and `OpenTalk` never does.
+So an ini from before `OpenTalk` existed that moved `Interact` to another input keeps opening, talking and sleeping
+with it, and an ini with no bindings at all is the game's own. (Merged first without this, PR #417: such an ini lost
+the box, the bed and the NPCs, since its `Interact` gave the press up to an `OpenTalk` it had never bound.)
+
+`OpenTalkAlsoInteract=1` is the other way round: at an open/talk target both keys press A, so a player can keep one
+interact key working everywhere and only *add* a key for the roll. Off by default: then the two keys are two halves of
+one button, which is what makes "A confirms, B gathers" possible.
+
+`TargetLog=1` is how `ConfirmTargets` is filled in: one line each time the category of the interactable in range changes,
+and nothing else (it does not need `Log=1`, which writes a line every frame).
+
+```
+[target] category 5
+```
+
+Walk up to each kind of interactable once and the log has its number; the ones that should open or talk go into
+`ConfirmTargets`.
+
+Both are in the settings screen too (Controls > Game actions, Show: a hunt): *Open / talk targets* (the list, typed on
+the keyboard) and *Target log* (the log line). Saving applies them at once, without a restart.
+
+`OpenTalk` on an input of its own shares that input with the roll: at an open/talk target `Dodge` and `Crouch` step
+aside *when `OpenTalk` is held as well* (the two on one input, the target deciding what the press is), and elsewhere the
+roll keeps it. On a separate input the roll is untouched everywhere.
+
+An empty `ConfirmTargets=` (the default is 5,8,9,13,17) changes nothing at all: no category is an open/talk one,
+`OpenTalk` never delivers a bit, and `Interact` keeps every input it had.
+
+```ini
+[Actions]
+; ConfirmTargets: only needed to change the default 5,8,9,13,17 (empty: OpenTalk off)
+; OpenTalkAlsoInteract=1: the interact key presses A at an open/talk target too
+; TargetLog=1: log the interactable's category as it changes, for filling ConfirmTargets in
+[Actions.Pad]
+OpenTalk = pad:south   ; A: the box, the bed, the NPC
+Dodge    = pad:south   ; A: the roll and the crouch everywhere else
+Interact = pad:north   ; B: gather, carve, climb, the wall jump
+```
+
+A climbable wall has no category (0), so A there is the roll and `Interact` climbs. The wall's own buttons (B: the slide
+and the fast climb; A: the wall jump) are the game's and are not touched.
+
 ## Consumer map (hunt and town; what is separable now)
 
 Bits are the engine / hunter-copy ones (INPUTS-MASTER B.1). "Separable now": the layer has an action or state for it. "Gate
@@ -204,6 +269,7 @@ low; (6) mash / struggle and the raw-word readers, not worth it.
 Enable=1                  ; 1 is the default (no section at all too); 0: nothing hooked, bit-for-bit the game's own input
 ManageMenus=1             ; the menu view too
 SheathedAttackA=0         ; 1: AttackA presses A with the weapon away too (only matters once Interact is bound)
+ConfirmTargets=5,8,9,13,17 ; OpenTalk's targets (the interactable's category, see above), only with OpenTalk bound; empty: off
 Pointer=0                 ; feed the engine's (dormant) pointer block: experiment, see P1 below
 Log=0                     ; one line per frame (env MHGU_ACTION_LOG=1); env MHGU_ACTIONS=0|1 overrides Enable
 
@@ -561,7 +627,8 @@ game's own glyphs back at its next button press.
 * **The pictures.** `extras/prompts/mouse_icons.png` (a 4 x 2 grid; used: left, right, middle, wheel up, wheel down)
   and `keycap.png`, made into 24 x 24 cells by `tools/prompt_icons.py` (cut to their ink, area-averaged; the mouse to
   22 px) as `runtime/hle/prompt_icons.h`. A key's name is drawn on the cap in the game's festa font (its first glyph
-  page, RGBA8, from `resident.arc`), near black, scaled into the cap's face: one letter or digit, F1..F12, N0..N9 for
+  page, from `resident.arc`: the game's RGBA8 with 24 px letters, or an HD font mod's BC3 with 48 px letters, as the
+  Korean patch's, area-averaged to 24 px), near black, scaled into the cap's face: one letter or digit, F1..F12, N0..N9 for
   the keypad, arrows as arrows, SPC ENT TAB BS ESC SHF CTL ALT CAP DEL INS HOM END PGU PGD, else the SDL name's first 3
   letters; M4 / M5 for the side buttons. Two D-pad directions on one glyph (KEY_UD, KEY_RL) take both keys' symbols,
   stacked when that draws them bigger (the left / right arrows).
@@ -572,6 +639,21 @@ game's own glyphs back at its next button press.
   click, R3 ALT; the pause menu's Signal SPC, Zoom In Map R; the context hunt / menus / hunt as the menu opens and closes.
   Not checked by eye: the quest details' L / R (HD_window), the Hunting Horn's notes, other languages (the files are
   compared, so a mod's own pictures are left alone).
+* **The chat key's prompt** (2026-11-21, issue #399; `runtime/hle/chat.c`). In an online Hub or Pub the bottom right
+  guide gets "<chat key> Chat", and the game's ZR "Chat" there (Shoutouts, the chat log, its Keyboard) becomes "Chat
+  Log": buttonName 142 and 95, the game's own words in each language. The town sets that prompt as guide slot 2's own
+  {icon 0x81, label 0x8e} (+0x248, 8 bytes a slot, through `0x844d08`, hooked to give label 95); the chat key's is an
+  extra (+0x228) put in as the guide is drawn (`0x8439ec`, hooked: the town sets the guide's state again as it goes,
+  and an extra added between two drawings never showed), with a buttonName icon index past the table's end (the game
+  gives "") and the label `<ICON CHATKEY>` + buttonName 142. Icon names go through one object's lookup
+  (`*0x232668c`, vtable +0x48: (this, name, fontIcon table) -> button font code; the text tag parser at `0xc425d4`
+  calls it for ICON); its hook gives CHATKEY the button font's glyph `o` (72, 216), which fontIcon names none of, so no
+  text of the game draws it (its picture is a Palico icon). `prompts.c` draws the chat key's cap there while the prompt
+  shows, with the controller too, named on the player's keyboard layout ("/" is "-" on a Spanish keyboard). Tested in
+  the Pub with the session check forced: T / ZR Chat Log, BS Help, "/" Chat with the keyboard and with a virtual
+  controller; gone while a line is typed and in the Shoutouts menu, back after; the village has Chat Log alone. Not
+  tested: a real online session, another game language (`MHGU_LANGUAGE` crashes on the way from the title screen,
+  with or without this), another keyboard layout.
 
 ## Mouse camera (2026-11-11)
 
@@ -618,6 +700,7 @@ New `[Mouse]` settings (settings menu: Controls tab, Spanish strings; live, no r
 | `MouseInvertY` | Off | up / down turned round, on top of the game's own invert options |
 | `MouseSmoothing` | 0.0 | 0 .. 0.9: each update takes (1 - s) of the counts waiting, the rest trails (hunt camera only; the same total turn: measured 101 + 164 + 196 ... decaying 5, 3, 1 against 240 a step unsmoothed) |
 | `MouseCapture` | Click | Click: a click in the window captures the mouse. Hunt: also captured by itself while the hunt camera is the mouse's (its handler ran in the last 200 ms), free again in menus, cutscenes and villages; Esc or losing focus stops it until a click or the hunt is over |
+| `MenuMouse` | On | Off: the menu pointer (hle/menuptr.c) never takes the mouse (no pointer by itself, no hover / click selection, the mouse stays captured in menus) and the keyboard and mouse defaults of `act_default_binding` (left click confirm / talk, right click back, Space X) are dropped: the `[Keybinds]` everywhere, as before 0.17 |
 
 Measured with `MouseSensitivityY=2 MouseInvertY=On MouseSmoothing=0.6`: the pitch per update went from +125 to -240 (twice,
 reversed), the yaw ramped up and trailed off. The mouse buttons bound to actions (`[Actions.Kbm]`) work while captured

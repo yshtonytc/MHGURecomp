@@ -25,15 +25,18 @@
 #include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "../../updater/updater.h"  // (sha256)
@@ -42,6 +45,7 @@
 #include "../kernel.h"
 #include "../overlay.h"
 #include "../settings_locale.h"
+#include "discord.h"  // (presence_hunter_name)
 #include "net.h"
 #include "room.h"
 #include "ryuldn.h"
@@ -108,8 +112,14 @@ enum { DR_NONE, DR_BY_USER, DR_BY_SYSTEM, DR_DESTROYED_BY_USER, DR_DESTROYED_BY_
 #define R_TOO_MANY_PLAYERS LDN_RESULT(144)
 
 // ---- link protocol
+// Version 4 plays with 3: the link frames are the same (4 adds only what the hub server does: session codes, join by
+// code, friends), so a host takes a hello of either, a LAN probe of either is answered in its own version, and a
+// station says to each host the version that host speaks (from the hub server's list; 3 for a host found on the LAN
+// or by address, which every host of 3 or 4 takes). The hub server lists 3 and 4 together.
 #define PROTO_MAGIC "MHGL"
-#define PROTO_VERSION 3
+#define PROTO_VERSION 4
+#define PROTO_MIN 3
+static bool link_version_ok(uint16_t v) { return v >= PROTO_MIN && v <= PROTO_VERSION; }
 enum { F_HELLO = 1, F_INFO, F_WELCOME, F_REFUSE, F_PACKET, F_DESTROY, F_AUX };  // F_AUX: the port's own messages (emsync.c, hle/hpscale.c)
 typedef struct {
     char magic[4];
@@ -160,8 +170,16 @@ typedef struct { char magic[4]; uint32_t token; uint8_t kind, flags, pad[2]; } U
 #define LOBBY_PROTO 1
 #define LOBBY_PORT 39510
 #define LOBBY_HEADER 24
-enum { S_LIST = 1, S_HOST, S_ATTACH, S_JOIN, S_UPDATE, S_PING, S_HUBS = 16, S_HOSTED, S_INCOMING, S_SPLICED, S_ERROR };
-enum { SE_NOT_FOUND = 1, SE_NO_ANSWER, SE_BUSY, SE_VERSION };
+enum { S_LIST = 1, S_HOST, S_ATTACH, S_JOIN, S_UPDATE, S_PING, S_FIND, S_PRESENCE, S_HUBS = 16, S_HOSTED, S_INCOMING,
+       S_SPLICED, S_ERROR, S_HUBS4, S_FRIENDS };
+enum { SE_NOT_FOUND = 1, SE_NO_ANSWER, SE_BUSY, SE_VERSION, SE_BAD_REQUEST, SE_CODE_TAKEN };
+// Session codes (link version 4): 8 characters of Crockford's base 32 that a host picks for its network and sends
+// with its HOST; the hub server finds the hub by it (FIND) and lets a player join with it from any room. Friend codes:
+// the first 10 bytes of SHA-256("MHGURecomp friend:" + this install's secret), shown as 16 of the same characters.
+#define CODE_LEN 8
+#define CODE_ALPHABET "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+#define FRIEND_LEN 10
+#define FRIEND_SECRET 32
 #define LOBBY_PING_NS 15000000000ull
 #define RELAY_MAGIC "MHGR"
 #define RELAY_PREFIX 16  // magic, u32 pair, u64 secret
@@ -223,6 +241,9 @@ static struct {
     pthread_t lobby_th;
     volatile bool lobby_run, lobby_dirty;  // dirty: the NetworkInfo changed, send it
     struct sockaddr_in lobby_addr;
+    char code[CODE_LEN + 1];         // host: the network's session code (made with it; "" without a network)
+    volatile bool code_listed;       // the hub server took it (an older server lists the hub without one)
+    char joined_code[CODE_LEN + 1];  // station: the session code of the hub joined through the hub server ("": none known)
 } L = {.mu = PTHREAD_MUTEX_INITIALIZER, .listen_s = BADSOCK, .disc_s = BADSOCK, .us = BADSOCK,
        .nodes = {[0 ... MAX_NODES - 1] = {.wmu = PTHREAD_MUTEX_INITIALIZER}}, .up = {.wmu = PTHREAD_MUTEX_INITIALIZER}};
 
@@ -233,8 +254,10 @@ static void link_reset(Link *l) {  // every field back to zero for a new network
 }
 
 // Scan results: where each found network's host is (hub: on the hub server at addr, 0: the host's own address).
+// ver: the link version to say to its host; code: its session code (hub server, version 4), "" when not known.
 #define MAX_FOUND 32
-static struct { uint8_t bssid[6], session[16]; struct sockaddr_in addr; uint64_t hub; int ryu, room; uint8_t info[NETINFO_SIZE]; } found[MAX_FOUND];  // ryu: the Ryujinx server's index + 1
+static struct { uint8_t bssid[6], session[16]; struct sockaddr_in addr; uint64_t hub; int ryu, room; uint16_t ver;
+                char code[CODE_LEN + 1]; uint8_t info[NETINFO_SIZE]; } found[MAX_FOUND];  // ryu: the Ryujinx server's index + 1
 static int nfound;
 
 static void signal_change(void) {
@@ -322,10 +345,39 @@ static bool spawn(void *(*fn)(void *), void *arg) {
 }
 
 // ---- frames
+// Why this thread's last send_all / recv_all / frame_recv failed, for the log: "no answer" alone can't tell a server
+// that hung up at once (its per-address connection cap, or something between that resets the connection) from a reply
+// that never came (packets lost).
+static __thread char io_fail[64];
+static __thread bool io_hung_up;  // ...and it was the other end closing the connection
+static void io_failed(bool sending, int k) {
+    io_hung_up = k == 0;
+    if (k == 0) {
+        snprintf(io_fail, sizeof io_fail, "the other end hung up");
+        return;
+    }
+#ifdef _WIN32
+    int e = WSAGetLastError();
+    bool timeout = e == WSAETIMEDOUT, reset = e == WSAECONNRESET || e == WSAECONNABORTED;
+#else
+    int e = errno;
+    bool timeout = e == EAGAIN || e == EWOULDBLOCK, reset = e == ECONNRESET || e == EPIPE;
+#endif
+    snprintf(io_fail, sizeof io_fail, "%s%s (error %d)", sending ? "sending: " : "",
+             timeout ? "nothing came in time" : reset ? "connection reset" : "socket error", e);
+}
+// What a request's failed answer was (n, type: frame_recv's), with the time it took
+static const char *reply_why(int n, uint8_t type, uint64_t asked_ns) {
+    static __thread char why[112];
+    int ms = (int)((plat_now_ns() - asked_ns) / 1000000);
+    if (n < 0) snprintf(why, sizeof why, "%s, after %d ms", io_fail[0] ? io_fail : "failed", ms);
+    else snprintf(why, sizeof why, "an unexpected reply (type %u, %d bytes), after %d ms", type, n, ms);
+    return why;
+}
 static bool send_all(hsock s, const void *b, size_t n) {
     for (const char *p = b; n;) {
         int k = send(s, p, (int)n, 0);
-        if (k <= 0) return false;
+        if (k <= 0) return io_failed(true, k), false;
         p += k, n -= (size_t)k;
     }
     return true;
@@ -333,7 +385,7 @@ static bool send_all(hsock s, const void *b, size_t n) {
 static bool recv_all(hsock s, void *b, size_t n) {
     for (char *p = b; n;) {
         int k = recv(s, p, (int)n, 0);
-        if (k <= 0) return false;
+        if (k <= 0) return io_failed(false, k), false;
         p += k, n -= (size_t)k;
     }
     return true;
@@ -354,7 +406,13 @@ static bool link_send(Link *l, uint8_t type, const void *a, uint32_t alen, const
 // -1: closed / error; else the payload size (buf holds MAX_FRAME bytes)
 static int frame_recv(hsock s, uint8_t *type, uint8_t *buf) {
     uint32_t size;
-    if (!recv_all(s, &size, 4) || size < 1 || size > MAX_FRAME + 1 || !recv_all(s, type, 1)) return -1;
+    if (!recv_all(s, &size, 4)) return -1;
+    if (size < 1 || size > MAX_FRAME + 1) {
+        io_hung_up = false;
+        snprintf(io_fail, sizeof io_fail, "a bad frame (size %u)", size);
+        return -1;
+    }
+    if (!recv_all(s, type, 1)) return -1;
     return recv_all(s, buf, size - 1) ? (int)size - 1 : -1;
 }
 static void link_close(Link *l) {  // (caller: not holding L.mu if l has a thread to join)
@@ -605,10 +663,26 @@ static void pkt_report(const char *who) {
         who, t[0], r[0], t[1], r[1], t[2], r[2]);
 }
 
-static Hello make_hello(bool scan_only, const uint8_t *user_name) {
+// Game packet gaps, for the log: Pia's connection check ends a session after a few seconds without packets, with
+// nothing from this layer, and the game says "Connection lost". These say which way the packets stopped: the game
+// sending none (its loop stalled: a long load, a hitch) or none arriving. rx by node (a station: [0] = the host).
+#define GAP_LOG_NS 2000000000ull
+static uint64_t gap_tx, gap_rx[MAX_NODES];
+static void gap_note(uint64_t *last, const char *what, int node) {
+    uint64_t now = plat_now_ns(), prev = __atomic_exchange_n(last, now, __ATOMIC_RELAXED);
+    if (!prev || now - prev < GAP_LOG_NS) return;
+    if (node < 0) LOG("[ldn] the game sent no packets for %.1f s\n", (double)(now - prev) / 1e9);
+    else LOG("[ldn] %s%.0d: no packets for %.1f s\n", what, node, (double)(now - prev) / 1e9);
+}
+static double gap_since(const uint64_t *last) {
+    uint64_t t = __atomic_load_n(last, __ATOMIC_RELAXED);
+    return t ? (double)(plat_now_ns() - t) / 1e9 : -1;
+}
+
+static Hello make_hello(bool scan_only, const uint8_t *user_name, uint16_t version) {  // version: the host's (see PROTO_MIN)
     Hello h = {0};
     memcpy(h.magic, PROTO_MAGIC, 4);
-    h.version = PROTO_VERSION;
+    h.version = version;
     h.scan_only = scan_only;
     h.lcv = L.lcv;
     memcpy(h.mac, L.mac, 6);
@@ -620,6 +694,15 @@ static Hello make_hello(bool scan_only, const uint8_t *user_name) {
 uint32_t ldn_own_ip(void) { return L.own_ip; }
 uint32_t ldn_broadcast_ip(void) { return L.subnet ? L.subnet | (L.ryu ? ~L.ryu_mask : 0xFFu) : 0xFFFFFFFFu; }
 bool ldn_net_up(void) { return L.state == ST_AP_CREATED || L.state == ST_STATION_CONNECTED; }
+// No network, and none for a while: Hunter Search closes its network for each scan (~10 s apart) and opens it again, so
+// a moment between the two is not offline
+static uint64_t g_net_left_ns;  // when the game last closed a network or a search (to_initialized)
+#define OFFLINE_AFTER_NS 15000000000ull
+bool ldn_offline(void) {
+    int s = __atomic_load_n(&L.state, __ATOMIC_ACQUIRE);
+    uint64_t left = __atomic_load_n(&g_net_left_ns, __ATOMIC_ACQUIRE);
+    return (s == ST_NONE || s == ST_INITIALIZED) && (!left || plat_now_ns() - left >= OFFLINE_AFTER_NS);
+}
 bool ldn_hosting(void) { return L.state == ST_AP_CREATED; }
 bool ldn_crossplay(void) { return (L.ryu || L.room) && ldn_net_up(); }  // a lobby on a Ryujinx LDN server: the port-only extras are off
 bool ldn_party(int *n, int *max, char *id, size_t size) {
@@ -679,11 +762,12 @@ static void ryu_xmit(const VPacket *p, const void *data, uint32_t len) {
 
 void ldn_send(const VPacket *p, const void *data, uint32_t len) {
     if (L.ryu || L.room) { if (ldn_net_up()) ryu_xmit(p, data, len); return; }
-    if (L.state == ST_AP_CREATED) { host_route(0, p, data, len); return; }
+    if (L.state == ST_AP_CREATED) { gap_note(&gap_tx, NULL, -1); host_route(0, p, data, len); return; }
     if (L.state != ST_STATION_CONNECTED) return;
     bool all = p->dst_ip == ldn_broadcast_ip() || p->dst_ip == 0xFFFFFFFFu;
     if (all || p->dst_ip == L.own_ip) vsock_deliver(p, data, len);  // (a broadcast reaches the sender too)
     if (p->dst_ip == L.own_ip) return;
+    gap_note(&gap_tx, NULL, -1);
     hsock us = L.us;
     if (us != BADSOCK && direct_usable(&L.up) && udp_send(us, &L.up.paddr, &L.up, false, U_DATA, 0, p, data, len)) {
         pkt_count(pkt_tx, PATH_DIRECT);
@@ -754,6 +838,7 @@ static void link_received(int from, const VPacket *p, const void *data, uint32_t
             LOG("[ldn] MHGU_LDN_LOSS: dropping %d%% of the received packets\n", loss_pct);
         }
     }
+    if (from >= 0 && from < MAX_NODES) gap_note(&gap_rx[from], from ? "node " : "the host", from);
     if (loss_pct && (int)(arc4random() % 100) < loss_pct) return;
     if (lag_ms <= 0) {
         if (from > 0) host_route(from, p, data, len);
@@ -791,7 +876,7 @@ static void *station_thread(void *arg) {
     Hello h;
     if (n < (int)sizeof h || type != F_HELLO) { hclose(acc.s); return NULL; }
     memcpy(&h, buf, sizeof h);
-    if (memcmp(h.magic, PROTO_MAGIC, 4) || h.version != PROTO_VERSION) {
+    if (memcmp(h.magic, PROTO_MAGIC, 4) || !link_version_ok(h.version)) {
         uint32_t r = R_CONNECT_REJECTED;
         frame_send(acc.s, F_REFUSE, &r, 4, NULL, 0);
         hclose(acc.s);
@@ -863,6 +948,8 @@ static void *station_thread(void *arg) {
             emsync_aux_received(buf, (uint32_t)n);
             hpscale_aux_received(buf, (uint32_t)n);
             hitsync_aux_received(buf, (uint32_t)n);
+            partsync_aux_received(buf, (uint32_t)n);
+            friends_aux_received(buf, (uint32_t)n);
             for (int i = 1; i < MAX_NODES; i++)
                 if (i != slot && L.nodes[i].alive) link_send(&L.nodes[i], F_AUX, buf, (uint32_t)n, NULL, 0);
         }
@@ -878,7 +965,8 @@ static void *station_thread(void *arg) {
     }
     l->has_thread = false;
     pthread_mutex_unlock(&L.mu);
-    LOG("[ldn] node %d (%s) left\n", slot, ipstr(l->ip));
+    LOG("[ldn] node %d (%s) left (its last game packet %.1f s ago)\n", slot, ipstr(l->ip), gap_since(&gap_rx[slot]));
+    __atomic_store_n(&gap_rx[slot], 0, __ATOMIC_RELAXED);
     vsock_peer_gone(l->ip);
     signal_change();
     return NULL;
@@ -1002,10 +1090,10 @@ static void *host_thread(void *arg) {
                 }
                 continue;
             }
-            if (n >= 6 && !memcmp(probe, PROTO_MAGIC, 4) && rd16(probe + 4) == PROTO_VERSION) {
+            if (n >= 6 && !memcmp(probe, PROTO_MAGIC, 4) && link_version_ok(rd16(probe + 4))) {
                 uint8_t reply[8 + NETINFO_SIZE];
                 memcpy(reply, PROTO_MAGIC, 4);
-                wr16(reply + 4, PROTO_VERSION);
+                wr16(reply + 4, rd16(probe + 4));  // (in the asker's version: a game of 3 drops any other)
                 wr16(reply + 6, (uint16_t)L.port);
                 pthread_mutex_lock(&L.mu);
                 memcpy(reply + 8, L.info, NETINFO_SIZE);
@@ -1135,6 +1223,8 @@ static void hub_report(int what, const char *srv, int state, int ms, int hubs) {
     overlay_notice(line, settings_text(lang, text));
 }
 
+static void friends_poke(void);  // (friends: what we do changed, tell them soon)
+
 // Host: one thread per created network keeps it listed and opens a connection for each player the server announces.
 // Threads of a network that is gone (lobby_gen moved on) end by themselves; nobody waits for them.
 static volatile uint32_t lobby_gen;
@@ -1168,10 +1258,18 @@ static void *lobby_attach_thread(void *arg) {
     return station_thread(a);
 }
 
+// A new session code (CODE_ALPHABET has 32 characters: arc4random % 32 is even)
+static void code_new(char *out) {
+    for (int i = 0; i < CODE_LEN; i++) out[i] = CODE_ALPHABET[arc4random() % 32];
+    out[CODE_LEN] = 0;
+}
+
 static void *lobby_thread(void *arg) {
     uint32_t gen = (uint32_t)(uintptr_t)arg;
     static __thread uint8_t buf[MAX_FRAME];
-    uint8_t req[LOBBY_HEADER + NETINFO_SIZE], type;
+    uint8_t req[LOBBY_HEADER + NETINFO_SIZE + CODE_LEN], type = 0;
+    bool with_code = true;  // false: the server is older than version 4 (it took the HOST only without a code)
+    int taken = 0;          // codes refused as taken in a row (a new one is tried at once, 3 times)
     while (lobby_gen == gen) {
         char srv[LOBBY_NAME];
         struct sockaddr_in addr;
@@ -1180,32 +1278,60 @@ static void *lobby_thread(void *arg) {
         bool named = resolve_host(srv, LOBBY_PORT, &addr);
         if (named) s = connect_to(&addr, 3000);
         if (s == BADSOCK) {
-            LOG("[ldn] hub server %s %s: this hub is not listed online (trying again in 30 s)\n", srv,
-                named ? "unreachable" : "not found");
+            LOG("[ldn] hub server %s %s%s: this hub is not listed online (trying again in 30 s)\n", srv,
+                named ? "unreachable at " : "not found", named ? inet_ntoa(addr.sin_addr) : "");
             if (lobby_gen == gen) hub_report(NOTE_HOST, srv, named ? HUB_UNREACHABLE : HUB_NOT_FOUND, -1, -1);
             if (!lobby_wait(gen, 30000)) break;
             continue;
         }
         bool keyed = lobby_header(req, NULL);
         pthread_mutex_lock(&L.mu);
+        // (the network may have closed while we connected - Hunter Search closes one every ~10 s: lobby_host_stop
+        // moves lobby_gen on before it clears the code under L.mu, so this sees one or the other. A listing of a closed
+        // network, or one without its code, is never sent: the server takes a protocol 4 listing without a code for a
+        // game that only claims 4.)
+        if (lobby_gen != gen || (with_code && !L.code[0])) {
+            pthread_mutex_unlock(&L.mu);
+            hclose(s);
+            break;
+        }
         memcpy(req + LOBBY_HEADER, L.info, NETINFO_SIZE);
+        memcpy(req + LOBBY_HEADER + NETINFO_SIZE, L.code, CODE_LEN);
+        bool coded = with_code && L.code[0];
         L.lobby_dirty = false;
         pthread_mutex_unlock(&L.mu);
         hset_timeout(s, 5000);
         int n = -1;
         uint64_t asked = plat_now_ns();
-        if (frame_send(s, S_HOST, req, sizeof req, NULL, 0)) n = frame_recv(s, &type, buf);
+        if (frame_send(s, S_HOST, req, coded ? sizeof req : sizeof req - CODE_LEN, NULL, 0)) n = frame_recv(s, &type, buf);
         if (n < 8 || type != S_HOSTED) {
             bool error = n >= 4 && type == S_ERROR;
-            LOG("[ldn] hub server %s: can't list this hub (%s); trying again in 30 s\n", srv,
-                error ? lobby_error(rd32(buf)) : "no answer");
+            uint32_t code = error ? rd32(buf) : 0;
             hclose(s);
+            if (coded && code == SE_CODE_TAKEN) {  // another hub holds it: a new one (at once the first 3 times)
+                pthread_mutex_lock(&L.mu);
+                if (lobby_gen == gen) code_new(L.code);
+                pthread_mutex_unlock(&L.mu);
+                LOG("[ldn] hub server %s: that session code is taken, trying a new one\n", srv);
+                if (++taken <= 3) continue;
+            }
+            if (coded && code == SE_BAD_REQUEST) {  // a server older than version 4: listed without a code
+                with_code = false;
+                LOG("[ldn] hub server %s is older than this game: the hub is listed without a session code\n", srv);
+                continue;
+            }
+            LOG("[ldn] hub server %s (%s): can't list this hub (%s%s); trying again in 30 s\n", srv,
+                inet_ntoa(addr.sin_addr), error ? lobby_error(code) : "no answer: ", error ? "" : reply_why(n, type, asked));
             if (lobby_gen == gen) hub_report(NOTE_HOST, srv, error ? lobby_state(rd32(buf)) : HUB_NO_ANSWER, -1, -1);
             if (!lobby_wait(gen, 30000)) break;
             continue;
         }
-        LOG("[ldn] hub listed on the hub server %s: %s\n", srv,
-            keyed ? "players with the same matchmaking key see it" : "public, every player sees it");
+        LOG("[ldn] hub listed on the hub server %s: %s%s\n", srv,
+            keyed ? "players with the same matchmaking key see it" : "public, every player sees it",
+            coded ? ", with its session code" : "");
+        L.code_listed = coded;
+        taken = 0;
+        friends_poke();
         hub_report(NOTE_HOST, srv, HUB_ONLINE, (int)((plat_now_ns() - asked) / 1000000), -1);
         uint64_t now = plat_now_ns(), last_rx = now, next_ping = now + LOBBY_PING_NS;
         while (lobby_gen == gen) {
@@ -1237,6 +1363,7 @@ static void *lobby_thread(void *arg) {
             }
         }
         hclose(s);
+        L.code_listed = false;
         if (lobby_gen != gen) break;
         LOG("[ldn] lost the hub server: this hub is not listed online (trying again in 10 s)\n");
         hub_report(NOTE_HOST, srv, HUB_LOST, -1, -1);
@@ -1253,25 +1380,62 @@ static void lobby_host_start(void) {
     pthread_mutex_unlock(&hub_mu);
     if (lobby_server(srv)) spawn(lobby_thread, (void *)(uintptr_t)gen);
 }
-static void lobby_host_stop(void) { lobby_gen++; }
+static void lobby_host_stop(void) {
+    lobby_gen++;
+    pthread_mutex_lock(&L.mu);
+    L.code[0] = 0, L.code_listed = false;
+    pthread_mutex_unlock(&L.mu);
+    friends_poke();
+}
 
 // Station: the hubs the server lists for a key (NULL: ini Key). A HUB_* state; ms: the request's round trip.
 #define LOBBY_LIST_MAX 24
 typedef struct {
     uint8_t infos[LOBBY_LIST_MAX][NETINFO_SIZE];
     uint64_t ids[LOBBY_LIST_MAX];
+    uint16_t vers[LOBBY_LIST_MAX];             // each hub's link version
+    char codes[LOBBY_LIST_MAX][CODE_LEN + 1];  // and session code ("": none)
     int n, state, ms;
     struct sockaddr_in addr;
     char server[LOBBY_NAME];
+    char why[136];  // HUB_NO_ANSWER: the address asked and what came instead (reply_why)
 } LobbyList;
+
+// A HUBS (u64 id, NetworkInfo each) or HUBS4 (u64 id, u16 link version, code[8], NetworkInfo) answer into r. A server
+// older than version 4 answers HUBS, of hubs of our version only.
+static void lobby_hubs(const uint8_t *buf, int n, uint8_t type, LobbyList *r) {
+    const uint32_t entry = type == S_HUBS4 ? 8 + 2 + CODE_LEN + NETINFO_SIZE : 8 + NETINFO_SIZE;
+    uint32_t count = rd32(buf);
+    r->n = 0;
+    for (uint32_t i = 0; i < count && r->n < LOBBY_LIST_MAX && 4 + (i + 1) * entry <= (uint32_t)n; i++) {
+        const uint8_t *e = buf + 4 + i * entry;
+        // (the server lists the protocols it pools: one older than PROTO_MIN can't be played with; to one newer than
+        // ours we say ours, and its host decides, as ours does for 3)
+        if (type == S_HUBS4 && rd16(e + 8) < PROTO_MIN) continue;
+        r->ids[r->n] = rd64(e);
+        r->vers[r->n] = PROTO_VERSION, r->codes[r->n][0] = 0;
+        if (type == S_HUBS4) {
+            uint16_t v = rd16(e + 8);
+            r->vers[r->n] = v > PROTO_VERSION ? PROTO_VERSION : v;
+            char raw[CODE_LEN + 1];
+            memcpy(raw, e + 10, CODE_LEN), raw[CODE_LEN] = 0;  // (zeros: no code; anything else not a code: none)
+            if (!raw[0] || strlen(raw) != CODE_LEN || !ldn_code_normalize(raw, r->codes[r->n])) r->codes[r->n][0] = 0;
+            e += 2 + CODE_LEN;
+        }
+        memcpy(r->infos[r->n++], e + 8, NETINFO_SIZE);
+    }
+}
 
 static int lobby_list(const char *srv, const char *key, int connect_ms, LobbyList *r) {
     static __thread uint8_t buf[MAX_FRAME];
-    r->n = 0, r->ms = -1;
+    r->n = 0, r->ms = -1, r->why[0] = 0;
     if (!resolve_host(srv, LOBBY_PORT, &r->addr)) return HUB_NOT_FOUND;
     hsock s = connect_to(&r->addr, connect_ms);
-    if (s == BADSOCK) return HUB_UNREACHABLE;
-    uint8_t req[LOBBY_HEADER], type;
+    if (s == BADSOCK) {
+        snprintf(r->why, sizeof r->why, "at %s", inet_ntoa(r->addr.sin_addr));
+        return HUB_UNREACHABLE;
+    }
+    uint8_t req[LOBBY_HEADER], type = 0;
     lobby_header(req, key);
     hset_timeout(s, 2000);
     uint64_t asked = plat_now_ns();
@@ -1279,13 +1443,11 @@ static int lobby_list(const char *srv, const char *key, int connect_ms, LobbyLis
     r->ms = (int)((plat_now_ns() - asked) / 1000000);
     hclose(s);
     if (n >= 4 && type == S_ERROR) return lobby_state(rd32(buf));
-    if (n < 4 || type != S_HUBS) return HUB_NO_ANSWER;
-    uint32_t count = rd32(buf);
-    for (uint32_t i = 0; i < count && r->n < LOBBY_LIST_MAX && 4 + (i + 1) * (8 + NETINFO_SIZE) <= (uint32_t)n; i++) {
-        const uint8_t *e = buf + 4 + i * (8 + NETINFO_SIZE);
-        r->ids[r->n] = rd64(e);
-        memcpy(r->infos[r->n++], e + 8, NETINFO_SIZE);
+    if (n < 4 || (type != S_HUBS && type != S_HUBS4)) {
+        snprintf(r->why, sizeof r->why, "at %s, %s", inet_ntoa(r->addr.sin_addr), reply_why(n, type, asked));
+        return HUB_NO_ANSWER;
     }
+    lobby_hubs(buf, n, type, r);
     return HUB_ONLINE;
 }
 
@@ -1320,8 +1482,9 @@ static void *lobby_list_thread(void *arg) {
     static int last = HUB_ONLINE;
     r->state = lobby_list(r->server, NULL, 1500, r);
     if (r->state != last && r->state != HUB_ONLINE)
-        LOG("[ldn] hub server %s: %s: only LAN / Join hubs are searched\n", r->server,
-            r->state == HUB_NOT_FOUND ? "not found" : r->state == HUB_UNREACHABLE ? "unreachable" : "no list");
+        LOG("[ldn] hub server %s: %s%s%s: only LAN / Join hubs are searched\n", r->server,
+            r->state == HUB_NOT_FOUND ? "not found" : r->state == HUB_UNREACHABLE ? "unreachable" : "no list",
+            r->why[0] ? ": " : "", r->why);
     last = r->state;
     hub_report(NOTE_SEARCH, r->server, r->state, r->ms, r->state == HUB_ONLINE ? r->n : -1);
     pthread_mutex_lock(&s->mu);
@@ -1387,7 +1550,8 @@ static void *hub_check_thread(void *arg) {
     pthread_mutex_lock(&hub_mu);
     if (hub_now.check == c->check) hub_set_locked(c->server, c->key, state, ms, hubs);
     pthread_mutex_unlock(&hub_mu);
-    LOG("[ldn] hub server check: %s: state %d, %d ms, %d hub(s) for this key\n", c->server, state, ms, hubs);
+    LOG("[ldn] hub server check: %s: state %d, %d ms, %d hub(s) for this key%s%s\n", c->server, state, ms, hubs,
+        r && r->why[0] ? ": " : "", r ? r->why : "");
     free(r);
     free(c);
     return NULL;
@@ -1425,7 +1589,9 @@ int ldn_hub_status(const char *server, const char *key, int *ms, int *hubs) {
 }
 
 // Joining a listed hub: the server asks its host to connect and splices the two. 0, else an nn::ldn result.
-static uint32_t lobby_join(const struct sockaddr_in *addr, uint64_t hub, hsock *out, uint32_t *pair, uint64_t *secret) {
+// code: the hub's session code when known (a found hub's, an invite's): with it the server lets us join from any room.
+static uint32_t lobby_join(const struct sockaddr_in *addr, uint64_t hub, const char *hub_code, hsock *out, uint32_t *pair,
+                           uint64_t *secret) {
     static uint8_t buf[MAX_FRAME];
     char srv[LOBBY_NAME];
     if (!lobby_server(srv)) snprintf(srv, sizeof srv, "%s", inet_ntoa(addr->sin_addr));
@@ -1435,18 +1601,22 @@ static uint32_t lobby_join(const struct sockaddr_in *addr, uint64_t hub, hsock *
         hub_report(NOTE_JOIN, srv, HUB_UNREACHABLE, -1, -1);
         return R_CONNECT_TIMEOUT;
     }
-    uint8_t req[LOBBY_HEADER + 8], type;
+    uint8_t req[LOBBY_HEADER + 8 + CODE_LEN], type = 0;
     lobby_header(req, NULL);
     memcpy(req + LOBBY_HEADER, &hub, 8);
+    bool coded = hub_code && strlen(hub_code) == CODE_LEN;
+    if (coded) memcpy(req + LOBBY_HEADER + 8, hub_code, CODE_LEN);
     hset_timeout(s, 12000);  // (the server waits up to 10 s for the host)
-    int n = frame_send(s, S_JOIN, req, sizeof req, NULL, 0) ? frame_recv(s, &type, buf) : -1;
+    uint64_t asked = plat_now_ns();
+    int n = frame_send(s, S_JOIN, req, coded ? sizeof req : sizeof req - CODE_LEN, NULL, 0) ? frame_recv(s, &type, buf) : -1;
     if (n >= 12 && type == S_SPLICED) {
         *out = s, *pair = rd32(buf), *secret = rd64(buf + 4);
         return 0;
     }
     hclose(s);
     uint32_t code = n >= 4 && type == S_ERROR ? rd32(buf) : 0;
-    LOG("[ldn] joining through the hub server failed: %s\n", code ? lobby_error(code) : "no answer");
+    LOG("[ldn] joining through the hub server (%s) failed: %s%s\n", inet_ntoa(addr->sin_addr),
+        code ? lobby_error(code) : "no answer: ", code ? "" : reply_why(n, type, asked));
     if (code == SE_NO_ANSWER) {  // (a hub that is gone: the game says so itself)
         int lang = config_language();
         overlay_notice(settings_text(lang, UI_TEXT("Could not join the hub.")),
@@ -1456,6 +1626,921 @@ static uint32_t lobby_join(const struct sockaddr_in *addr, uint64_t hub, hsock *
     }
     return code == SE_NOT_FOUND ? R_CONNECT_NOT_FOUND : code == SE_BUSY ? R_CONNECT_REJECTED : R_CONNECT_TIMEOUT;
 }
+
+// ---- session codes (link version 4)
+// A code as typed: case, spaces and dashes don't matter, and Crockford's look-alikes are read as they're meant (O as
+// 0, I and L as 1). false: not 8 of the alphabet's characters.
+bool ldn_code_normalize(const char *in, char *out) {
+    int n = 0;
+    for (; *in; in++) {
+        char ch = *in;
+        if (ch == ' ' || ch == '-') continue;
+        if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 'A');
+        if (ch == 'O') ch = '0';
+        if (ch == 'I' || ch == 'L') ch = '1';
+        if (!strchr(CODE_ALPHABET, ch) || n == CODE_LEN) return false;
+        out[n++] = ch;
+    }
+    out[n] = 0;
+    return n == CODE_LEN;
+}
+
+static void code_shown(const char *code, char *out, size_t size) {  // "ABCD-EFGH"
+    snprintf(out, size, "%.4s-%.4s", code, code + 4);
+}
+
+// The code of the hub we're in, for sharing: ours when hosting one the hub server listed with it, else the one we
+// joined through the hub server. A Hunter Search network (it lasts seconds) has none worth sharing.
+static bool hunt_search(const uint8_t *info);
+bool ldn_session_code(char *out, size_t size) {
+    char code[CODE_LEN + 1] = "";
+    pthread_mutex_lock(&L.mu);
+    if (!hunt_search(L.info)) {
+        if (L.state == ST_AP_CREATED && L.code_listed) snprintf(code, sizeof code, "%s", L.code);
+        else if (L.state == ST_STATION_CONNECTED) snprintf(code, sizeof code, "%s", L.joined_code);
+    }
+    pthread_mutex_unlock(&L.mu);
+    if (!code[0]) return false;
+    code_shown(code, out, size);
+    return true;
+}
+
+// A Hunter Search network, not a hub (server/server.go huntSearch): room for 2, 0xFF at advertise byte 0x1C (hubs have
+// 1). The 8 bytes before it, at 0x14, are the host's account id (ldn_account_id), not a constant.
+static bool hunt_search(const uint8_t *info) {
+    const uint8_t *adv = info + NI_ADV;
+    return info[NI_NODE_MAX] == 2 && rd16(info + NI_ADV_SIZE) > 0x1C && adv[0x1C] == 0xFF;
+}
+
+// Join by code (invites): the hub a session code names, found on the hub server (FIND) and put first in the game's
+// searches for INVITE_KEEP_NS, so the player picks it in Join Hub; joining it sends the code, which the server lets in
+// from any room. One invite at a time: a new code replaces the last.
+#define INVITE_KEEP_NS 600000000000ull  // 10 minutes
+static pthread_mutex_t invite_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+    int state;  // LDN_INVITE_*
+    uint32_t gen;
+    char code[CODE_LEN + 1], server[LOBBY_NAME];
+    struct sockaddr_in addr;
+    uint64_t hub, at;
+    uint16_t ver;
+    uint8_t info[NETINFO_SIZE];
+} invite;
+
+static void *invite_thread(void *arg) {
+    uint32_t gen = (uint32_t)(uintptr_t)arg;
+    static __thread uint8_t buf[MAX_FRAME];
+    char code[CODE_LEN + 1], srv[LOBBY_NAME];
+    pthread_mutex_lock(&invite_mu);
+    snprintf(code, sizeof code, "%s", invite.code);
+    snprintf(srv, sizeof srv, "%s", invite.server);
+    pthread_mutex_unlock(&invite_mu);
+    int state = LDN_INVITE_FAILED;
+    struct sockaddr_in addr;
+    LobbyList *r = NULL;
+    if (resolve_host(srv, LOBBY_PORT, &addr)) {
+        hsock s = connect_to(&addr, 3000);
+        if (s != BADSOCK) {
+            uint8_t req[LOBBY_HEADER + CODE_LEN], type;
+            lobby_header(req, NULL);
+            memcpy(req + LOBBY_HEADER, code, CODE_LEN);
+            hset_timeout(s, 4000);
+            uint64_t asked = plat_now_ns();
+            int n = frame_send(s, S_FIND, req, sizeof req, NULL, 0) ? frame_recv(s, &type, buf) : -1;
+            hclose(s);
+            if (n >= 4 && type == S_HUBS4 && (r = malloc(sizeof *r))) {
+                lobby_hubs(buf, n, type, r);
+                state = r->n == 1 && info_sane(r->infos[0]) ? LDN_INVITE_READY : LDN_INVITE_NOT_FOUND;
+            } else if (n >= 4 && type == S_ERROR) {
+                state = rd32(buf) == SE_BUSY ? LDN_INVITE_FAILED : LDN_INVITE_OLD_SERVER;
+            } else {  // a server older than version 4 hangs up on FIND at once; one that runs out the time is just slow
+                state = plat_now_ns() - asked < 3000000000ull ? LDN_INVITE_OLD_SERVER : LDN_INVITE_FAILED;
+            }
+        }
+    }
+    LOG("[ldn] session code %s on %s: %s\n", code, srv,
+        state == LDN_INVITE_READY ? "found" : state == LDN_INVITE_NOT_FOUND ? "no such hub" :
+        state == LDN_INVITE_OLD_SERVER ? "the hub server doesn't know session codes" : "no answer");
+    pthread_mutex_lock(&invite_mu);
+    bool mine = invite.gen == gen;
+    if (mine) {
+        invite.state = state, invite.addr = addr, invite.at = plat_now_ns();
+        if (state == LDN_INVITE_READY) {
+            invite.hub = r->ids[0], invite.ver = r->vers[0];
+            memcpy(invite.info, r->infos[0], NETINFO_SIZE);
+        }
+    }
+    pthread_mutex_unlock(&invite_mu);
+    free(r);
+    if (!mine) return NULL;
+    int lang = config_language();
+    if (state == LDN_INVITE_READY)
+        overlay_notice(settings_text(lang, UI_TEXT("Hub found")),
+                       settings_text(lang, UI_TEXT("Search for hubs in Join Hub: it is first in the list.")));
+    else if (state == LDN_INVITE_NOT_FOUND)
+        overlay_notice(settings_text(lang, UI_TEXT("No hub has that code")),
+                       settings_text(lang, UI_TEXT("It may have closed, or be on another hub server.")));
+    else
+        overlay_notice(settings_text(lang, UI_TEXT("Could not look up the code")),
+                       settings_text(lang, state == LDN_INVITE_OLD_SERVER ? UI_TEXT("The hub server is older than this game.")
+                                                                          : UI_TEXT("The hub server did not answer.")));
+    return NULL;
+}
+
+bool ldn_join_code(const char *typed, const char *server) {
+    char code[CODE_LEN + 1], srv[LOBBY_NAME];
+    if (!ldn_code_normalize(typed, code)) return false;
+    if (server && *server) snprintf(srv, sizeof srv, "%s", server);
+    else if (!lobby_server(srv)) return false;
+    hnet_init();
+    pthread_mutex_lock(&invite_mu);
+    uint32_t gen = ++invite.gen;
+    invite.state = LDN_INVITE_SEARCHING;
+    snprintf(invite.code, sizeof invite.code, "%s", code);
+    snprintf(invite.server, sizeof invite.server, "%s", srv);
+    pthread_mutex_unlock(&invite_mu);
+    if (!spawn(invite_thread, (void *)(uintptr_t)gen)) {
+        pthread_mutex_lock(&invite_mu);
+        if (invite.gen == gen) invite.state = LDN_INVITE_FAILED;
+        pthread_mutex_unlock(&invite_mu);
+    }
+    return true;
+}
+
+int ldn_invite_state(char *code, size_t size) {
+    pthread_mutex_lock(&invite_mu);
+    int state = invite.state;
+    if (state == LDN_INVITE_READY && plat_now_ns() - invite.at > INVITE_KEEP_NS) state = invite.state = LDN_INVITE_NONE;
+    if (code) code_shown(invite.code, code, size);
+    pthread_mutex_unlock(&invite_mu);
+    return state;
+}
+
+// For Discord: "code@server" of the hub we're in (empty: none to share).
+bool ldn_join_secret(char *out, size_t size) {
+    char code[16], srv[LOBBY_NAME];
+    if (!ldn_session_code(code, sizeof code) || !lobby_server(srv)) return false;
+    snprintf(out, size, "%s@%s", code, srv);
+    return true;
+}
+
+// A join secret from Discord (someone's "Join"): only for our own hub server, so that a made-up one can't send the
+// game to a server the player never chose.
+void ldn_join_from_secret(const char *secret) {
+    char code[CODE_LEN + 1], srv[LOBBY_NAME], mine[LOBBY_NAME], part[32];
+    const char *at = strchr(secret, '@');
+    if (!at || (size_t)(at - secret) >= sizeof part) return;
+    memcpy(part, secret, (size_t)(at - secret)), part[at - secret] = 0;
+    snprintf(srv, sizeof srv, "%s", at + 1);
+    if (!ldn_code_normalize(part, code)) return;
+    int lang = config_language();
+    if (!lobby_server(mine) || strcmp(mine, srv)) {
+        LOG("[ldn] Discord join: the hub is on another hub server (%s)\n", srv);
+        char line[LOBBY_NAME + 128];
+        snprintf(line, sizeof line, settings_text(lang, UI_TEXT("That hub is on the hub server %s")), srv);
+        overlay_notice(line, settings_text(lang, UI_TEXT("Set the same hub server in Multiplayer to join it.")));
+        return;
+    }
+    LOG("[ldn] Discord join: session code %s\n", code);
+    ldn_join_code(code, NULL);
+}
+
+// ---- friends (link version 4)
+// This install's identity is a random secret in the save folder (friends-id.bin: it goes with the saves, never in the
+// settings file people share); its friend code is SHA-256("MHGURecomp friend:" + secret), the first 10 bytes, shown
+// as 16 characters. friends.txt beside it lists the friends: a code and a name a line. A thread tells the hub server
+// every FRIENDS_POLL_NS (and soon after we start or stop hosting, join or leave) what we do and the hunter name our
+// requests show, and hears which friends are online that list us back, and who lists us that we don't list: friend
+// requests. Adding a player is the request; accepting is adding them back. A rejected request stays out until the game
+// restarts (F.rejected), unless we add that player ourselves. In a hub, the games of version 4 tell each other their
+// friend codes and hunter names (F_AUX 0xE9 hellos), so a hunter there is added with a click. ini FriendRequests Off:
+// no requests shown, no hellos sent (adding by code still works).
+#define FRIENDS_POLL_NS 30000000000ull
+#define FRIENDS_GAP_NS 5000000000ull  // (the least between two requests: a hosted or joined hub may change fast)
+#define HELLO_EVERY_NS 60000000000ull  // a hub's hellos also again this often (and whenever its players change)
+#define FRIEND_REQUESTS_MAX 8
+#define FRIENDS_REMOVED_MAX 64  // (the server takes this many in a PRESENCE; full: the oldest goes)
+#define HUNTERS_MAX (MAX_NODES - 1)
+#define FRIEND_MAGIC 0xE9u  // aux message (emsync.c 0xE5, hpscale.c 0xE6, hitsync.c 0xE7, partsync.c 0xE8)
+static pthread_mutex_t friends_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t friends_cv = PTHREAD_COND_INITIALIZER;
+static struct {
+    bool loaded, started, poked, polled;
+    uint8_t secret[FRIEND_SECRET], id[FRIEND_LEN];
+    int n, server_state;
+    LdnFriend list[LDN_FRIENDS_MAX];
+    uint8_t ids[LDN_FRIENDS_MAX][FRIEND_LEN];
+    // requests now (from the last answer), the ones rejected this session, and when each player's request last got a
+    // notice (friend_request_noted)
+    int nreq;
+    LdnRequest req[FRIEND_REQUESTS_MAX];
+    uint8_t req_ids[FRIEND_REQUESTS_MAX][FRIEND_LEN];
+    int nrejected, ntold;
+    uint8_t rejected[64][FRIEND_LEN], told[64][FRIEND_LEN];
+    uint64_t told_ns[64];
+    // the players removed from the friends (friends.txt "removed" lines): their requests aren't shown until they are
+    // added again, and the hub server is told, so their games drop us too (an old listing of theirs is no request)
+    int nremoved;
+    uint8_t removed[FRIENDS_REMOVED_MAX][FRIEND_LEN];
+    char removed_names[FRIENDS_REMOVED_MAX][33];
+    // the hub's hunters that said hello: by their address in the network
+    int nhunters;
+    struct { uint32_t ip; uint8_t id[FRIEND_LEN]; char name[33]; } hunters[HUNTERS_MAX];
+} F = {.server_state = HUB_UNKNOWN};
+
+static bool id_in(const uint8_t (*set)[FRIEND_LEN], int n, const uint8_t *id) {
+    for (int i = 0; i < n; i++)
+        if (!memcmp(set[i], id, FRIEND_LEN)) return true;
+    return false;
+}
+static void id_add(uint8_t (*set)[FRIEND_LEN], int *n, int max, const uint8_t *id) {  // (full: the oldest goes)
+    if (id_in((const uint8_t (*)[FRIEND_LEN])set, *n, id)) return;
+    if (*n == max) memmove(set[0], set[1], (size_t)(max - 1) * FRIEND_LEN), (*n)--;
+    memcpy(set[(*n)++], id, FRIEND_LEN);
+}
+// A notice for a friend request: when it is new since the last answer (sent, sent again, or its sender back online),
+// but not twice within FRIEND_NOTE_AGAIN_NS from the same player, so nobody can fill the screen with them (friends_mu held)
+#define FRIEND_NOTE_AGAIN_NS 600000000000ull
+static bool friend_request_noted(const uint8_t *id) {
+    uint64_t now = plat_now_ns();
+    for (int i = 0; i < F.ntold; i++)
+        if (!memcmp(F.told[i], id, FRIEND_LEN)) {
+            if (now - F.told_ns[i] < FRIEND_NOTE_AGAIN_NS) return false;
+            F.told_ns[i] = now;
+            return true;
+        }
+    if (F.ntold == 64) {  // (full: the oldest goes)
+        memmove(F.told[0], F.told[1], 63 * FRIEND_LEN);
+        memmove(&F.told_ns[0], &F.told_ns[1], 63 * sizeof F.told_ns[0]);
+        F.ntold--;
+    }
+    memcpy(F.told[F.ntold], id, FRIEND_LEN);
+    F.told_ns[F.ntold++] = now;
+    return true;
+}
+static bool friend_removed_del(const uint8_t *id);
+static bool friend_drop_locked(const uint8_t *id);
+static void friends_save_locked(void);
+static void id_remove(uint8_t (*set)[FRIEND_LEN], int *n, const uint8_t *id) {
+    for (int i = 0; i < *n; i++)
+        if (!memcmp(set[i], id, FRIEND_LEN)) {
+            memmove(set[i], set[i + 1], (size_t)(*n - i - 1) * FRIEND_LEN);
+            (*n)--;
+            return;
+        }
+}
+
+static void friends_file(char *out, size_t size, const char *name) {
+    const char *dir = getenv("MHGU_SAVE_DIR");
+    snprintf(out, size, "%s/%s", dir && *dir ? dir : g_save_dir, name);
+}
+
+static void friend_text(const uint8_t *id, char *out) {  // 10 bytes -> 16 characters, 5 bits each (most significant first)
+    for (int i = 0; i < 16; i++) {
+        int v = 0;
+        for (int b = 0; b < 5; b++) {
+            int k = i * 5 + b;
+            v = v << 1 | (id[k / 8] >> (7 - k % 8) & 1);
+        }
+        out[i] = CODE_ALPHABET[v];
+    }
+    out[16] = 0;
+}
+
+static bool friend_parse(const char *typed, uint8_t *id) {  // the 16 characters (as ldn_code_normalize reads them)
+    uint8_t v[16];
+    int n = 0;
+    for (; *typed && n <= 16; typed++) {
+        char ch = *typed;
+        if (ch == ' ' || ch == '-') continue;
+        if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 'A');
+        if (ch == 'O') ch = '0';
+        if (ch == 'I' || ch == 'L') ch = '1';
+        const char *p = strchr(CODE_ALPHABET, ch);
+        if (!p || !ch || n == 16) return false;
+        v[n++] = (uint8_t)(p - CODE_ALPHABET);
+    }
+    if (n != 16) return false;
+    memset(id, 0, FRIEND_LEN);
+    for (int i = 0; i < 16; i++)
+        for (int b = 0; b < 5; b++)
+            if (v[i] >> (4 - b) & 1) id[(i * 5 + b) / 8] |= (uint8_t)(0x80 >> ((i * 5 + b) % 8));
+    return true;
+}
+
+static void friend_shown(const char *text, char *out, size_t size) {  // "ABCD-EFGH-JKMN-PQRS"
+    snprintf(out, size, "%.4s-%.4s-%.4s-%.4s", text, text + 4, text + 8, text + 12);
+}
+
+static void friends_save_locked(void) {
+    char path[512], tmp[520];
+    friends_file(path, sizeof path, "friends.txt");
+    snprintf(tmp, sizeof tmp, "%s.new", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f) { LOG("[ldn] can't write %s\n", tmp); return; }
+    fprintf(f, "# MHGURecomp friends: a friend code and a name a line (the settings menu's Friends tab edits it)\n");
+    for (int i = 0; i < F.n; i++) {
+        char t[17];
+        friend_text(F.ids[i], t);
+        fprintf(f, "%s %s\n", t, F.list[i].name);
+    }
+    // ("removed" lines: players taken out of the friends; older games skip them, not being codes)
+    for (int i = 0; i < F.nremoved; i++) {
+        char t[17];
+        friend_text(F.removed[i], t);
+        fprintf(f, "removed %s %s\n", t, F.removed_names[i]);
+    }
+    if (fclose(f) || (remove(path), rename(tmp, path))) LOG("[ldn] can't write %s\n", path);
+}
+
+static void friends_load_locked(void) {
+    if (F.loaded) return;
+    F.loaded = true;
+    char path[512];
+    friends_file(path, sizeof path, "friends-id.bin");
+    FILE *f = fopen(path, "rb");
+    bool have = f && fread(F.secret, 1, FRIEND_SECRET, f) == FRIEND_SECRET;
+    if (f) fclose(f);
+    if (!have) {  // a new identity: made once, then kept with the saves
+        rand_bytes(F.secret, FRIEND_SECRET);
+        mkdir(getenv("MHGU_SAVE_DIR") && *getenv("MHGU_SAVE_DIR") ? getenv("MHGU_SAVE_DIR") : g_save_dir, 0755);  // (a new install)
+        if ((f = fopen(path, "wb"))) {
+            fwrite(F.secret, 1, FRIEND_SECRET, f);
+            fclose(f);
+            LOG("[ldn] a friend code made for this install (%s)\n", path);
+        } else {
+            LOG("[ldn] can't write %s: the friend code lasts until the game closes\n", path);
+        }
+    }
+    Sha256 s;
+    char hex[65];
+    sha256_init(&s);
+    sha256_update(&s, "MHGURecomp friend:", 18);
+    sha256_update(&s, F.secret, FRIEND_SECRET);
+    sha256_hex(&s, hex);
+    for (int i = 0; i < FRIEND_LEN; i++) {
+        unsigned v;
+        sscanf(hex + 2 * i, "%2x", &v);
+        F.id[i] = (uint8_t)v;
+    }
+    friends_file(path, sizeof path, "friends.txt");
+    if (!(f = fopen(path, "r"))) return;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        char *e = line + strlen(line);
+        while (e > line && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ')) *--e = 0;
+        char *sp = strchr(line, ' ');
+        if (line[0] == '#' || !line[0]) continue;
+        if (sp) *sp = 0;
+        else sp = e - 1;  // (a code without a name: sp + 1 is the empty string at the end)
+        uint8_t id[FRIEND_LEN];
+        if (!strcmp(line, "removed")) {  // removed CODE name
+            char *code = sp + 1, *nsp = strchr(code, ' ');
+            if (nsp) *nsp = 0;
+            if (friend_parse(code, id) && memcmp(id, F.id, FRIEND_LEN) && F.nremoved < FRIENDS_REMOVED_MAX &&
+                !id_in((const uint8_t (*)[FRIEND_LEN])F.removed, F.nremoved, id)) {
+                snprintf(F.removed_names[F.nremoved], sizeof F.removed_names[0], "%s", nsp ? nsp + 1 : "");
+                memcpy(F.removed[F.nremoved++], id, FRIEND_LEN);
+            }
+            continue;
+        }
+        if (F.n >= LDN_FRIENDS_MAX || !friend_parse(line, id) || !memcmp(id, F.id, FRIEND_LEN)) continue;
+        LdnFriend *fr = &F.list[F.n];
+        memset(fr, 0, sizeof *fr);
+        char t[17];
+        friend_text(id, t);
+        friend_shown(t, fr->code, sizeof fr->code);
+        snprintf(fr->name, sizeof fr->name, "%s", sp[1] ? sp + 1 : fr->code);  // (no name: the code, as when added)
+        fr->state = LDN_FRIEND_UNKNOWN;
+        memcpy(F.ids[F.n++], id, FRIEND_LEN);
+    }
+    fclose(f);
+}
+
+static void friends_poke(void) {
+    pthread_mutex_lock(&friends_mu);
+    F.poked = true;
+    pthread_cond_signal(&friends_cv);
+    pthread_mutex_unlock(&friends_mu);
+}
+
+// What we do, for the friends: hosting a hub (with its code once listed with one), in a hub joined through the hub
+// server (its code when we know it), or just in the game. Hunter Search networks don't count.
+static uint8_t friends_my_state(char *code) {
+    uint8_t state = 0;
+    memset(code, 0, CODE_LEN);
+    pthread_mutex_lock(&L.mu);
+    if (!L.ryu && !L.room && !hunt_search(L.info)) {
+        if (L.state == ST_AP_CREATED) {
+            state = 1;
+            if (L.code_listed) memcpy(code, L.code, CODE_LEN);
+        } else if (L.state == ST_STATION_CONNECTED && L.up.relay_pair) {
+            state = 2;
+            memcpy(code, L.joined_code, strlen(L.joined_code) == CODE_LEN ? CODE_LEN : 0);
+        }
+    }
+    pthread_mutex_unlock(&L.mu);
+    return state;
+}
+
+// The name our friend requests and hellos show: the hunter's, without anything that isn't plain text (at most 32 bytes).
+static size_t friends_my_name(char *out) {
+    char name[33] = "";
+    presence_hunter_name(name, sizeof name);
+    size_t n = 0;
+    for (const char *p = name; *p && n < 32; p++)
+        if ((unsigned char)*p >= 0x20 && *p != 0x7F) out[n++] = *p;
+    out[n] = 0;
+    return n;
+}
+
+// A friend hello into the hub (to every other game; version 3 games drop it): u8 magic, u8 1, u8 name length, u8 0,
+// u32 our address in the network, friend code[10], name. Sent when the hub's players change and every
+// HELLO_EVERY_NS; not in crossplay (no F_AUX there) nor with FriendRequests Off. Also forgets hunters who left.
+static void friends_hello_tick(void) {
+    static uint64_t sig, next;
+    bool up = ldn_net_up() && !ldn_crossplay() && !L.ryu && !L.room;
+    uint64_t s = 0;
+    uint32_t own = 0;
+    uint32_t ips[MAX_NODES] = {0};
+    int nips = 0;
+    if (up) {
+        pthread_mutex_lock(&L.mu);
+        own = L.own_ip;
+        for (int i = 0; i < MAX_NODES; i++) {
+            const uint8_t *nd = node_at(L.info, i);
+            if (!nd[NODE_CONNECTED]) continue;
+            ips[nips++] = rd32(nd + NODE_IP);
+            s = s * 1000003u + rd32(nd + NODE_IP);
+        }
+        pthread_mutex_unlock(&L.mu);
+        s = s * 31 + own;
+    }
+    pthread_mutex_lock(&friends_mu);  // (hunters no longer in the hub, or every one when there is none)
+    for (int i = 0; i < F.nhunters;) {
+        bool in = false;
+        for (int k = 0; k < nips; k++) in |= ips[k] == F.hunters[i].ip && ips[k] != own;
+        if (in) { i++; continue; }
+        memmove(&F.hunters[i], &F.hunters[i + 1], (size_t)(F.nhunters - i - 1) * sizeof F.hunters[0]);
+        F.nhunters--;
+    }
+    uint8_t id[FRIEND_LEN];
+    memcpy(id, F.id, FRIEND_LEN);
+    pthread_mutex_unlock(&friends_mu);
+    uint64_t now = plat_now_ns();
+    if (!up || !config_live_friend_requests() || nips < 2) { sig = 0; return; }
+    if (s == sig && now < next) return;
+    sig = s, next = now + HELLO_EVERY_NS;
+    uint8_t m[8 + FRIEND_LEN + 32];
+    char name[33];
+    size_t nl = friends_my_name(name);
+    m[0] = FRIEND_MAGIC, m[1] = 1, m[2] = (uint8_t)nl, m[3] = 0;
+    wr32(m + 4, own);
+    memcpy(m + 8, id, FRIEND_LEN);
+    memcpy(m + 8 + FRIEND_LEN, name, nl);
+    ldn_send_aux(m, (uint32_t)(8 + FRIEND_LEN + nl));
+}
+
+void friends_aux_received(const void *data, uint32_t len) {
+    const uint8_t *m = data;
+    if (len < 8 + FRIEND_LEN || m[0] != FRIEND_MAGIC || m[1] != 1 || m[2] > 32 || len < 8u + FRIEND_LEN + m[2]) return;
+    uint32_t ip = rd32(m + 4);
+    pthread_mutex_lock(&friends_mu);
+    if (memcmp(m + 8, F.id, FRIEND_LEN)) {
+        int i = 0;
+        while (i < F.nhunters && F.hunters[i].ip != ip) i++;
+        if (i == F.nhunters && F.nhunters < HUNTERS_MAX)
+            F.nhunters++, LOG("[ldn] friends: a hunter in the hub shared their friend code (%d now)\n", F.nhunters);
+        if (i < F.nhunters) {
+            F.hunters[i].ip = ip;
+            memcpy(F.hunters[i].id, m + 8, FRIEND_LEN);
+            size_t k = 0;
+            for (size_t j = 0; j < m[2]; j++)
+                if (m[8 + FRIEND_LEN + j] >= 0x20 && m[8 + FRIEND_LEN + j] != 0x7F) F.hunters[i].name[k++] = (char)m[8 + FRIEND_LEN + j];
+            F.hunters[i].name[k] = 0;
+        }
+        // A friend in our list with no name of their own (added by code alone, which names them with the code; or a
+        // friends.txt line without a name) takes the hunter name their game goes by (a name the player typed stays).
+        uint8_t was[FRIEND_LEN];
+        char shown[33] = "";
+        size_t k = 0;
+        for (size_t j = 0; j < m[2]; j++)
+            if (m[8 + FRIEND_LEN + j] >= 0x20 && m[8 + FRIEND_LEN + j] != 0x7F) shown[k++] = (char)m[8 + FRIEND_LEN + j];
+        shown[k] = 0;
+        for (int f = 0; k && f < F.n; f++) {
+            LdnFriend *fr = &F.list[f];
+            if (memcmp(F.ids[f], m + 8, FRIEND_LEN) || (fr->name[0] && !(friend_parse(fr->name, was) && !memcmp(was, F.ids[f], FRIEND_LEN))))
+                continue;
+            snprintf(fr->name, sizeof fr->name, "%s", shown);
+            LOG("[ldn] friends: %s is named %s from the hub\n", fr->code, fr->name);
+            friends_save_locked();
+            break;
+        }
+    }
+    pthread_mutex_unlock(&friends_mu);
+}
+
+static void *friends_thread(void *arg) {
+    (void)arg;
+    static uint8_t buf[MAX_FRAME];
+    uint64_t last = 0;
+    for (;;) {
+        pthread_mutex_lock(&friends_mu);
+        for (;;) {
+            uint64_t now = plat_now_ns();
+            if (now - last >= FRIENDS_POLL_NS || (F.poked && now - last >= FRIENDS_GAP_NS)) break;
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += 1;
+            pthread_cond_timedwait(&friends_cv, &friends_mu, &ts);
+            pthread_mutex_unlock(&friends_mu);
+            friends_hello_tick();  // (every second: the hub's hellos)
+            pthread_mutex_lock(&friends_mu);
+        }
+        F.poked = false;
+        int n = F.n;
+        uint8_t ids[LDN_FRIENDS_MAX][FRIEND_LEN], secret[FRIEND_SECRET], removed[FRIENDS_REMOVED_MAX][FRIEND_LEN];
+        memcpy(ids, F.ids, sizeof ids);
+        memcpy(secret, F.secret, sizeof secret);
+        int nremoved = F.nremoved;
+        memcpy(removed, F.removed, sizeof removed);
+        pthread_mutex_unlock(&friends_mu);
+        last = plat_now_ns();
+        char srv[LOBBY_NAME];
+        int state = HUB_UNKNOWN;
+        bool requests = config_live_friend_requests();
+        if (!n && !requests) continue;  // (nobody to tell, nobody to hear from)
+        if (!lobby_server(srv)) state = HUB_OFF;
+        uint8_t req[LOBBY_HEADER + FRIEND_SECRET + 1 + CODE_LEN + 1 + LDN_FRIENDS_MAX * FRIEND_LEN + 1 + 32 + 1 +
+                    FRIENDS_REMOVED_MAX * FRIEND_LEN], type = 0;
+        int got = -1;
+        struct sockaddr_in addr;
+        char why[160] = "";  // (for the log: why the server can't be asked)
+        if (state != HUB_OFF) {
+            state = HUB_NOT_FOUND;
+            snprintf(why, sizeof why, ": %s not found", srv);
+            if (resolve_host(srv, LOBBY_PORT, &addr)) {
+                state = HUB_UNREACHABLE;
+                snprintf(why, sizeof why, ": unreachable at %s", inet_ntoa(addr.sin_addr));
+                hsock s = connect_to(&addr, 3000);
+                if (s != BADSOCK) {
+                    lobby_header(req, NULL);
+                    uint8_t *p = req + LOBBY_HEADER;
+                    memcpy(p, secret, FRIEND_SECRET), p += FRIEND_SECRET;
+                    *p = friends_my_state((char *)p + 1), p += 1 + CODE_LEN;
+                    *p++ = (uint8_t)n;
+                    memcpy(p, ids, (size_t)n * FRIEND_LEN), p += n * FRIEND_LEN;
+                    char name[33];
+                    size_t nl = friends_my_name(name);  // (what our requests show the players we added)
+                    if (nl || nremoved) *p++ = (uint8_t)nl, memcpy(p, name, nl), p += nl;
+                    if (nremoved) {  // (after the name: the players we removed; a server older than that ignores them)
+                        *p++ = (uint8_t)nremoved;
+                        memcpy(p, removed, (size_t)nremoved * FRIEND_LEN), p += nremoved * FRIEND_LEN;
+                    }
+                    hset_timeout(s, 4000);
+                    uint64_t asked = plat_now_ns();
+                    got = frame_send(s, S_PRESENCE, req, (uint32_t)(p - req), NULL, 0) ? frame_recv(s, &type, buf) : -1;
+                    hclose(s);
+                    // (a server older than version 4 hangs up on PRESENCE at once, without a word. Nothing in time, a
+                    // reset or anything else is the way there failing, not the server's age: "unreachable", not "too
+                    // old" - a 0.20.0 player with a flaky connection was told the server was too old)
+                    bool old = got < 0 && io_hung_up && plat_now_ns() - asked < 3000000000ull;
+                    state = got >= 1 && type == S_FRIENDS ? HUB_ONLINE
+                          : got >= 4 && type == S_ERROR   ? lobby_state(rd32(buf))
+                          : old                           ? HUB_VERSION
+                                                          : HUB_NO_ANSWER;
+                    if (state == HUB_NO_ANSWER)
+                        snprintf(why, sizeof why, ": no answer at %s: %s", inet_ntoa(addr.sin_addr),
+                                 reply_why(got, type, asked));
+                    else if (state != HUB_ONLINE)
+                        snprintf(why, sizeof why, ": %s", got >= 4 && type == S_ERROR ? lobby_error(rd32(buf)) : "");
+                }
+            }
+        }
+        char notes[6][96];
+        int nn = 0;
+        pthread_mutex_lock(&friends_mu);
+        if (state != F.server_state && (state == HUB_ONLINE || F.server_state == HUB_ONLINE || F.server_state == HUB_UNKNOWN))
+            LOG("[ldn] friends: the hub server %s%s\n", state == HUB_ONLINE ? "answers" : state == HUB_VERSION
+                ? "doesn't know friends (older than this game)" : "can't be asked now",
+                state == HUB_ONLINE || state == HUB_VERSION ? "" : why);
+        F.server_state = state;
+        int was_req = F.nreq, was_mutual = 0, now_mutual = 0;
+        for (int i = 0; i < F.n; i++) was_mutual += F.list[i].mutual && F.list[i].state != LDN_FRIEND_OFFLINE;
+        if (state == HUB_ONLINE) {
+            int count = buf[0];
+            const int entry = FRIEND_LEN + 1 + CODE_LEN;
+            for (int i = 0; i < F.n; i++) {
+                LdnFriend *fr = &F.list[i];
+                int was = fr->state, now = LDN_FRIEND_OFFLINE;
+                fr->hub[0] = 0;
+                for (int k = 0; k < count && 1 + (k + 1) * entry <= got; k++) {
+                    const uint8_t *e = buf + 1 + k * entry;
+                    if (memcmp(e, F.ids[i], FRIEND_LEN)) continue;
+                    uint8_t st = e[FRIEND_LEN];
+                    now = st == 1 ? LDN_FRIEND_HOSTING : st == 2 ? LDN_FRIEND_IN_HUB : LDN_FRIEND_ONLINE;
+                    memcpy(fr->hub, e + FRIEND_LEN + 1, CODE_LEN);
+                    fr->hub[CODE_LEN] = 0;
+                    fr->mutual = true;  // (the server tells only friends who list us back)
+                }
+                fr->state = now;
+                // A notice when a friend starts hosting ([Multiplayer] FriendHubNotices On), or comes online from
+                // offline (FriendOnlineNotices On); none from the first answer (it only learns who is online already)
+                // or for a friend still unknown.
+                bool hosting = now == LDN_FRIEND_HOSTING && was != LDN_FRIEND_HOSTING;
+                bool came = now != LDN_FRIEND_OFFLINE && was == LDN_FRIEND_OFFLINE;
+                if (F.polled && was != LDN_FRIEND_UNKNOWN && nn < 4 && ((hosting && config_live_friend_hub_notices()) || (came && config_live_friend_online_notices())))
+                    snprintf(notes[nn++], sizeof notes[0], "%c%s", hosting ? 'H' : 'O', fr->name);
+            }
+            // the requests after the friends: u8 r, r x (friend[10], u8 len, name); rejected ones and those with
+            // FriendRequests Off are left out. One that wasn't in the last answer gets a notice (friend_request_noted).
+            uint8_t before[FRIEND_REQUESTS_MAX][FRIEND_LEN];
+            int nbefore = F.nreq;
+            memcpy(before, F.req_ids, sizeof before);
+            F.nreq = 0;
+            int at = 1 + count * entry;
+            int r = at < got ? buf[at++] : 0, k = 0;
+            for (; k < r && at + FRIEND_LEN + 1 <= got; k++) {
+                const uint8_t *e = buf + at;
+                int nl = e[FRIEND_LEN];
+                if (nl > 32 || at + FRIEND_LEN + 1 + nl > got) break;
+                at += FRIEND_LEN + 1 + nl;
+                // (not shown: rejected this session, removed from the friends until added again, a friend already)
+                if (!requests || F.nreq == FRIEND_REQUESTS_MAX || id_in((const uint8_t (*)[FRIEND_LEN])F.rejected, F.nrejected, e) ||
+                    id_in((const uint8_t (*)[FRIEND_LEN])F.removed, F.nremoved, e) ||
+                    id_in((const uint8_t (*)[FRIEND_LEN])F.ids, F.n, e) || !memcmp(e, F.id, FRIEND_LEN))
+                    continue;
+                LdnRequest *q = &F.req[F.nreq];
+                char t[17];
+                friend_text(e, t);
+                friend_shown(t, q->code, sizeof q->code);
+                size_t w = 0;
+                for (int j = 0; j < nl && w < 32; j++)
+                    if (e[FRIEND_LEN + 1 + j] >= 0x20 && e[FRIEND_LEN + 1 + j] != 0x7F) q->name[w++] = (char)e[FRIEND_LEN + 1 + j];
+                q->name[w] = 0;
+                if (!w) snprintf(q->name, sizeof q->name, "%s", q->code);
+                memcpy(F.req_ids[F.nreq++], e, FRIEND_LEN);
+                if (!id_in((const uint8_t (*)[FRIEND_LEN])before, nbefore, e) && nn < 6 && friend_request_noted(e))
+                    snprintf(notes[nn++], sizeof notes[0], "R%s", q->name);
+            }
+            // then (a server that knows removals, only when there are any) u8 g, g x friend[10]: friends that removed
+            // us. They go from the list too (not into the removed list: a request of theirs later is a new one).
+            if (k == r && at < got) {
+                int g = buf[at++];
+                bool changed = false;
+                for (int i = 0; i < g && at + FRIEND_LEN <= got; i++, at += FRIEND_LEN)
+                    for (int f = 0; f < F.n; f++)
+                        if (!memcmp(F.ids[f], buf + at, FRIEND_LEN)) {
+                            LOG("[ldn] friends: %s removed us: out of the friends list\n", F.list[f].name);
+                            friend_drop_locked(buf + at);
+                            changed = true;
+                            break;
+                        }
+                if (changed) friends_save_locked();
+            }
+            F.polled = true;
+            for (int i = 0; i < F.n; i++) now_mutual += F.list[i].mutual && F.list[i].state != LDN_FRIEND_OFFLINE;
+            if (F.nreq != was_req) LOG("[ldn] friends: %d friend request(s)\n", F.nreq);
+            if (now_mutual != was_mutual) LOG("[ldn] friends: %d of %d friend(s) online\n", now_mutual, F.n);
+        }
+        pthread_mutex_unlock(&friends_mu);
+        int lang = config_language();
+        for (int i = 0; i < nn; i++) {
+            char line[160];
+            const char *title = notes[i][0] == 'H' ? UI_TEXT("%s is hosting a hub")
+                              : notes[i][0] == 'R' ? UI_TEXT("%s wants to be friends")
+                                                   : UI_TEXT("%s is online");
+            const char *text = notes[i][0] == 'H' ? UI_TEXT("To join: settings menu, Friends tab.")
+                             : notes[i][0] == 'R' ? UI_TEXT("To accept or reject: settings menu, Friends tab.")
+                                                  : UI_TEXT("Your friend is playing.");
+            snprintf(line, sizeof line, settings_text(lang, title), notes[i] + 1);
+            overlay_notice(line, settings_text(lang, text));
+        }
+    }
+    return NULL;
+}
+
+void ldn_friends_start(void) {
+    pthread_mutex_lock(&friends_mu);
+    friends_load_locked();
+    bool start = !F.started;
+    F.started = true;
+    pthread_mutex_unlock(&friends_mu);
+    if (start) hnet_init(), spawn(friends_thread, NULL);
+}
+
+void ldn_my_friend_code(char *out, size_t size) {
+    pthread_mutex_lock(&friends_mu);
+    friends_load_locked();
+    char t[17];
+    friend_text(F.id, t);
+    pthread_mutex_unlock(&friends_mu);
+    friend_shown(t, out, size);
+}
+
+int ldn_friends(LdnFriend *out, int max, int *server_state) {
+    pthread_mutex_lock(&friends_mu);
+    friends_load_locked();
+    int n = F.n < max ? F.n : max;
+    memcpy(out, F.list, (size_t)n * sizeof *out);
+    if (server_state) *server_state = F.server_state;
+    pthread_mutex_unlock(&friends_mu);
+    return n;
+}
+
+// "code name" as typed (the name may be left out). NULL: added; else why not (UI_TEXT: the menu translates it).
+const char *ldn_friend_add(const char *typed) {
+    char code[64], name[64] = "";
+    while (*typed == ' ') typed++;
+    const char *sp = strchr(typed, ' ');
+    size_t cl = sp ? (size_t)(sp - typed) : strlen(typed);
+    if (cl >= sizeof code) return UI_TEXT("That is not a friend code: 16 letters and digits.");
+    memcpy(code, typed, cl), code[cl] = 0;
+    if (sp) {
+        while (*sp == ' ') sp++;
+        snprintf(name, sizeof name, "%.32s", sp);
+    }
+    uint8_t id[FRIEND_LEN];
+    if (!friend_parse(code, id)) return UI_TEXT("That is not a friend code: 16 letters and digits.");
+    pthread_mutex_lock(&friends_mu);
+    friends_load_locked();
+    const char *why = NULL;
+    if (!memcmp(id, F.id, FRIEND_LEN)) why = UI_TEXT("That is your own friend code.");
+    for (int i = 0; !why && i < F.n; i++)
+        if (!memcmp(id, F.ids[i], FRIEND_LEN)) why = UI_TEXT("That friend is in the list already.");
+    if (!why && F.n >= LDN_FRIENDS_MAX) why = UI_TEXT("The friends list is full.");
+    if (!why) {
+        LdnFriend *fr = &F.list[F.n];
+        memset(fr, 0, sizeof *fr);
+        char t[17];
+        friend_text(id, t);
+        friend_shown(t, fr->code, sizeof fr->code);
+        snprintf(fr->name, sizeof fr->name, "%s", *name ? name : fr->code);
+        fr->state = LDN_FRIEND_UNKNOWN;
+        memcpy(F.ids[F.n++], id, FRIEND_LEN);
+        friend_removed_del(id);  // (a player we removed, added again: out of the removed list)
+        friends_save_locked();
+        // (adding a player we rejected takes them back; their request, if any, is answered by this)
+        id_remove(F.rejected, &F.nrejected, id);
+        for (int i = 0; i < F.nreq; i++)
+            if (!memcmp(F.req_ids[i], id, FRIEND_LEN)) {
+                memmove(&F.req[i], &F.req[i + 1], (size_t)(F.nreq - i - 1) * sizeof F.req[0]);
+                memmove(F.req_ids[i], F.req_ids[i + 1], (size_t)(F.nreq - i - 1) * FRIEND_LEN);
+                F.nreq--;
+                break;
+            }
+    }
+    pthread_mutex_unlock(&friends_mu);
+    if (!why) friends_poke();
+    return why;
+}
+
+// The removed list (friends_mu held): a player in (with the name they had; full: the oldest goes), or out
+static void friend_removed_add(const uint8_t *id, const char *name) {
+    for (int i = 0; i < F.nremoved; i++)
+        if (!memcmp(F.removed[i], id, FRIEND_LEN)) return;
+    if (F.nremoved == FRIENDS_REMOVED_MAX) {
+        memmove(F.removed[0], F.removed[1], (FRIENDS_REMOVED_MAX - 1) * FRIEND_LEN);
+        memmove(F.removed_names[0], F.removed_names[1], (FRIENDS_REMOVED_MAX - 1) * sizeof F.removed_names[0]);
+        F.nremoved--;
+    }
+    snprintf(F.removed_names[F.nremoved], sizeof F.removed_names[0], "%s", name);
+    memcpy(F.removed[F.nremoved++], id, FRIEND_LEN);
+}
+static bool friend_removed_del(const uint8_t *id) {
+    for (int i = 0; i < F.nremoved; i++)
+        if (!memcmp(F.removed[i], id, FRIEND_LEN)) {
+            memmove(F.removed[i], F.removed[i + 1], (size_t)(F.nremoved - i - 1) * FRIEND_LEN);
+            memmove(F.removed_names[i], F.removed_names[i + 1], (size_t)(F.nremoved - i - 1) * sizeof F.removed_names[0]);
+            F.nremoved--;
+            return true;
+        }
+    return false;
+}
+// friends_mu held: a friend out of the list (and saved); false: not in it
+static bool friend_drop_locked(const uint8_t *id) {
+    for (int i = 0; i < F.n; i++)
+        if (!memcmp(id, F.ids[i], FRIEND_LEN)) {
+            memmove(&F.list[i], &F.list[i + 1], (size_t)(F.n - i - 1) * sizeof F.list[0]);
+            memmove(F.ids[i], F.ids[i + 1], (size_t)(F.n - i - 1) * FRIEND_LEN);
+            F.n--;
+            return true;
+        }
+    return false;
+}
+
+// Removing a friend: out of the list, into the removed list (kept in friends.txt): their request is not shown again
+// (their game may still list us: that would come back as one) until we add them ourselves, and the hub server tells
+// their game, which drops us too.
+void ldn_friend_remove(const char *code) {
+    uint8_t id[FRIEND_LEN];
+    if (!friend_parse(code, id)) return;
+    pthread_mutex_lock(&friends_mu);
+    for (int i = 0; i < F.n; i++)
+        if (!memcmp(id, F.ids[i], FRIEND_LEN)) {
+            friend_removed_add(id, F.list[i].name);
+            friend_drop_locked(id);
+            friends_save_locked();
+            break;
+        }
+    pthread_mutex_unlock(&friends_mu);
+    friends_poke();
+}
+
+int ldn_friend_requests(LdnRequest *out, int max) {
+    pthread_mutex_lock(&friends_mu);
+    int n = config_live_friend_requests() ? (F.nreq < max ? F.nreq : max) : 0;
+    memcpy(out, F.req, (size_t)n * sizeof *out);
+    pthread_mutex_unlock(&friends_mu);
+    return n;
+}
+
+// Accept: the player is added (with the name their request showed). Reject: out of the requests until the game
+// restarts (or until we add them ourselves).
+void ldn_friend_request_answer(const char *code, bool accept) {
+    uint8_t id[FRIEND_LEN];
+    if (!friend_parse(code, id)) return;
+    char name[33] = "";
+    pthread_mutex_lock(&friends_mu);
+    for (int i = 0; i < F.nreq; i++)
+        if (!memcmp(F.req_ids[i], id, FRIEND_LEN)) {
+            snprintf(name, sizeof name, "%s", F.req[i].name);
+            memmove(&F.req[i], &F.req[i + 1], (size_t)(F.nreq - i - 1) * sizeof F.req[0]);
+            memmove(F.req_ids[i], F.req_ids[i + 1], (size_t)(F.nreq - i - 1) * FRIEND_LEN);
+            F.nreq--;
+            break;
+        }
+    if (!accept) id_add(F.rejected, &F.nrejected, 64, id);
+    pthread_mutex_unlock(&friends_mu);
+    if (accept) {
+        char typed[64];
+        snprintf(typed, sizeof typed, "%s %s", code, name);
+        ldn_friend_add(typed);
+    }
+    LOG("[ldn] friend request %s\n", accept ? "accepted" : "rejected (until the game restarts)");
+}
+
+int ldn_hub_hunters(LdnHunter *out, int max) {
+    pthread_mutex_lock(&friends_mu);
+    int n = 0;
+    for (int i = 0; i < F.nhunters && n < max; i++) {
+        LdnHunter *h = &out[n++];
+        char t[17];
+        friend_text(F.hunters[i].id, t);
+        friend_shown(t, h->code, sizeof h->code);
+        snprintf(h->name, sizeof h->name, "%s", F.hunters[i].name[0] ? F.hunters[i].name : h->code);
+        h->state = LDN_HUNTER_ADD;
+        for (int k = 0; k < F.n; k++)
+            if (!memcmp(F.ids[k], F.hunters[i].id, FRIEND_LEN)) h->state = F.list[k].mutual ? LDN_HUNTER_FRIEND : LDN_HUNTER_ADDED;
+    }
+    pthread_mutex_unlock(&friends_mu);
+    return n;
+}
+
+// An account id from a friend code: SHA-256("MHGURecomp account:" + code), the first 8 bytes (little endian), never 0
+// nor the id every game had before version 4 (0x1234567890abcdef). The hub's advertise data carries its host's at
+// 0x14, and the game compares its friends' ids with it.
+static uint64_t account_of(const uint8_t *id) {
+    Sha256 s;
+    char hex[65];
+    sha256_init(&s);
+    sha256_update(&s, "MHGURecomp account:", 19);
+    sha256_update(&s, id, FRIEND_LEN);
+    sha256_hex(&s, hex);
+    uint64_t v = 0;
+    for (int i = 7; i >= 0; i--) {
+        unsigned b;
+        sscanf(hex + 2 * i, "%2x", &b);
+        v = v << 8 | b;
+    }
+    if (!v || v == 0x1234567890abcdefull) v ^= 0x8000000000000001ull;
+    return v;
+}
+
+uint64_t ldn_account_id(void) {
+    pthread_mutex_lock(&friends_mu);
+    friends_load_locked();
+    uint64_t v = account_of(F.id);
+    pthread_mutex_unlock(&friends_mu);
+    return v;
+}
+
+// The game's friends: those in our list the hub server has told us list us back (adding a code alone doesn't make
+// someone a friend to the game: that would let them past a friends-only passcode one-sidedly). names (may be NULL):
+// the names in our list.
+int ldn_game_friends(uint64_t *ids, char (*names)[33], int max) {
+    pthread_mutex_lock(&friends_mu);
+    friends_load_locked();
+    int n = 0;
+    for (int i = 0; i < F.n && n < max; i++)
+        if (F.list[i].mutual) {
+            if (names) snprintf(names[n], sizeof names[n], "%s", F.list[i].name);
+            ids[n++] = account_of(F.ids[i]);
+        }
+    pthread_mutex_unlock(&friends_mu);
+    return n;
+}
+int ldn_friend_account_ids(uint64_t *out, int max) { return ldn_game_friends(out, NULL, max); }
 
 static bool host_start(void) {
     hnet_init();
@@ -1496,6 +2581,8 @@ static bool host_start(void) {
 
 static void host_stop(uint32_t reason) {  // (caller: not holding L.mu)
     lobby_host_stop();
+    __atomic_store_n(&gap_tx, 0, __ATOMIC_RELAXED);
+    for (int i = 0; i < MAX_NODES; i++) __atomic_store_n(&gap_rx[i], 0, __ATOMIC_RELAXED);
     if (L.hosting) {
         L.hosting = false;
         pthread_join(L.host_th, NULL);
@@ -1535,6 +2622,8 @@ static void *uplink_thread(void *arg) {
             emsync_aux_received(buf, (uint32_t)n);
             hpscale_aux_received(buf, (uint32_t)n);
             hitsync_aux_received(buf, (uint32_t)n);
+            partsync_aux_received(buf, (uint32_t)n);
+            friends_aux_received(buf, (uint32_t)n);
         }
     }
     L.uth_run = false;
@@ -1649,7 +2738,10 @@ static void station_leave(void) {  // (caller: not holding L.mu)
     }
     L.up.udp_up = false;
     L.up.p_up = L.up.p_known = false;
+    L.joined_code[0] = 0;
+    __atomic_store_n(&gap_tx, 0, __ATOMIC_RELAXED), __atomic_store_n(&gap_rx[0], 0, __ATOMIC_RELAXED);
     vsock_network_down();
+    friends_poke();
 }
 
 // Hosts to ask: ini Join (comma separated host[:port]) and this computer.
@@ -1672,7 +2764,7 @@ static int discover(uint8_t (*infos)[NETINFO_SIZE], struct sockaddr_in *addrs, i
     static __thread uint8_t buf[MAX_FRAME];
     struct sockaddr_in targets[8];
     int nt = scan_addresses(targets, 8);
-    Hello h = make_hello(true, NULL);
+    Hello h = make_hello(true, NULL, PROTO_MIN);  // (every host of 3 or 4 answers 3)
     for (int i = 0; i < nt && n < max; i++) {
         hsock s = connect_to(&targets[i], 1500);
         if (s == BADSOCK) continue;
@@ -1691,7 +2783,7 @@ static int discover(uint8_t (*infos)[NETINFO_SIZE], struct sockaddr_in *addrs, i
     setsockopt(u, SOL_SOCKET, SO_BROADCAST, (const char *)&one, sizeof one);
     uint8_t probe[8];
     memcpy(probe, PROTO_MAGIC, 4);
-    wr16(probe + 4, PROTO_VERSION);
+    wr16(probe + 4, PROTO_MIN);  // (hosts of 3 and of 4 answer it)
     wr16(probe + 6, 0);
     struct sockaddr_in to = {0};
     to.sin_family = AF_INET;
@@ -1711,7 +2803,7 @@ static int discover(uint8_t (*infos)[NETINFO_SIZE], struct sockaddr_in *addrs, i
         struct sockaddr_in from;
         socklen_t fl = sizeof from;
         int k = recvfrom(u, (char *)buf, MAX_FRAME, 0, (struct sockaddr *)&from, &fl);
-        if (k < 8 + NETINFO_SIZE || memcmp(buf, PROTO_MAGIC, 4) || rd16(buf + 4) != PROTO_VERSION) continue;
+        if (k < 8 + NETINFO_SIZE || memcmp(buf, PROTO_MAGIC, 4) || !link_version_ok(rd16(buf + 4))) continue;
         bool dup = false;
         for (int i = 0; i < n; i++) dup |= !memcmp(infos[i] + NI_BSSID, buf + 8 + NI_BSSID, 6);
         if (dup) continue;
@@ -2063,6 +3155,7 @@ HLE_FUNC("_ZN2nn3ldn10InitializeEv", ldn_initialize) { NTRACE(); LDN_CALL();
 
 static void to_initialized(void) {
     int st = L.state;
+    if (st > ST_INITIALIZED) __atomic_store_n(&g_net_left_ns, plat_now_ns(), __ATOMIC_RELEASE);  // (ldn_offline)
     if (L.ryu || L.room) {
         if (L.ryu) ryu_stop();
         else room_stop();
@@ -2213,6 +3306,8 @@ static uint32_t create_network(const uint8_t *cfg, const uint8_t *sec, const uin
     uint64_t auth = ((uint64_t)arc4random() << 32) | arc4random();
     memcpy(L.info + NI_AUTH_ID, &auth, 8);
     for (int i = 0; i < MAX_NODES; i++) link_reset(&L.nodes[i]);
+    code_new(L.code);  // (kept for the network's life: a code shared goes on working when the hub lists again)
+    L.code_listed = false;
     pthread_mutex_unlock(&L.mu);
     if (via_room) L.room = true;
     else host_start();
@@ -2347,9 +3442,27 @@ HLE_FUNC("_ZN2nn3ldn4ScanEPNS0_11NetworkInfoEPiiRKNS0_10ScanFilterEi", ldn_scan)
     static uint8_t infos[MAX_FOUND][NETINFO_SIZE];
     struct sockaddr_in addrs[MAX_FOUND];
     uint64_t hubs[MAX_FOUND] = {0};
+    uint16_t vers[MAX_FOUND];
+    static char codes[MAX_FOUND][CODE_LEN + 1];
+    for (int i = 0; i < MAX_FOUND; i++) vers[i] = PROTO_MIN, codes[i][0] = 0;  // (LAN / address hosts: 3 takes them all)
     hnet_init();  // (before the thread's first socket call)
     ScanList *sl = scan_list_start();
-    int n = discover(infos, addrs, 16), k = 0;
+    int n = 0, k = 0;
+    // a hub found by its code (Join by code) comes first, so the player sees it at the top of Join Hub
+    pthread_mutex_lock(&invite_mu);
+    if (invite.state == LDN_INVITE_READY && plat_now_ns() - invite.at <= INVITE_KEEP_NS) {
+        memcpy(infos[0], invite.info, NETINFO_SIZE);
+        addrs[0] = invite.addr, hubs[0] = invite.hub, vers[0] = invite.ver;
+        snprintf(codes[0], sizeof codes[0], "%s", invite.code);
+        n = 1;
+    }
+    pthread_mutex_unlock(&invite_mu);
+    int lan = discover(infos + n, addrs + n, 16), invited = n;
+    for (int i = invited; i < invited + lan; i++) {  // (the invited hub found on the LAN too: once, the invite's way)
+        if (invited && !memcmp(infos[i] + NI_BSSID, infos[0] + NI_BSSID, 6)) continue;
+        if (i != n) memcpy(infos[n], infos[i], NETINFO_SIZE), addrs[n] = addrs[i];
+        n++;
+    }
     int ryu_of[MAX_FOUND] = {0};  // a lobby found on a Ryujinx server: its index + 1
     bool room_of[MAX_FOUND] = {0};  // found in the suyu-family room
     const LobbyList *online = sl && scan_list_wait(sl) ? &sl->r : NULL;
@@ -2360,6 +3473,8 @@ HLE_FUNC("_ZN2nn3ldn4ScanEPNS0_11NetworkInfoEPiiRKNS0_10ScanFilterEi", ldn_scan)
             if (dup) continue;
             memcpy(infos[n], online->infos[j], NETINFO_SIZE);
             addrs[n] = online->addr;
+            vers[n] = online->vers[j];
+            snprintf(codes[n], sizeof codes[n], "%s", online->codes[j]);
             hubs[n++] = online->ids[j];
         }
     }
@@ -2401,6 +3516,8 @@ HLE_FUNC("_ZN2nn3ldn4ScanEPNS0_11NetworkInfoEPiiRKNS0_10ScanFilterEi", ldn_scan)
         memcpy(found[nfound].bssid, infos[i] + NI_BSSID, 6);
         memcpy(found[nfound].session, infos[i] + NI_SESSION_ID, 16);
         found[nfound].hub = hubs[i];
+        found[nfound].ver = vers[i];
+        snprintf(found[nfound].code, sizeof found[nfound].code, "%s", codes[i]);
         found[nfound++].addr = addrs[i];
         if (k < max) memcpy((uint8_t *)G2H(out) + (size_t)k++ * NETINFO_SIZE, infos[i], NETINFO_SIZE);
     }
@@ -2465,14 +3582,14 @@ static uint32_t connect_network(const uint8_t *info, const uint8_t *user, uint16
     uint32_t pair = 0;
     uint64_t secret = 0;
     if (found[i].hub) {
-        uint32_t r = lobby_join(&found[i].addr, found[i].hub, &s, &pair, &secret);
+        uint32_t r = lobby_join(&found[i].addr, found[i].hub, found[i].code, &s, &pair, &secret);
         if (r) return r;
     } else if ((s = connect_to(&found[i].addr, 3000)) == BADSOCK) {
         LOG("[ldn] can't reach the host at %s\n", inet_ntoa(found[i].addr.sin_addr));
         return R_CONNECT_TIMEOUT;
     }
     L.lcv = lcv;
-    Hello h = make_hello(false, user);
+    Hello h = make_hello(false, user, found[i].ver ? found[i].ver : PROTO_MIN);
     static uint8_t buf[MAX_FRAME];
     uint8_t type;
     int n;
@@ -2502,6 +3619,7 @@ static uint32_t connect_network(const uint8_t *info, const uint8_t *user, uint16
     L.up.token = rd32(buf + 4), L.up.udp_up = false, L.up.udp_rx_ns = 0;
     L.up.relay_pair = pair, L.up.relay_secret = secret;
     L.up.uaddr = found[i].addr;
+    snprintf(L.joined_code, sizeof L.joined_code, "%s", pair ? found[i].code : "");
     direct_reset(&L.up, config_live_ldn_direct());
     L.state = ST_STATION_CONNECTED, L.reason = DR_NONE;
     pthread_mutex_unlock(&L.mu);
@@ -2523,6 +3641,12 @@ static uint32_t connect_network(const uint8_t *info, const uint8_t *user, uint16
     if (pair) LOG("[ldn] joined a hub through the hub server as %s (node %d)%s\n", ipstr(L.own_ip), node,
                   L.up.direct_ok ? "" : " (Direct = Off: game packets only through the server)");
     else LOG("[ldn] joined %s's network as %s (node %d)\n", inet_ntoa(found[i].addr.sin_addr), ipstr(L.own_ip), node);
+    if (found[i].hub) {  // (the invite is used: the hub stops coming first)
+        pthread_mutex_lock(&invite_mu);
+        if (invite.state == LDN_INVITE_READY && invite.hub == found[i].hub) invite.state = LDN_INVITE_NONE;
+        pthread_mutex_unlock(&invite_mu);
+    }
+    friends_poke();
     signal_change();
     return 0;
 }
@@ -2556,6 +3680,9 @@ HLE_FUNC("_ZN2nn3ldn14ConnectPrivateERKNS0_13NetworkConfigERKNS0_14SecurityConfi
 
 HLE_FUNC("_ZN2nn3ldn10DisconnectEv", ldn_disconnect) { NTRACE(); LDN_CALL();
     if (L.state != ST_STATION_CONNECTED && L.state != ST_ERROR) { RET(R_INVALID_STATE); return; }
+    if (L.state == ST_STATION_CONNECTED && !L.ryu && !L.room)  // (a menu choice, or Pia's connection check: "Connection lost")
+        LOG("[ldn] the game ended its connection to the host: its last game packet sent %.1f s ago, received %.1f s ago\n",
+            gap_since(&gap_tx), gap_since(&gap_rx[0]));
     if (L.ryu) ryu_stop();
     else if (L.room) room_stop();
     else station_leave();

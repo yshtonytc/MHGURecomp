@@ -459,13 +459,14 @@ static void test_all_buttons(void) {
             for (int j = 0; j < k; j++) CHECK(ids[j] != ids[k], "%s listed twice", act_name(ids[k]));
             int v = view == ACT_VIEW_MB1 ? ACT_VIEW_HUNT_ANY : view;
             bool bar_action = ids[k] == ACT_ITEMBAR_RIGHT || ids[k] == ACT_ITEMBAR_LEFT;  // (only while the bar is open)
+            bool confirm_action = ids[k] == ACT_OPEN_TALK;  // (only at a confirm target: test_confirm_target)
             uint32_t w = act_view(v, 0xFFFF | 0x10000, 1ull << ids[k], false);
-            CHECK(w == ((bar_action ? 0u : act_ew_bits(ids[k], false)) | 0x10000), "%s alone: %x", act_name(ids[k]), w);
+            CHECK(w == (((bar_action || confirm_action) ? 0u : act_ew_bits(ids[k], false)) | 0x10000), "%s alone: %x", act_name(ids[k]), w);
             if (bar_action) {
                 w = act_view(v | ACT_VIEW_BAR, 0x10000, 1ull << ids[k], false);
                 CHECK(w == (act_ew_bits(ids[k], false) | 0x10000), "%s alone, bar open: %x", act_name(ids[k]), w);
             }
-            all |= bar_action ? act_ew_bits(ids[k], false) : w;
+            all |= (bar_action || confirm_action) ? act_ew_bits(ids[k], false) : w;
         }
         int count = 0;
         for (int i = 0; i < ACT_COUNT; i++) count += act_view_of(i) == view;
@@ -902,7 +903,8 @@ static void test_menu_confirm_policy(void) {
     CHECK(act_menu_confirm_policy() == -1, "layer off: own setting");
 }
 
-// Crouch never fires while the left stick is pushed (split from Dodge), with the weapon out or away
+// Crouch never fires while the left stick is pushed (split from Dodge), with the weapon out or away; on an input of its
+// own it never fires with the weapon out (no crouching then: B would be a dodge)
 static void test_crouch_not_moving(void) {
     ActProfile p = parse("[Actions]\nEnable=1\n[Actions.Pad]\nCrouch = pad:west\nDodge = pad:south\n");
     act_use_profile(&p);
@@ -911,7 +913,8 @@ static void test_crouch_not_moving(void) {
     int views[] = {ACT_VIEW_MB1, ACT_VIEW_SHEATHED, ACT_VIEW_HUNT_ANY};
     for (int i = 0; i < 3; i++) {
         uint32_t standing = act_view(views[i], 0, crouch, false), moving = act_view(views[i], stick, crouch, false);
-        CHECK(standing & 0x4000, "view %d: Crouch standing gives B: %x", views[i], standing);
+        if (views[i] == ACT_VIEW_MB1) CHECK(!(standing & 0x4000), "weapon out: Crouch standing gives no B (no dodge): %x", standing);
+        else CHECK(standing & 0x4000, "view %d: Crouch standing gives B: %x", views[i], standing);
         CHECK(!(moving & 0x4000), "view %d: Crouch with the stick pushed gives no B: %x", views[i], moving);
         CHECK(act_view(views[i], stick, dodge, false) & 0x4000, "view %d: Dodge with the stick pushed gives B (the roll)", views[i]);
     }
@@ -925,6 +928,188 @@ static void test_crouch_not_moving(void) {
     for (int i = 0; i < 3; i++)
         CHECK(act_view(views[i], stick, crouch | dodge, false) & 0x4000, "view %d: auto split, Dodge's input still rolls while moving", views[i]);
     CHECK(act_view(ACT_VIEW_MB1, stick, crouch, false) & 0x4000, "auto split, weapon out: Crouch following Dodge is not stopped while moving");
+}
+
+// Crouch and AttackA on one input (a player's report: AttackA east, Dodge + Interact south, Crouch east): crouch with the
+// weapon away, attack with it out, not a conflict; with SheathedAttackA=1 they clash again
+static void test_crouch_attack_a(void) {
+    int E = ACT_PAD + SDL_GAMEPAD_BUTTON_EAST, S = ACT_PAD + SDL_GAMEPAD_BUTTON_SOUTH;
+    const uint32_t MOVING = 0x10000;
+    ActSnap s;
+    ActHost h = (ActHost){NULL, fake_held, map_sources, 0, 0, false, false, 700};
+    #define SAMPLE(code) do { release_all(); press(code); h.sw_word = map_word(); act_sample(&h, &s); } while (0)
+    #define VIEW(view, ew) act_view((view), (ew), s.hold[0], false)
+    const char *ini = "[Actions]\nEnable=1\n[Actions.Pad]\nAttackA = pad:east\nCrouch = pad:east\nDodge = pad:south\nInteract = pad:south\n";
+    ActProfile p = parse(ini);
+    act_use_profile(&p);
+    SAMPLE(E);
+    CHECK(VIEW(ACT_VIEW_SHEATHED, 0) == 0x4000, "weapon away, standing: east crouches (B only): %x", VIEW(ACT_VIEW_SHEATHED, 0));
+    CHECK(VIEW(ACT_VIEW_MB1, 0) == 0x2000, "weapon out: east is Attack A only, no dodge: %x", VIEW(ACT_VIEW_MB1, 0));
+    CHECK(VIEW(ACT_VIEW_MB1, MOVING) == (MOVING | 0x2000), "weapon out, moving: Attack A: %x", VIEW(ACT_VIEW_MB1, MOVING));
+    SAMPLE(S);
+    CHECK(VIEW(ACT_VIEW_SHEATHED, 0) == 0x2000, "weapon away, standing: south gathers: %x", VIEW(ACT_VIEW_SHEATHED, 0));
+    CHECK(VIEW(ACT_VIEW_MB1, 0) == 0x4000, "weapon out: south dodges: %x", VIEW(ACT_VIEW_MB1, 0));
+    act_set_log(collect);
+    logbuf[0] = 0;
+    act_validate(&p);
+    CHECK(!strstr(logbuf, "Crouch"), "no conflict reported for Crouch: %s", logbuf);
+    act_set_log(quiet);
+    int crouch = row_named("Crouch"), attacka = row_named("AttackA");
+    CHECK(!act_rows_clash(&p, 0, crouch, attacka), "Simple: Crouch and AttackA rows don't clash");
+    // binding Crouch to east in Simple leaves AttackA its east
+    p = parse("[Actions]\nEnable=1\n[Actions.Pad]\nAttackA = pad:east\nDodge = pad:south\nInteract = pad:south\n");
+    act_row_claim(&p, 0, crouch, E, NULL, NULL, false);
+    int from = ACT_ATTACK_A;
+    const ActBinding *b = act_effective(&p, 0, ACT_ATTACK_A, 0, &from);
+    CHECK(b && b->n == 1 && b->alt[0].code[0] == E, "claiming east for Crouch leaves AttackA on east");
+    // SheathedAttackA: AttackA presses A with the weapon away too, so the two clash
+    p = parse("[Actions]\nEnable=1\nSheathedAttackA=1\n[Actions.Pad]\nAttackA = pad:east\nCrouch = pad:east\nDodge = pad:south\nInteract = pad:south\n");
+    CHECK(p.sheathed_attack, "(SheathedAttackA parsed)");
+    CHECK(act_rows_clash(&p, 0, crouch, attacka), "SheathedAttackA: Crouch and AttackA clash");
+    act_set_log(collect);
+    logbuf[0] = 0;
+    act_validate(&p);
+    CHECK(strstr(logbuf, "conflict: AttackA and Crouch") || strstr(logbuf, "conflict: Crouch and AttackA"), "and it is said: %s", logbuf);
+    act_set_log(quiet);
+    #undef SAMPLE
+    #undef VIEW
+}
+
+// The Hunter Arts on keys of their own: the switch in the ini, the keyboard's defaults, and an Art's input never shared
+// in Simple (a press asks the game for the Art itself: hle/input_view.c, tested in a hunt)
+static void test_hunter_arts(void) {
+    CHECK(act_find("HunterArt2") == ACT_ART2 && act_view_of(ACT_ART1) == ACT_VIEW_MB1, "registered, in the hunt");
+    CHECK(act_ew_bits(ACT_ART1, false) == 0, "no button of its own");
+    ActProfile p = parse("[Actions]\nEnable=1\n");
+    act_use_profile(&p);
+    CHECK(!p.art_keys && !act_art_keys(), "off unless asked for");
+    p = parse("[Actions]\nEnable=1\nHunterArtKeys=1\n");
+    act_use_profile(&p);
+    CHECK(p.art_keys && act_art_keys(), "HunterArtKeys=1");
+    char buf[4096];
+    act_format(&p, buf, sizeof buf);
+    CHECK(strstr(buf, "HunterArtKeys=1"), "written back: %s", buf);
+    const ActBinding *k = act_default_binding(ACT_ART3, 1);
+    CHECK(k && k->n == 1 && k->alt[0].code[0] == SDL_SCANCODE_3, "keyboard default: 3");
+    CHECK(!act_default_binding(ACT_ART1, 0), "no controller default");
+    int art1 = row_named("HunterArt1"), dodge = row_named("Dodge"), interact = row_named("Interact");
+    CHECK(art1 >= 0, "a Simple row");
+    p = parse("[Actions]\nEnable=1\nHunterArtKeys=1\n[Actions.Kbm]\nHunterArt1 = key:f\nDodge = key:f\nInteract = key:f\n");
+    CHECK(act_rows_clash(&p, 1, art1, dodge) && act_rows_clash(&p, 1, art1, interact), "an Art's input is its own");
+    act_set_log(quiet);
+}
+
+// The confirm key (ConfirmTargets): A is the roll unless the hunter stands by an interactable whose category is listed,
+// and there A confirms while the roll gives the bit up. Interact (the function key) works everywhere, and with the
+// weapon out nothing changes.
+static void test_confirm_target(void) {
+    int S = ACT_PAD + SDL_GAMEPAD_BUTTON_SOUTH, N = ACT_PAD + SDL_GAMEPAD_BUTTON_NORTH;
+    ActProfile p = parse("[Actions]\nEnable=1\nConfirmTargets=5,9\nTargetLog=1\n[Actions.Pad]\nOpenTalk = pad:south\n"
+                         "Dodge = pad:south\nInteract = pad:north\n");
+    CHECK(p.confirm_mask == ((1ull << 5) | (1ull << 9)), "ConfirmTargets parsed: %llx", (unsigned long long)p.confirm_mask);
+    CHECK(p.target_log, "TargetLog parsed");
+    char text[1024];
+    act_format(&p, text, sizeof text);
+    CHECK(strstr(text, "ConfirmTargets=5,9"), "ConfirmTargets written: %s", text);
+    CHECK(strstr(text, "TargetLog=1"), "TargetLog written: %s", text);
+    act_use_profile(&p);
+    CHECK(act_target_log(), "TargetLog in use");
+    char targets[64];
+    uint64_t rt = 0;
+    act_format_targets(p.confirm_mask, targets, sizeof targets);
+    CHECK(!strcmp(targets, "5,9"), "act_format_targets: %s", targets);
+    CHECK(act_parse_targets("5, 9", &rt) && rt == p.confirm_mask, "act_parse_targets");
+    act_parse_targets("", &rt);
+    CHECK(rt == 0, "empty targets");
+    // (a frame far past every act_inject the earlier tests left behind: those would be held here otherwise)
+    ActHost h = host_for(0, false, 1000000);
+    ActSnap s;
+    // nothing to interact with, and a gather point (1 is not listed): A is the roll
+    act_set_target(0);
+    release_all(), press(S), act_sample(&h, &s);
+    CHECK(act_view(ACT_VIEW_SHEATHED, 0, s.hold[0], false) == 0x4000, "no target: A is the roll: %x",
+          act_view(ACT_VIEW_SHEATHED, 0, s.hold[0], false));
+    act_set_target(1);
+    CHECK(act_view(ACT_VIEW_SHEATHED, 0, s.hold[0], false) == 0x4000, "a gather point: A is still the roll");
+    // the supply box (5): A confirms and the roll drops the bit
+    act_set_target(5);
+    CHECK(act_view(ACT_VIEW_SHEATHED, 0, s.hold[0], false) == 0x2000, "a box: A confirms: %x",
+          act_view(ACT_VIEW_SHEATHED, 0, s.hold[0], false));
+    // the interact key gives the target up: at a box only the open/talk key presses A
+    release_all(), press(N), act_sample(&h, &s);
+    CHECK(act_view(ACT_VIEW_SHEATHED, 0, s.hold[0], false) == 0, "a box: the interact key does not press A");
+    // ... and away from an open/talk target it is the interact key that presses A
+    act_set_target(1);
+    CHECK(act_view(ACT_VIEW_SHEATHED, 0, s.hold[0], false) == 0x2000, "a gather point: the interact key presses A");
+    // weapon out: A is the roll as before (nothing confirms with it out)
+    act_set_target(5);
+    release_all(), press(S), act_sample(&h, &s);
+    CHECK(act_view(ACT_VIEW_MB1, 0, s.hold[0], false) == 0x4000, "weapon out: A is the roll at a box too");
+    // the confirm key on an input of its own: the roll keeps its own input, even at a box
+    ActProfile alt = parse("[Actions]\nEnable=1\nConfirmTargets=5\n[Actions.Pad]\nOpenTalk = pad:north\nDodge = pad:south\n");
+    act_use_profile(&alt);
+    act_set_target(5);
+    release_all(), press(S), act_sample(&h, &s);
+    CHECK(act_view(ACT_VIEW_SHEATHED, 0, s.hold[0], false) == 0x4000, "confirm on another input: A still rolls at a box");
+    release_all(), press(N), act_sample(&h, &s);
+    CHECK(act_view(ACT_VIEW_SHEATHED, 0, s.hold[0], false) == 0x2000, "confirm on its own input: it confirms");
+    // the confirm key does not take its input from the roll's default: on one input both are read, the target decides
+    ActProfile one = parse("[Actions]\nEnable=1\nConfirmTargets=5\n");
+    one.dev[0].base[ACT_OPEN_TALK].set = true, one.dev[0].base[ACT_OPEN_TALK].n = 1;
+    one.dev[0].base[ACT_OPEN_TALK].alt[0].n = 1;
+    one.dev[0].base[ACT_OPEN_TALK].alt[0].code[0] = ACT_PAD + 20 + 1;  // the fake controller's Switch B source
+    act_use_profile(&one);
+    ActHost hb = host_for(1ull << 1, false, 1000000);  // Switch B held, as the game has it on Dodge's default
+    act_set_target(0);
+    release_all(), press(ACT_PAD + 20 + 1), act_sample(&hb, &s);
+    CHECK((s.hold[0] >> ACT_DODGE & 1) && (s.hold[0] >> ACT_OPEN_TALK & 1), "one input: the roll and the confirm both read");
+    CHECK(act_view(ACT_VIEW_SHEATHED, 0, s.hold[0], false) == 0x4000, "one input, no target: the roll");
+    act_set_target(5);
+    CHECK(act_view(ACT_VIEW_SHEATHED, 0, s.hold[0], false) == 0x2000, "one input, a box: the confirm");
+    // OpenTalkAlsoInteract: both keys press A at an open/talk target
+    ActProfile both = parse("[Actions]\nEnable=1\nConfirmTargets=5\nOpenTalkAlsoInteract=1\n[Actions.Pad]\nOpenTalk = pad:south\nDodge = pad:south\nInteract = pad:north\n");
+    act_use_profile(&both);
+    act_set_target(5);
+    release_all(), press(N), act_sample(&h, &s);
+    CHECK(act_view(ACT_VIEW_SHEATHED, 0, s.hold[0], false) == 0x2000, "OpenTalkAlsoInteract: the interact key presses A at a box");
+    // empty ConfirmTargets: OpenTalk is off and everything is as before
+    ActProfile q = parse("[Actions]\nEnable=1\nConfirmTargets=\n[Actions.Pad]\nOpenTalk = pad:south\nDodge = pad:south\n");
+    act_use_profile(&q);
+    act_set_target(5);
+    release_all(), press(S), act_sample(&h, &s);
+    CHECK(act_view(ACT_VIEW_SHEATHED, 0, s.hold[0], false) == 0x4000, "empty ConfirmTargets: A is the roll even at a box");
+    // inis from before OpenTalk: no binding of its own, so no split (default ConfirmTargets) and the player's own
+    // interact input still opens, talks and sleeps
+    int W = ACT_PAD + SDL_GAMEPAD_BUTTON_WEST;
+    static const struct { const char *ini; int key; } old[] = {
+        {"[Actions]\nEnable=1\n[Actions.Pad]\nInteract = pad:north\n", 0},
+        {"[Actions]\nEnable=1\n[Actions.Pad]\nAttackA = pad:west\n", 1},  // (Interact follows AttackA)
+        {"[Actions]\nEnable=1\n[Actions.Pad]\nInteract = pad:north\nDodge = pad:south\n", 0},
+    };
+    for (unsigned k = 0; k < sizeof old / sizeof *old; k++) {
+        ActProfile o = parse(old[k].ini);
+        act_use_profile(&o);
+        for (int t = 0; t < 4; t++) {
+            static const uint32_t cats[] = {0, 1, 5, 13};
+            act_set_target(cats[t]);
+            release_all(), press(old[k].key ? W : N), act_sample(&h, &s);
+            uint32_t w = act_view(ACT_VIEW_SHEATHED, 0, s.hold[0], false);
+            CHECK(w == 0x2000, "old ini %u, OpenTalk unbound, category %u: the interact key presses A: %x", k, cats[t], w);
+        }
+    }
+    act_set_target(5);
+    release_all(), press(S), act_sample(&h, &s);
+    CHECK(act_view(ACT_VIEW_SHEATHED, 0, s.hold[0], false) == 0x4000, "old ini, Dodge on south: A still rolls at a box");
+    // the settings screen's list: numbers 1-63 and separators only
+    uint64_t m = 7;
+    CHECK(act_parse_targets(" 5, 9;13 ", &m) && m == ((1ull << 5) | (1ull << 9) | (1ull << 13)), "targets with separators");
+    CHECK(act_parse_targets("", &m) && m == 0, "empty targets: none");
+    m = 7;
+    CHECK(!act_parse_targets("5,x", &m) && !act_parse_targets("0", &m) && !act_parse_targets("64", &m) &&
+              !act_parse_targets("-5", &m) && !act_parse_targets("0x11", &m) && m == 7,
+          "bad targets refused, the list kept");
+    act_set_target(0);
+    act_set_log(quiet);
 }
 
 int main(void) {
@@ -946,6 +1131,9 @@ int main(void) {
     test_save();
     test_menu_confirm_policy();
     test_crouch_not_moving();
+    test_crouch_attack_a();
+    test_hunter_arts();
+    test_confirm_target();
     test_rows();
     test_claim();
     test_scheme_layout();

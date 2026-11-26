@@ -24,7 +24,8 @@
 // Which input: the button's action in the context on screen (the menus, a town, a hunt; actions.c), its binding for
 // the keyboard and mouse (its own, the one it follows, or the device's default: actions.c act_default_binding), else
 // what the settings' keybinds give that button (Tier 0). A key's name is drawn with the game's festa font (its first
-// glyph page, the letters measured from their ink), short: "SPC", "ENT", "F5", arrows as arrows.
+// glyph page, the letters measured from their ink; an HD font mod's, BC3 with 48 px letters, scaled to the game's 24 px),
+// short: "SPC", "ENT", "F5", arrows as arrows.
 //
 // Render thread (prompts_frame, at present; prompts_texture_seen from the texture upload).
 #include <math.h>
@@ -41,6 +42,7 @@
 #include "../hle.h"
 #include "../romfs.h"
 #include "../settings_panel.h"
+#include "chat.h"
 #include "input.h"
 #include "input_view.h"
 #include "menuptr.h"
@@ -56,12 +58,15 @@
 // A cell: its box in the sheet (what was the glyph's, cleared), the Switch button it is (or two: a pair of D-pad
 // directions, the button font's KEY_UD / KEY_RL). The picture is drawn 24 x 24, then fitted into the box.
 typedef struct { int x, y, w, h, btn, btn2; } Cell;
+// The chat key's cell: the button font's glyph 'o' (72, 216), which fontIcon names none of, so no text of the game draws
+// it; the chat key's prompt in the button guide does (runtime/hle/chat.c), with the key's cap on it whatever the device
+#define CHAT_CELL (16 + 3)
 #define G(x, y, b) {x, y, 24, 24, b, -1}  // (the button font's 24 x 24 cells)
 static const Cell font_cells[] = {
     G(0, 0, BTN_Y), G(24, 0, BTN_X), G(48, 0, BTN_B), G(72, 0, BTN_A), G(96, 0, BTN_L), G(0, 24, BTN_R),
     G(120, 24, BTN_ZL), G(144, 24, BTN_ZR), G(0, 72, BTN_PLUS), G(24, 72, BTN_MINUS), G(168, 24, BTN_LSTICK),
     G(192, 24, BTN_RSTICK), G(72, 24, BTN_UP), G(96, 24, BTN_RIGHT), G(0, 48, BTN_DOWN), G(24, 48, BTN_LEFT),
-    {48, 48, 24, 24, BTN_UP, BTN_DOWN}, {72, 48, 24, 24, BTN_RIGHT, BTN_LEFT},
+    {48, 48, 24, 24, BTN_UP, BTN_DOWN}, {72, 48, 24, 24, BTN_RIGHT, BTN_LEFT}, G(72, 216, CHAT_CELL),
 };
 #undef G
 // (the HUD sheets' boxes: each picture's ink, measured, and a texel around it)
@@ -270,41 +275,84 @@ static void region_encode(int sw, int sh, const uint8_t *rgba, uint8_t *data, in
 }
 
 // ------------------------------------------------------------------ the festa font's letters
-// (mip 0 of an RGBA8 block-linear page: textlayout.c's reading)
-static int page_alpha(const uint8_t *data, uint32_t w, uint32_t h, uint32_t x, uint32_t y) {
-    if (x >= w || y >= h) return 0;
-    uint32_t bh = 1;
-    while (bh < (h + 7) / 8 && bh < 16) bh <<= 1;
-    uint32_t gobs_w = (w * 4 + 63) / 64, bx = x * 4;
+// The first glyph page's mip 0, block-linear: RGBA8 (tex format 7: the game's, 1024 x 1024 with 24 px letters) or BC3
+// (0x17: an HD font mod's, e.g. the Korean patch's, with 48 px letters). The ink is the alpha.
+typedef struct { const uint8_t *data; uint32_t w, h, bh; bool bc3; } Page;
+static int g_font_px, g_font_fmt;  // (the font read: its letters' size and its page's format, for the log)
+static bool page_open(Page *p, const uint8_t *t, uint32_t size) {
+    int fmt = -1;
+    const uint8_t *d = tex_data(t, size, &p->w, &p->h, &fmt);
+    g_font_fmt = fmt;
+    if (!d || !p->w || !p->h || (fmt != 7 && fmt != 0x17) || (fmt == 0x17 && (p->w % 4 || p->h % 4))) return false;
+    p->data = d, p->bc3 = fmt == 0x17;
+    // (mip 0's bytes in its layout: rows of 64-byte GOBs, whole blocks of them high)
+    uint64_t row, rows, gob_rows;
+    if (p->bc3) row = ((uint64_t)p->w / 4 * 16 + 63) / 64 * 64, rows = p->h / 4, gob_rows = 8u << bh_log2((int)p->h);
+    else {
+        p->bh = 1;
+        while (p->bh < (p->h + 7) / 8 && p->bh < 16) p->bh <<= 1;
+        row = ((uint64_t)p->w * 4 + 63) / 64 * 64, rows = p->h, gob_rows = 8ull * p->bh;
+    }
+    return (uint64_t)(d - t) + row * ((rows + gob_rows - 1) / gob_rows * gob_rows) <= size;
+}
+static int page_alpha(const Page *p, uint32_t x, uint32_t y) {
+    if (x >= p->w || y >= p->h) return 0;
+    if (p->bc3) {
+        uint8_t px[16][4];
+        bc3_decode_block(p->data + block_off((int)p->w, (int)p->h, (int)(x / 4), (int)(y / 4)), px);
+        return px[(y % 4) * 4 + x % 4][3];
+    }
+    uint32_t bh = p->bh, gobs_w = (p->w * 4 + 63) / 64, bx = x * 4;  // (textlayout.c's reading)
     uint32_t off = (y / (8 * bh)) * gobs_w * bh * 512 + (bx / 64) * bh * 512 + ((y % (8 * bh)) / 8) * 512 +
                    ((bx % 64) / 32) * 256 + ((y % 8) / 2) * 64 + ((bx % 32) / 16) * 32 + (y % 2) * 16 + bx % 16;
-    return data[off + 3];
+    return p->data[off + 3];
 }
 static bool wanted_letter(uint32_t c) {
-    return (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || (c >= 0x2190 && c <= 0x2193) || strchr("[];,./-=`'\\#", (int)c);
+    return (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || (c >= 0x2190 && c <= 0x2193) || strchr("[];,./-=`'\\#!", (int)c);
 }
+// The letters wanted, from the first page. A font bigger than the game's (its tallest wanted cell over 24 px) is
+// scaled down to 24 px by area, so the drawing below works at the game's size for any font.
 static void load_font(FILE *f) {
     uint32_t gsize = 0, psize = 0;
     uint8_t *gfd = arc_entry(f, FONT_NAME, &gsize), *tex = arc_entry(f, PAGE_NAME, &psize);
-    uint32_t pw, ph;
-    int pfmt;
-    const uint8_t *page = tex ? tex_data(tex, psize, &pw, &ph, &pfmt) : NULL;
-    if (gfd && gsize >= 0x48 && !memcmp(gfd, "GFD", 4) && page && pfmt == 7) {
+    Page page;
+    bool gfd_ok = gfd && gsize >= 0x48 && !memcmp(gfd, "GFD", 4), page_ok = gfd_ok && tex && page_open(&page, tex, psize);
+    if (page_ok) {
         uint32_t count, name_len;
         memcpy(&count, gfd + 0x1c, 4), memcpy(&name_len, gfd + 0x44, 4);
-        uint32_t base = 0x48 + name_len + 1;
+        uint64_t base = 0x48 + (uint64_t)name_len + 1;
+        int tall = FONT_H;
+        for (uint32_t i = 0; i < count && base + 20ull * (i + 1) <= gsize; i++) {
+            uint32_t e[3];
+            memcpy(e, gfd + base + 20ull * i, 12);
+            int h = (int)((e[2] >> 12) & 0xfff);
+            if (wanted_letter(e[0]) && !(e[1] & 0xff) && h > tall && h <= 8 * FONT_H) tall = h;  // (first page only)
+        }
+        float k = (float)tall / FONT_H;  // (font texels a letter texel)
+        g_font_px = tall;
         for (uint32_t i = 0; i < count && base + 20ull * (i + 1) <= gsize && g_nletters < 160; i++) {
             uint32_t e[3];
-            memcpy(e, gfd + base + 20 * i, 12);
-            if (!wanted_letter(e[0]) || (e[1] & 0xff)) continue;  // (first page only)
+            memcpy(e, gfd + base + 20ull * i, 12);
+            if (!wanted_letter(e[0]) || (e[1] & 0xff)) continue;
             int x = (int)((e[1] >> 8) & 0xfff), y = (int)(e[1] >> 20), w = (int)(e[2] & 0xfff), h = (int)((e[2] >> 12) & 0xfff);
-            if (w > 32 || h > FONT_H) continue;
+            int lw = (int)ceilf((float)w / k - 0.001f), lh = (int)ceilf((float)h / k - 0.001f);
+            if (lw > 32 || lh > FONT_H) continue;
             Letter *l = &g_letters[g_nletters++];
-            l->code = e[0], l->w = w;
+            l->code = e[0], l->w = lw;
             memset(l->a, 0, sizeof l->a);
-            for (int r = 0; r < h; r++)
-                for (int cx = 0; cx < w; cx++) l->a[r * 32 + cx] = (uint8_t)page_alpha(page, pw, ph, (uint32_t)(x + cx), (uint32_t)(y + r));
+            for (int r = 0; r < lh; r++)
+                for (int cx = 0; cx < lw; cx++) {  // (the cell's texels this one covers, averaged; outside the cell: blank)
+                    float sx0 = (float)cx * k, sx1 = sx0 + k, sy0 = (float)r * k, sy1 = sy0 + k, acc = 0;
+                    for (int sy = (int)sy0; sy < (int)ceilf(sy1) && sy < h; sy++)
+                        for (int sx = (int)sx0; sx < (int)ceilf(sx1) && sx < w; sx++) {
+                            float wx = fminf((float)sx + 1, sx1) - fmaxf((float)sx, sx0), wy = fminf((float)sy + 1, sy1) - fmaxf((float)sy, sy0);
+                            if (wx > 0 && wy > 0) acc += (float)page_alpha(&page, (uint32_t)(x + sx), (uint32_t)(y + sy)) * wx * wy;
+                        }
+                    l->a[r * 32 + cx] = (uint8_t)fminf(acc / (k * k) + 0.5f, 255.0f);
+                }
         }
+    } else if (gfd_ok && tex) {
+        LOG("[prompts] festa font: glyph page %s not read (format 0x%x: RGBA8 0x7 and BC3 0x17 are)\n", PAGE_NAME, g_font_fmt);
     }
     free(gfd), free(tex);
 }
@@ -397,8 +445,8 @@ static void load_sheets(void) {
     FILE *f = path ? fopen(path, "rb") : NULL;
     if (f) load_font(f), fclose(f);
     g_ready = found ? 1 : -1;
-    LOG("[prompts] %d button glyph pictures read (sheets' versions: languages, arcs), %d letters of the festa font for keys' names\n",
-        found, g_nletters);
+    LOG("[prompts] %d button glyph pictures read (sheets' versions: languages, arcs), %d letters of the festa font for keys' names"
+        " (%d px, %s)\n", found, g_nletters, g_font_px, g_font_fmt == 0x17 ? "BC3" : g_font_fmt == 7 ? "RGBA8" : "not read");
 }
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 
@@ -464,8 +512,54 @@ static void melody_toggle(Cpu *c) {
     g_pause_menu = c->r[0];
     fnhook_call_original(c, FN_MELODY_TOGGLE);
 }
+// The Hunter Arts' panel on the HUD: a row per Art (0x84cfc0 its update, r0 the row, +0x88 the Art 0..2) shows that
+// Art's buttons by the Control Type (options +0x446c, 0..3) and the swaps (+0x446e R / ZR roles, +0x446f D-pad and
+// right stick): "ZL + X", "R + A + B", "ZL", a right stick or a D-pad direction. The row keeps the three bytes it was
+// laid out for (+0xd4..d6) and, when they change, plays the GUI sequence for its [type][Art] from one of four tables
+// (by the swaps; 0x183dfc8...), `bl 0x76e538` at 0x84d2a0 (row, its object +0xd0, sequence). Type 0 unswapped has a
+// picture each, D-pad up / right / down: 0xf42ad + the Art, in all four tables.
+// With the Arts on keys of their own (actions.c HunterArtKeys) shown for the keyboard, each row plays that D-pad
+// sequence whatever the type, and those three cells of the HUD's sheet carry the Arts' keys (prompts_frame): one key a
+// row. A row is laid out again when that changes (its +0xd4 made stale).
+#define FN_ART_ROW      0x84cfc0u
+#define FN_ROW_SEQ      0x76e538u
+#define ART_ROW_SEQ_LR  0x84d2a4u  // (the return address of the row's layout call)
+#define ROW_ART         0x88u
+#define ROW_TYPE_SEEN   0xd4u
+#define SEQ_DPAD        0xf42adu
+static volatile bool g_art_rows;  // the rows show the Arts' keys (prompts_frame, render thread; read on the game thread)
+static struct { uint32_t row; bool keys; } g_rows[8];  // (game thread) each row seen and how it was laid out last
+static int g_nrows;
+static int row_slot(uint32_t row) {
+    for (int i = 0; i < g_nrows; i++)
+        if (g_rows[i].row == row) return i;
+    return -1;
+}
+static void art_row(Cpu *c) {
+    uint32_t row = c->r[0];
+    int i = row_slot(row);
+    if (row && (i < 0 || g_rows[i].keys != g_art_rows)) ST8(row + ROW_TYPE_SEEN, 0xff);  // (no type: laid out again)
+    fnhook_call_next(c, FN_ART_ROW);
+}
+static void row_seq(Cpu *c) {
+    if (c->r[14] == ART_ROW_SEQ_LR) {
+        uint32_t row = c->r[0], art = LD32(row + ROW_ART);
+        bool keys = g_art_rows && art < 3;
+        if (keys) c->r[2] = SEQ_DPAD + art;
+        int i = row_slot(row);
+        if (i < 0) {  // (the HUD makes its rows anew for each hunt: the oldest one seen goes)
+            if (g_nrows < 8) i = g_nrows++;
+            else memmove(g_rows, g_rows + 1, sizeof g_rows[0] * 7), i = 7;
+            g_rows[i].row = row;
+        }
+        g_rows[i].keys = keys;
+    }
+    fnhook_call_next(c, FN_ROW_SEQ);
+}
 void prompts_init(void) {
     if (!fnhook_get(FN_MELODY_TOGGLE)) fnhook_set(FN_MELODY_TOGGLE, hle_register("prompts:melody_toggle", melody_toggle));
+    fnhook_set_outer(FN_ART_ROW, hle_register("prompts:art_row", art_row));
+    fnhook_set_outer(FN_ROW_SEQ, hle_register("prompts:row_seq", row_seq));
 }
 static bool melody_shown(void) {
     uint32_t pm = g_pause_menu;
@@ -547,6 +641,18 @@ static int key_label(int code, uint32_t out[3]) {
     for (const char *s = name; s && *s && n < 3; s++)
         if (*s != ' ') out[n++] = (uint32_t)(*s >= 'a' && *s <= 'z' ? *s - 32 : (uint8_t)*s);
     return n;
+}
+// The chat key's cap: the key's name on the player's layout (ChatKey's "/" is "-" on a Spanish or German keyboard,
+// "!" on a French one: issue #399), when it is one letter the font has; else its name as the other caps have it
+static int layout_label(int code, uint32_t out[3]) {
+    const char *n = code > 0 && code < SDL_SCANCODE_COUNT
+                        ? SDL_GetKeyName(SDL_GetKeyFromScancode((SDL_Scancode)code, SDL_KMOD_NONE, false)) : NULL;
+    uint32_t u = n ? (uint8_t)n[0] : 0;
+    if (u > ' ' && u < 0x80 && !n[1]) {
+        if (u >= 'a' && u <= 'z') u -= 32;
+        if (letter(u)) return out[0] = u, 1;
+    }
+    return key_label(code, out);
 }
 
 // The label's letters, scaled down into the cap's face (ink at most FACE_W x FACE_H, centred on it), dark
@@ -644,7 +750,7 @@ static bool draw_tile(uint8_t *tile, const Cell *c, int code, int code2) {
              : k == SRC_WHEEL_UP ? PROMPT_WHEEL_UP : k == SRC_WHEEL_DOWN ? PROMPT_WHEEL_DOWN : -1;
     if (icon >= 0) return memcpy(tile, prompt_icons[icon], CELL * CELL * 4), true;
     uint32_t t[3];
-    int n = key_label(code, t);
+    int n = c->btn == CHAT_CELL ? layout_label(code, t) : key_label(code, t);
     if (!n) return false;
     memcpy(tile, prompt_icons[PROMPT_KEYCAP], CELL * CELL * 4);
     put_label(tile, t, n);
@@ -698,18 +804,28 @@ static void put_tile(int sw, uint8_t *rgba, const Cell *c, const uint8_t *tile) 
 // ------------------------------------------------------------------ each frame
 void prompts_frame(void) {
     if (g_ready <= 0) return;
-    static int shown[16];
+    static int shown[16 + 4];
     static bool shown_kbm, any_shown;
     static int shown_view = -1;
     bool kbm = config_live_kbm_prompts() && host_input_last_device() == 1;
-    int want[16], view = -1;  // (each Switch button's input now; 0: the game's glyph)
-    memset(want, 0, sizeof want);
+    int want[16 + 4], view = -1;  // (each Switch button's input now; 0: the game's glyph; then the three Arts' keys,
+    memset(want, 0, sizeof want);  // and the chat key's prompt's, whatever the device: CHAT_CELL)
+    int chat_key = chat_key_prompt();
+    want[CHAT_CELL] = chat_key > 0 ? chat_key : 0;
     if (kbm) {
         ActProfile p;
         act_get_profile(&p);
         view = view_now();
         for (int b = 0; b < 16; b++) want[b] = input_for(&p, view, b);
+        if (act_art_keys())  // (the Arts' own keys: the HUD's Art panel shows them, by its D-pad cells: art_row)
+            for (int n = 0; n < 3; n++) {
+                const ActBinding *b = act_effective(&p, 1, ACT_ART1 + n, 0, NULL);
+                if (!b) b = act_default_binding(ACT_ART1 + n, 1);
+                want[16 + n] = b && b->n ? b->alt[0].code[0] : 0;
+            }
     }
+    bool art_hud = kbm && (want[16] || want[17] || want[18]);
+    g_art_rows = art_hud;
     if (view != shown_view && kbm) {
         static int logged_views;
         if (logged_views++ < 200)
@@ -727,7 +843,7 @@ void prompts_frame(void) {
             bool has = false;
             for (int k = 0; k < s->ncopies && !has; k++) has = s->copies[k].v == v;
             if (!has) continue;
-            if (!kbm) { write_copies(s, v, s->var[v]); continue; }
+            if (!kbm && !want[CHAT_CELL]) { write_copies(s, v, s->var[v]); continue; }
             uint64_t bytes = vbytes(s, v);
             int sw = vw(s, v), sh = vh(s, v), k = s->vk[v];
             if (s->cap < bytes) continue;
@@ -736,7 +852,10 @@ void prompts_frame(void) {
             for (int c = 0; c < s->ncells; c++) {
                 const Cell *cell = &s->cells[c];
                 uint8_t tile[CELL * CELL * 4];
-                if (!draw_tile(tile, cell, want[cell->btn], cell->btn2 >= 0 ? want[cell->btn2] : 0)) continue;
+                int key = want[cell->btn];
+                if (art_hud && s->cells == panel_cells)  // (the Art panel's three rows, by its D-pad cells)
+                    key = cell->btn == BTN_UP ? want[16] : cell->btn == BTN_RIGHT ? want[17] : cell->btn == BTN_DOWN ? want[18] : key;
+                if (!draw_tile(tile, cell, key, cell->btn2 >= 0 ? want[cell->btn2] : 0)) continue;
                 // (the cell's box at this version's scale, and the blocks it touches)
                 Cell box = {cell->x * k, cell->y * k, cell->w * k, cell->h * k, cell->btn, cell->btn2};
                 int bx0 = box.x / 4, by0 = box.y / 4, bx1 = (box.x + box.w - 1) / 4, by1 = (box.y + box.h - 1) / 4;

@@ -1476,13 +1476,15 @@ int interp_owns(uint32_t pc) {
 
 // The instruction at pc. The first two words of a hooked game function may be a Forge hook's jump to its detour
 // (written over them in guest memory): there the hook's kept words are the function's own code (fnhook_keep_entry).
+// A mod's jump into a subsdk the loader moved stays in memory as the mod wrote it and runs moved (mods_code_word).
 static uint32_t code_word(uint32_t pc) {
     uint32_t w;
-    if (pc >= 4 && pc < HLE_BASE && (((g_fnhook[pc >> 5] >> ((pc >> 2) & 7)) & 1) ||
-                                     ((g_fnhook[(pc - 4) >> 5] >> (((pc - 4) >> 2) & 7)) & 1)) &&
-        fnhook_entry_word(pc, &w))
-        return w;
-    return LD32(pc);
+    if (!(pc >= 4 && pc < HLE_BASE && (((g_fnhook[pc >> 5] >> ((pc >> 2) & 7)) & 1) ||
+                                       ((g_fnhook[(pc - 4) >> 5] >> (((pc - 4) >> 2) & 7)) & 1)) &&
+          fnhook_entry_word(pc, &w)))
+        w = LD32(pc);
+    mods_code_word(pc, &w);
+    return w;
 }
 
 // Calls out of the interpreted code run the callee through rt_dispatch (recompiled code returns by returning, not
@@ -1555,16 +1557,17 @@ static void stats_add(uint32_t entry, uint64_t n, bool top, uint64_t ns) {
     pthread_mutex_unlock(&stats_lock);
 }
 
+static void run_inner(Cpu *c);  // (the JIT's run, or interp_run_inner)
 void interp_run(Cpu *c) {
     if (stats_on < 0) stats_on = getenv("MHGU_INTERP_STATS") != NULL;
     if (!stats_on) {
-        interp_run_inner(c);
+        run_inner(c);
     } else {
         uint32_t entry = c->pc;
         if (code_word(entry) == 0xE51FF004u) entry = LD32(entry + 4);  // (dispatch_interpret's stub: its function)
         uint64_t before = t_insns, t0 = plat_now_ns();
         t_depth++;
-        interp_run_inner(c);
+        run_inner(c);
         t_depth--;
         stats_add(entry, t_insns - before, t_depth == 0, plat_now_ns() - t0);
     }
@@ -1994,4 +1997,20 @@ static void interp_run_inner(Cpu *c) {
         pc = lr;
     }
     if (stats_on > 0) t_insns += n;
+}
+
+// ================================================================ JIT (x86-64 hosts: runtime/interp_jit.h)
+#include "interp_jit.h"
+
+static void run_inner(Cpu *c) {
+#ifdef HAVE_JIT
+    if (!(g_interp_watch | read_hi) && jit_enabled()) {
+        JitTls *t = jit_tls();
+        if (t) {
+            jit_run(c, t);
+            return;
+        }
+    }
+#endif
+    interp_run_inner(c);
 }

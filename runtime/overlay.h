@@ -13,7 +13,9 @@ extern "C" {
 
 // From runtime/forge.c once plugins are loaded: font (a .ttf; NULL: ImGui's own), its size in pixels at 720 lines
 // (scaled with the window), the key that opens the menu (SDL scancode = HID usage, as Forge's config has it).
-void overlay_init(const char *font_path, float font_size, int menu_key);
+// cjk_font: a mod's .ttf merged into the same atlas for its Chinese glyphs, ahead of the release's mhgurecomp-cjk.otf
+// beside the program or in the APK (NULL: the release's alone; neither: the system's once the menu is translated).
+void overlay_init(const char *font_path, const char *cjk_font, float font_size, int menu_key);
 // Host main thread, before the renderer: ImGui with its own font, for the loading screen until overlay_init.
 void overlay_init_early(void);
 bool overlay_enabled(void);
@@ -52,6 +54,15 @@ void overlay_draw(VkCommandBuffer cb, const OverlayTarget *t);
 // Before the game's first frame (device.c's loading screen thread, under the Vulkan lock, inside the window image's
 // render pass): the loading indicator alone, on the black window.
 void overlay_loading(VkCommandBuffer cb, const OverlayTarget *t);
+
+// Forge 2.0.0's forge_graphics_registerTexture / unregisterTexture (any thread): a plugin's NVNtexture (guest address)
+// with its NVNtextureView's 0x28 bytes (NULL: none) for ImGui::Image; the ImTextureID the plugin draws it with, 0 when
+// the table is full. remove: false for an id that is not registered.
+uint64_t overlay_user_texture_add(uint32_t tex, const void *view);
+bool overlay_user_texture_remove(uint64_t id);
+// device.c, each present, outside the render pass and before overlay_draw: view_of(texture, view or NULL) is the
+// registered texture's sampled Vulkan view now (VK_NULL_HANDLE: none)
+void overlay_user_textures_prepare(VkImageView (*view_of)(uint32_t tex, const void *view));
 
 #ifdef __cplusplus
 }

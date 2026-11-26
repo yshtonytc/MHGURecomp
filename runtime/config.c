@@ -57,7 +57,8 @@
     .fsr_animsurf = 1,                                                                              \
     /* [Graphics] */                                                                                \
     .draw_distance = 1.0f,                                                                          \
-    .smooth_gradients = 0,                                                                          \
+    .aniso = 1,                                                                                     \
+    .smooth_gradients = 0,                                                                         \
     .fix_kerning = 1,                                                                               \
     .bold_text = BOLD_TEXT_DEFAULT,                                                                 \
     /* [HDR] */                                                                                 \
@@ -81,6 +82,7 @@
     /* [Performance] */                                                                             \
     .show_fps = 0,                                                                                  \
     .show_battery = BATTERY_OFF,                                                                    \
+    .show_temperature = TEMP_OFF,                                                                   \
     .fps = 60,                                                                                      \
     .vsync = 1,                                                                                     \
     .shader_prewarm = 1,                                                                            \
@@ -92,13 +94,16 @@
     .kbm_prompts = 1,                                                                               \
     .combo_window = COMBO_LENIENT,                                                                  \
     .chat_key = "/",                                                                                \
+    .pause_key = "Pause",                                                                           \
     .menu_chord = 1,                                                                                \
+    .title_back_exit = 1,                                                                           \
     /* [Mouse] */                                                                                   \
     .mouse_sensitivity = 1.0f,                                                                      \
     .mouse_sensitivity_y = 1.0f,                                                                    \
     .mouse_invert_y = 0,                                                                            \
     .mouse_smoothing = 0.0f,                                                                        \
     .mouse_capture = MOUSE_CAPTURE_CLICK,                                                           \
+    .menu_mouse = 1,                                                                                \
     /* [Keybinds] */                                                                                \
     .binds = DEFAULT_BINDS,                                                                         \
     /* [Multiplayer] */                                                                             \
@@ -107,11 +112,16 @@
     .ldn_server = "",                                                                               \
     .ldn_key = "",                                                                                  \
     .ldn_direct = 1,                                                                                \
+    .ldn_friend_requests = 1,                                                                       \
+    .ldn_friend_online_notices = 0,                                                                 \
+    .ldn_friend_hub_notices = 0,                                                                    \
+    .ldn_ryu_serve_port = 30456,                                                                    \
+    .ldn_room_serve_port = 24872,                                                                   \
     .sync_small_monsters = 1,                                                                       \
     .lag_compensation = 1,                                                                          \
     .share_urgent = 1,                                                                              \
     /* [Monster HP, Village Quests] */                                                              \
-    .hp = {{1, 1, 1, 1}, 2},                                                                        \
+    .hp = {{1, 1, 1, 1}, 1.5f},                                                                     \
     .village_in_hub = 1,                                                                            \
     /* [Quest Rewards] */                                                                           \
     .quest_hold_send = 1,                                                                           \
@@ -126,12 +136,19 @@
     .audio_output = AUDIO_OUT_STEREO,                                                               \
     /* [Application] */                                                                             \
     .confirm_exit = 1,                                                                              \
-    .language = 2,                                                                                  \
+    .language = 0,                                                                                  \
     .button_icons = 0,                                                                              \
     .menu_theme = THEME_HUNTER,                                                                     \
     .menu_scale = 100,                                                                              \
     .updates = UPDATES_ASK,                                                                         \
     .save_location = "",                                                                            \
+    .backups_on = 1,                                                                                \
+    .save_backups = 10,                                                                             \
+    .backup_location = "",                                                                          \
+    .second_display = 0,                                                                            \
+    .bottom_panels = BOTTOM_PANELS_DEFAULT,                                                         \
+    .bottom_background = BOTTOM_BG_DARK,                                                            \
+    .bottom_wallpaper = "",                                                                         \
 
 Config g_config = {CONFIG_DEFAULT_VALUES};
 Config config_defaults(void) { Config c = {CONFIG_DEFAULT_VALUES}; return c; }
@@ -185,7 +202,7 @@ static const char DEFAULT_INI[] =
     "; Default: On\n"
     "FXAA = On\n"
     "\n"
-    "; Which FXAA: Original is GU's own, 3_11 is FXAA 3.11, which keeps textures sharper\n"
+    "; Which FXAA method to use.\n"
     "; Original, 3_11\n"
     "; Default: Original\n"
     "FXAAMode = Original\n"
@@ -225,8 +242,14 @@ static const char DEFAULT_INI[] =
     "; Default: 1.0\n"
     "DrawDistance = 1.0\n"
     "\n"
+    "; Anisotropic filtering, improves texture sharpness.\n"
+    "; Off: vanilla\n"
+    "; Off, 2x, 4x, 8x, 16x\n"
+    "; Default: Off\n"
+    "AnisotropicFiltering = Off\n"
+    "\n"
     "; Renders the picture with 16 bits per colour instead of 8, so dark skies and soft glows show no colour bands.\n"
-    "; Costs GPU time: about 1 ms a frame at 1600x1000, more at higher resolutions\n"
+    "; Slightly impacts GPU performance.\n"
     "; Default: Off\n"
     "SmoothGradients = Off\n"
     "\n"
@@ -320,6 +343,12 @@ static const char DEFAULT_INI[] =
     "; Default: Off\n"
     "ShowBattery = Off\n"
     "\n"
+    "; Android only: show the device's temperature (its battery's) under the frame rate, or in a box of its own when the\n"
+    "; frame rate is off\n"
+    "; Off, Celsius, Fahrenheit\n"
+    "; Default: Off\n"
+    "ShowTemperature = Off\n"
+    "\n"
     "; Framerate cap\n"
     "; Between 30 and 240\n"
     "; Default: 60\n"
@@ -370,10 +399,21 @@ static const char DEFAULT_INI[] =
     "; Default: On\n"
     "MenuChord = On\n"
     "\n"
+    "; B (the menus' Back) on the title screen's Main Menu asks to quit the game. Turn it off when a mod swaps the\n"
+    "; menus' Confirm and Back, so that confirming there no longer asks\n"
+    "; Default: On\n"
+    "TitleBackExit = On\n"
+    "\n"
     "; The key that opens a line of chat, anywhere (in a quest too): a key's name as the settings menu shows it, or\n"
     "; nothing for none\n"
     "; Default: /\n"
     "ChatKey = /\n"
+    "\n"
+    "; Pause/Suspend: the key that pauses the game and resumes it (Esc and Enter resume it too). Offline only: not in a\n"
+    "; hub or with Hunter Search, and not while the game saves. A key's name as the settings menu shows it, or nothing\n"
+    "; for none\n"
+    "; Default: Pause\n"
+    "PauseKey = Pause\n"
     "\n"
     "[Mouse]\n"
     "; Mouse sensitivity\n"
@@ -396,6 +436,12 @@ static const char DEFAULT_INI[] =
     "; hunt camera is yours, and free in menus and cutscenes\n"
     "; Default: Click\n"
     "MouseCapture = Click\n"
+    "\n"
+    "; The mouse in the game's menus: the pointer shows, the option under it is selected, a left click picks it and a\n"
+    "; right click backs out (in towns too: left click talks). Off: as before version 0.17, the mouse only turns the\n"
+    "; camera, no pointer shows up by itself, and the mouse buttons do what the Keybinds give them everywhere\n"
+    "; Default: On\n"
+    "MenuMouse = On\n"
     "\n"
     "[Keybinds]\n"
     "; The keys or mouse buttons for each Switch button, for moving (the left stick) and for turning the item bar\n"
@@ -445,7 +491,6 @@ static const char DEFAULT_INI[] =
     "\n"
     "; Matchmaking key: hubs are only seen by players with the same key, so friends who all enter the same key\n"
     "; only see each other's hubs. Empty: public, your hubs are seen by (and you see) everyone without a key.\n"
-    "; On Android, empty means public among Android players only: to play with friends on PC, all enter the same key.\n"
     "; Default:\n"
     "Key =\n"
     "\n"
@@ -455,6 +500,21 @@ static const char DEFAULT_INI[] =
     "; server, nobody sees your address. Both ends need it On for a direct connection.\n"
     "; Default: On\n"
     "Direct = On\n"
+    "\n"
+    "; FriendRequests = On: players can send you friend requests (you accept or reject them in the settings menu), and\n"
+    "; the other players in your hub see your friend code to add you. A request you reject stays rejected until the\n"
+    "; game restarts, unless you add that player yourself. Off: no requests and your code isn't shared in hubs; you can\n"
+    "; still add friends by their code. Your friend code and friends list are kept in the save folder, not here.\n"
+    "; Default: On\n"
+    "FriendRequests = On\n"
+    "\n"
+    "; FriendOnlineNotices = On: a notice when one of your friends comes online.\n"
+    "; Default: Off\n"
+    "FriendOnlineNotices = Off\n"
+    "\n"
+    "; FriendHubNotices = On: a notice when one of your friends opens a hub. The Friends tab still shows who is hosting.\n"
+    "; Default: Off\n"
+    "FriendHubNotices = Off\n"
     "\n"
     "; Sync small monsters between players in multiplayer. Everyone in the hunt should use the same setting.\n"
     "; Default: On\n"
@@ -495,7 +555,7 @@ static const char DEFAULT_INI[] =
     "RoomServe = Off\n"
     "RoomServePort = 24872\n"
     "\n"
-    "; Crossplay with suyu, yuzu and the forks that kept their multiplayer rooms (Eden, Citron, ...). RoomServer: the\n"
+    "; Crossplay with suyu/yuzu/Eden emulators. RoomServer: the\n"
     "; room's address (host or host:port, default port 24872); this game joins it while local play is open, and the\n"
     "; emulators' hubs show up in Search Hubs. RoomHost = On: a hub you create lives in the room, so their players can\n"
     "; search and join it. RoomName: your name in the room. The same game version (1.4.0) is needed, and the port's extras\n"
@@ -528,8 +588,8 @@ static const char DEFAULT_INI[] =
     "\n"
     "; When playing a Village Quest from the Hub, first multiply the monster HP by this amount.\n"
     "; This amount is then scaled again by the [Monster HP] settings.\n"
-    "; Default: 2.0\n"
-    "HubHP = 2.0\n"
+    "; Default: 1.5\n"
+    "HubHP = 1.5\n"
     "\n"
     "[Quest Rewards]\n"
     "; At the end of a quest, press and hold A on the Reward Box (Send to the Item Box option) to rapidly send items one-by-one, similar to World/Rise/Wilds.\n"
@@ -564,19 +624,22 @@ static const char DEFAULT_INI[] =
     "MuteInBackground = Off\n"
     "\n"
     "; Speakers: Stereo, or 5.1 (front left / right, center, subwoofer, rear left / right) for a surround system.\n"
-    "; The game mixes its sound in 5.1 either way; Stereo folds it down to two channels.\n"
     "; Default: Stereo\n"
     "Output = Stereo\n"
     "\n"
+    "; Which playback device to use for the audio.\n"
+    "; Default: empty\n"
+    "Device =\n"
+    "\n"
     "[Application]\n"
-    "; Ask before the game window closes (closing does not save the game)\n"
+    "; Ask before the game window closes (closing does not automatically save the game)\n"
     "; Default: On\n"
     "ConfirmExit = On\n"
     "\n"
     "; Language of the settings menu (F1, or Minus + Plus on a controller)\n"
-    "; English, Spanish, Chinese\n"
-    "; Default: Chinese\n"
-    "Language = Chinese\n"
+    "; English, Spanish, Chinese, Korean\n"
+    "; Default: English\n"
+    "Language = English\n"
     "\n"
     "; Button icons in the settings menu\n"
     "; Xbox, Switch, PlayStation\n"
@@ -604,6 +667,21 @@ static const char DEFAULT_INI[] =
     "; Your save is not moved: copy save_0 there yourself. Takes effect at the next start\n"
     "SaveLocation =\n"
     "\n"
+    "[Save Backups]\n"
+    "; Each time the game saves, a copy of save_0's files goes in a folder named after the date and time.\n"
+    "; To restore one, close the game and copy its files into save_0. Off: no backups (those made stay)\n"
+    "; Default: On\n"
+    "Backups = On\n"
+    "\n"
+    "; How many backups are kept: past this many, the oldest is deleted\n"
+    "; Between 1 and 100\n"
+    "; Default: 10\n"
+    "BackupsKept = 10\n"
+    "\n"
+    "; PC only. The folder the save backups go in. Empty means: a backups folder in the save folder, beside save_0.\n"
+    "; Takes effect at the next start\n"
+    "BackupLocation =\n"
+    "\n"
     "[Android]\n"
     "; Android only. The folder the save is kept in, so syncing software can keep it in step: the one that holds save_0. Empty: the app's own\n"
     "; folder. Set it with Save folder in the settings menu (Android tab): the app needs Android's \"All files access\"\n"
@@ -613,7 +691,36 @@ static const char DEFAULT_INI[] =
     "; Android only. The folder holding the game's exefs and romfs folders, used where it is (for example on a USB drive or SD\n"
     "; card), so they don't have to fit in the app's own folder. Empty: the data folder in the app's own folder. Set it with\n"
     "; Game files folder in the settings menu (Android tab): the app needs Android's \"All files access\". Takes effect at the next start\n"
-    "GameFolder =\n";
+    "GameFolder =\n"
+#ifdef MHGU_DUAL_SCREEN
+    "\n"
+    "[Dual Screen]\n"
+    "; Enable MHXX-style dual screen support for certain HUD elements and Hunter Arts, useful for the AYN Thor.\n"
+    "; Can be a bit finicky on PC setups.\n"
+    "; Default: Off\n"
+    "SecondDisplay = Off\n"
+    "\n"
+    "; The bottom screen's panels, as MHXX's Panel Customize places them on its 4 x 3 grid: name@column,row, columns 0..3\n"
+    "; from the left, rows 0..2 from the top. A panel covers its size from there; a later panel replaces what it covers.\n"
+    "; arts3v 2x3 (three Hunter Arts, stacked: touch one to use it), arts3h 4x1 (the same in a row), map 2x2 (the game's\n"
+    "; minimap: touch to switch the zoomed and the whole map), itembar 2x1 (touch the middle to use the item, the sides\n"
+    "; to change it), status 4x1 (clock, health, stamina, sharpness), palico 4x1, target 2x1 (touch to switch the\n"
+    "; target), dpad 2x2 (touch to turn the camera)\n"
+    "; Default: " BOTTOM_PANELS_DEFAULT "\n"
+    "Panels = " BOTTOM_PANELS_DEFAULT "\n"
+    "\n"
+    "; What the bottom screen shows under its panels, and alone out of a quest: Dark (MHXX's grey), Black (an OLED\n"
+    "; screen's pixels stay off), Wallpaper (a picture of your own: below)\n"
+    "; Default: Dark\n"
+    "Background = Dark\n"
+    "\n"
+    "; The wallpaper: a 24-bit BMP you put in the wallpapers folder (beside the game; Android: in the app's files), scaled\n"
+    "; to cover the screen.\n"
+    "; Empty: each BMP of the folder in turn, 30 seconds each\n"
+    "; Default: (empty)\n"
+    "Wallpaper =\n"
+#endif
+    ;
 
 void config_path(char *buf, size_t size) {
     const char *e = getenv("MHGU_CONFIG");
@@ -719,8 +826,13 @@ static bool parse_aspect(const char *v, float *out) {
 #define ERR_FSR "Invalid FSR quality, sharpness or reactive mask."
 #define ERR_NET "Invalid port or Join address list (no newlines, ';' or '#')."
 #define ERR_SERVER "Invalid hub server or matchmaking key (no newlines, ';' or '#')."
+#define ERR_CROSSPLAY "Invalid emulator crossplay address, name or password (no newlines, ';' or '#')."
 #define ERR_FOLDER "Invalid save folder (one line, no ';' or '#')."
+#define ERR_BACKUPS "Backups to keep must be 1-100."
+#define ERR_BACKUP_FOLDER "Invalid backup folder (one line, no ';' or '#')."
 #define ERR_GAME_FOLDER "Invalid game files folder (one line, no ';' or '#')."
+#define ERR_PANELS "Invalid bottom screen panel list (one line, no ';' or '#')."
+#define ERR_WALLPAPER "Invalid wallpaper file name (one line, no ';' or '#')."
 #define ERR_HP "HP factors must be 0.05-20."
 #define ERR_VILLAGE "Invalid village HP or quest override count."
 #define ERR_MOUSE "Mouse sensitivity must be 0.1-10 and smoothing 0-0.9."
@@ -735,7 +847,8 @@ static bool parse_aspect(const char *v, float *out) {
 #define F(x) offsetof(Config, x)
 #define ON_OFF(section, key, field, restart) {section, key, SET_BOOL, F(field), 0, 0, 0, NULL, NULL, restart, ERR_TOGGLE}
 #define KEYS(key, bind) {"Keybinds", key, SET_KEYS, F(binds[bind]), 0, 0, 0, NULL, NULL, false, ERR_KEYS}
-static const int anchor_values[] = {UI_CENTER, UI_21_9, UI_32_9, UI_EDGES}, msaa_values[] = {1, 2, 4, 8};
+static const int anchor_values[] = {UI_CENTER, UI_21_9, UI_32_9, UI_EDGES}, msaa_values[] = {1, 2, 4, 8},
+                 aniso_values[] = {1, 2, 4, 8, 16};
 const ConfigSetting g_settings[] = {
     {"Display", "Mode", SET_CHOICE, F(display_mode), 0, 0, 0,
      "Windowed|window,Fullscreen|exclusive|exclusivefullscreen,Borderless|borderless*", NULL, true, ERR_SIZE},
@@ -756,6 +869,8 @@ const ConfigSetting g_settings[] = {
     {"Upscaler", "Reactive", SET_FLOAT, F(fsr_reactive), 0, 0.0f, 1.0f, NULL, NULL, false, ERR_FSR},
     ON_OFF("Upscaler", "AnimSurf", fsr_animsurf, true),
     {"Graphics", "DrawDistance", SET_FLOAT, F(draw_distance), 0, 0.0f, 10.0f, NULL, NULL, false, ERR_DRAW},
+    {"Graphics", "AnisotropicFiltering|Anisotropy|AF", SET_CHOICE, F(aniso), 0, 0, 0, "Off|none|0|1|1x,2x|2,4x|4,8x|8,16x|16",
+     aniso_values, false, ERR_MISC},
     ON_OFF("Graphics", "SmoothGradients", smooth_gradients, false),
     ON_OFF("Graphics", "FixKerning", fix_kerning, false),
     ON_OFF("Graphics", "BoldText", bold_text, false),
@@ -778,6 +893,7 @@ const ConfigSetting g_settings[] = {
     {"HDR", "HDRFormat", SET_CHOICE, F(hdr_format), 0, 0, 0, "Auto,HDR10|pq,scRGB|fp16", NULL, false, ERR_HDR},
     ON_OFF("Performance", "ShowFPS", show_fps, false),
     {"Performance", "ShowBattery", SET_CHOICE, F(show_battery), 0, 0, 0, "Off,WithFPS,ByItself", NULL, false, ERR_MISC},
+    {"Performance", "ShowTemperature", SET_CHOICE, F(show_temperature), 0, 0, 0, "Off,Celsius|C,Fahrenheit|F", NULL, false, ERR_MISC},
     {"Performance", "FPS|FrameRate", SET_INT, F(fps), 0, 30, 240, NULL, NULL, false, ERR_MISC},
     ON_OFF("Performance", "VSync", vsync, false),
     ON_OFF("Performance", "ShaderPrewarm", shader_prewarm, true),
@@ -788,13 +904,16 @@ const ConfigSetting g_settings[] = {
     ON_OFF("Controls", "BackgroundInput", background_input, false),
     ON_OFF("Controls", "KeyboardPrompts", kbm_prompts, false),
     ON_OFF("Controls", "MenuChord", menu_chord, false),
+    ON_OFF("Controls", "TitleBackExit", title_back_exit, false),
     {"Controls", "ComboInputWindow", SET_CHOICE, F(combo_window), 0, 0, 0, "Lenient,Strict", NULL, false, ERR_MISC},
     {"Controls", "ChatKey", SET_TEXT, F(chat_key), sizeof g_config.chat_key, 0, 0, NULL, NULL, false, ERR_MISC},
+    {"Controls", "PauseKey", SET_TEXT, F(pause_key), sizeof g_config.pause_key, 0, 0, NULL, NULL, false, ERR_MISC},
     {"Mouse", "MouseSensitivity", SET_FLOAT, F(mouse_sensitivity), 0, 0.1f, 10.0f, NULL, NULL, false, ERR_VIEW},
     {"Mouse", "MouseSensitivityY", SET_FLOAT, F(mouse_sensitivity_y), 0, 0.1f, 10.0f, NULL, NULL, false, ERR_MOUSE},
     ON_OFF("Mouse", "MouseInvertY", mouse_invert_y, false),
     {"Mouse", "MouseSmoothing", SET_FLOAT, F(mouse_smoothing), 0, 0.0f, 0.9f, NULL, NULL, false, ERR_MOUSE},
     {"Mouse", "MouseCapture", SET_CHOICE, F(mouse_capture), 0, 0, 0, "Click,Hunt", NULL, false, ERR_MISC},
+    ON_OFF("Mouse", "MenuMouse", menu_mouse, false),
     KEYS("MoveUp", BIND_MOVE_UP), KEYS("MoveDown", BIND_MOVE_DOWN), KEYS("MoveLeft", BIND_MOVE_LEFT),
     KEYS("MoveRight", BIND_MOVE_RIGHT), KEYS("Walk", BIND_WALK), KEYS("A", BIND_A), KEYS("B", BIND_B), KEYS("X", BIND_X),
     KEYS("Y", BIND_Y), KEYS("L", BIND_L), KEYS("R", BIND_R), KEYS("ZL", BIND_ZL), KEYS("ZR", BIND_ZR),
@@ -804,10 +923,19 @@ const ConfigSetting g_settings[] = {
     {"Multiplayer", "Port", SET_INT, F(ldn_port), 0, 1, 65535, NULL, NULL, false, ERR_NET},
     {"Android", "SaveFolder", SET_TEXT, F(save_dir), sizeof g_config.save_dir, 0, 0, NULL, NULL, true, ERR_FOLDER},
     {"Android", "GameFolder", SET_TEXT, F(game_dir), sizeof g_config.game_dir, 0, 0, NULL, NULL, true, ERR_GAME_FOLDER},
+#ifdef MHGU_DUAL_SCREEN
+    ON_OFF("Dual Screen", "SecondDisplay", second_display, false),
+    {"Dual Screen", "Panels", SET_TEXT, F(bottom_panels), sizeof g_config.bottom_panels, 0, 0, NULL, NULL, false, ERR_PANELS},
+    {"Dual Screen", "Background", SET_CHOICE, F(bottom_background), 0, 0, 0, "Wallpaper,Dark,Black", NULL, false, ERR_MISC},
+    {"Dual Screen", "Wallpaper", SET_TEXT, F(bottom_wallpaper), sizeof g_config.bottom_wallpaper, 0, 0, NULL, NULL, false, ERR_WALLPAPER},
+#endif
     {"Multiplayer", "Join", SET_TEXT, F(ldn_join), sizeof g_config.ldn_join, 0, 0, NULL, NULL, false, ERR_NET},
     {"Multiplayer", "Server", SET_TEXT, F(ldn_server), sizeof g_config.ldn_server, 0, 0, NULL, NULL, false, ERR_SERVER},
     {"Multiplayer", "Key", SET_TEXT, F(ldn_key), sizeof g_config.ldn_key, 0, 0, NULL, NULL, false, ERR_SERVER},
     ON_OFF("Multiplayer", "Direct", ldn_direct, false),
+    ON_OFF("Multiplayer", "FriendRequests", ldn_friend_requests, false),
+    ON_OFF("Multiplayer", "FriendOnlineNotices", ldn_friend_online_notices, false),
+    ON_OFF("Multiplayer", "FriendHubNotices", ldn_friend_hub_notices, false),
     ON_OFF("Multiplayer", "SyncSmallMonsters", sync_small_monsters, false),
     ON_OFF("Multiplayer", "LagCompensation", lag_compensation, false),
     ON_OFF("Multiplayer", "ShareUrgentCredit", share_urgent, false),
@@ -818,30 +946,35 @@ const ConfigSetting g_settings[] = {
     ON_OFF("Village Quests", "VillageQuestsInHub", village_in_hub, false),
     {"Village Quests", "HubHP", SET_FACTOR, F(hp.village), 0, HP_SCALE_MIN, HP_SCALE_MAX, NULL, NULL, false, ERR_VILLAGE},
     ON_OFF("Quest Rewards", "HoldASend", quest_hold_send, false),
-    {"Multiplayer", "RyuServers", SET_TEXT, F(ldn_ryu_servers), sizeof g_config.ldn_ryu_servers, 0, 0, NULL, NULL, false, ERR_SERVER},
-    {"Multiplayer", "RyuHost", SET_TEXT, F(ldn_ryu_host), sizeof g_config.ldn_ryu_host, 0, 0, NULL, NULL, false, ERR_SERVER},
-    {"Multiplayer", "RyuPassphrase", SET_TEXT, F(ldn_ryu_pass), sizeof g_config.ldn_ryu_pass, 0, 0, NULL, NULL, false, ERR_SERVER},
-    {"Multiplayer", "RoomServer", SET_TEXT, F(ldn_room_server), sizeof g_config.ldn_room_server, 0, 0, NULL, NULL, false, ERR_SERVER},
-    {"Multiplayer", "RoomPassword", SET_TEXT, F(ldn_room_pass), sizeof g_config.ldn_room_pass, 0, 0, NULL, NULL, false, ERR_SERVER},
-    {"Multiplayer", "RoomName", SET_TEXT, F(ldn_room_nick), sizeof g_config.ldn_room_nick, 0, 0, NULL, NULL, false, ERR_SERVER},
-    ON_OFF("Multiplayer", "RoomHost", ldn_room_host, false),
-    ON_OFF("Multiplayer", "RyuServe", ldn_ryu_serve, false),
-    {"Multiplayer", "RyuServePort", SET_INT, F(ldn_ryu_serve_port), 0, 0, 65535, NULL, NULL, false, ERR_NET},
-    ON_OFF("Multiplayer", "RoomServe", ldn_room_serve, false),
-    {"Multiplayer", "RoomServePort", SET_INT, F(ldn_room_serve_port), 0, 0, 65535, NULL, NULL, false, ERR_NET},
+    // (crossplay: runtime/net reads these from g_config, so a change takes effect at the next start)
+    {"Multiplayer", "RyuServers", SET_TEXT, F(ldn_ryu_servers), sizeof g_config.ldn_ryu_servers, 0, 0, NULL, NULL, true, ERR_CROSSPLAY},
+    {"Multiplayer", "RyuHost", SET_TEXT, F(ldn_ryu_host), sizeof g_config.ldn_ryu_host, 0, 0, NULL, NULL, true, ERR_CROSSPLAY},
+    {"Multiplayer", "RyuPassphrase", SET_TEXT, F(ldn_ryu_pass), sizeof g_config.ldn_ryu_pass, 0, 0, NULL, NULL, true, ERR_CROSSPLAY},
+    {"Multiplayer", "RoomServer", SET_TEXT, F(ldn_room_server), sizeof g_config.ldn_room_server, 0, 0, NULL, NULL, true, ERR_CROSSPLAY},
+    {"Multiplayer", "RoomPassword", SET_TEXT, F(ldn_room_pass), sizeof g_config.ldn_room_pass, 0, 0, NULL, NULL, true, ERR_CROSSPLAY},
+    {"Multiplayer", "RoomName", SET_TEXT, F(ldn_room_nick), sizeof g_config.ldn_room_nick, 0, 0, NULL, NULL, true, ERR_CROSSPLAY},
+    ON_OFF("Multiplayer", "RoomHost", ldn_room_host, true),
+    ON_OFF("Multiplayer", "RyuServe", ldn_ryu_serve, true),
+    {"Multiplayer", "RyuServePort", SET_INT, F(ldn_ryu_serve_port), 0, 0, 65535, NULL, NULL, true, ERR_NET},
+    ON_OFF("Multiplayer", "RoomServe", ldn_room_serve, true),
+    {"Multiplayer", "RoomServePort", SET_INT, F(ldn_room_serve_port), 0, 0, 65535, NULL, NULL, true, ERR_NET},
     ON_OFF("Discord", "RichPresence", discord, false),
     ON_OFF("Discord", "ShowHunter", discord_hunter, false),
     ON_OFF("Bonus Content", "BonusContent", bonus_content, false),
     {"Audio", "Volume", SET_INT, F(volume), 0, 0, 100, NULL, NULL, false, ERR_MISC},
     ON_OFF("Audio", "MuteInBackground", mute_in_background, false),
     {"Audio", "Output", SET_CHOICE, F(audio_output), 0, 0, 0, "Stereo|2.0,5.1|surround|5.1surround", NULL, false, ERR_MISC},
+    {"Audio", "Device", SET_TEXT, F(audio_device), sizeof g_config.audio_device, 0, 0, NULL, NULL, false, ERR_MISC},
     ON_OFF("Application", "ConfirmExit", confirm_exit, false),
-    {"Application", "Language", SET_CHOICE, F(language), 0, 0, 0, "English|en,Spanish|es,Chinese|zh", NULL, false, ERR_LANGUAGE},
+    {"Application", "Language", SET_CHOICE, F(language), 0, 0, 0, "English|en,Spanish|es,中文|zh|chinese,한국어|ko|korean", NULL, false, ERR_LANGUAGE},
     {"Application", "ButtonIcons", SET_CHOICE, F(button_icons), 0, 0, 0, "Xbox,Switch,PlayStation", NULL, false, ERR_ICONS},
     {"Application", "Theme", SET_CHOICE, F(menu_theme), 0, 0, 0, "Gold,Blue,Hunter", NULL, false, ERR_MISC},
     {"Application", "MenuScale", SET_INT, F(menu_scale), 0, 50, 200, NULL, NULL, false, ERR_SCALE},
     {"Application", "Updates", SET_CHOICE, F(updates), 0, 0, 0, "Ask,Auto|automatic,Off|never", NULL, false, ERR_UPDATES},
     {"Application", "SaveLocation", SET_TEXT, F(save_location), sizeof g_config.save_location, 0, 0, NULL, NULL, true, ERR_FOLDER},
+    ON_OFF("Save Backups", "Backups", backups_on, false),
+    {"Save Backups", "BackupsKept", SET_INT, F(save_backups), 0, 1, 100, NULL, NULL, false, ERR_BACKUPS},
+    {"Save Backups", "BackupLocation", SET_TEXT, F(backup_location), sizeof g_config.backup_location, 0, 0, NULL, NULL, true, ERR_BACKUP_FOLDER},
 };
 #undef ON_OFF
 #undef KEYS
@@ -1218,13 +1351,43 @@ static void append_missing_sections(const char *path, const char *seen) {
     if (o) fclose(o);
 }
 
+// The settings menu's language for a new player (no mhgurecomp.ini yet): the first of the system's preferred languages
+// the menu has (Chinese for every zh locale: the translation is Simplified Chinese, closer to Traditional than English
+// is), else English. A saved Language always stays. MHGU_LOCALE=<language[-country]> (debug) stands for the system's.
+static int system_language(void) {
+    static const char *const codes[] = {"en", "es", "zh", "ko"};  // (the indices of [Application] Language)
+    const char *env = getenv("MHGU_LOCALE");
+    int count = 0, language = 0;
+    SDL_Locale **locales = env ? NULL : SDL_GetPreferredLocales(&count);
+    for (int i = 0; env ? i < 1 : i < count; i++) {
+        const char *code = env ? env : locales[i]->language;
+        int found = -1;
+        for (int l = 0; l < 4; l++)
+            if (!strncasecmp(code, codes[l], 2) && !isalpha((unsigned char)code[2])) found = l;
+        if (found >= 0) { language = found; break; }
+    }
+    SDL_free(locales);
+    return language;
+}
+
 void config_load(void) {
     char path[1100];
     config_path(path, sizeof path);
     FILE *f = fopen(path, "r");
     if (!f) {
+        // (DEFAULT_INI, with the system's language in place of English when the menu has it)
+        static const char *const names[] = {"English", "Spanish", "中文", "한국어"}, line[] = "\nLanguage = English\n";
+        g_config.language = system_language();
+        const char *at = strstr(DEFAULT_INI, line);
         FILE *o = fopen(path, "w");
-        if (o) { fputs(DEFAULT_INI, o); fclose(o); LOG("[config] wrote the default settings to %s\n", path); }
+        if (o && at) {
+            fprintf(o, "%.*s\nLanguage = %s\n%s", (int)(at - DEFAULT_INI), DEFAULT_INI, names[g_config.language],
+                    at + strlen(line));
+        } else if (o) {
+            fputs(DEFAULT_INI, o);
+            g_config.language = 0;  // (what the file says)
+        }
+        if (o) { fclose(o); LOG("[config] wrote the default settings to %s (menu language %s)\n", path, names[g_config.language]); }
         else LOG("[config] %s is missing and could not be written; using the defaults\n", path);
     } else {
         char buf[512], seen[512] = "|";
@@ -1268,6 +1431,7 @@ void config_load(void) {
     if (getenv("MHGU_HIDDEN")) g_config.display_mode = DISPLAY_WINDOWED;
     if ((e = getenv("MHGU_MSAA"))) g_config.msaa = atoi(e) >= 8 ? 8 : atoi(e) >= 4 ? 4 : atoi(e) >= 2 ? 2 : 1;
     if ((e = getenv("MHGU_FXAA"))) g_config.fxaa = atoi(e) != 0;
+    if ((e = getenv("MHGU_AF"))) g_config.aniso = atoi(e) >= 16 ? 16 : atoi(e) >= 8 ? 8 : atoi(e) >= 4 ? 4 : atoi(e) >= 2 ? 2 : 1;
     if ((e = getenv("MHGU_RT16"))) g_config.smooth_gradients = atoi(e) != 0;
     if ((e = getenv("MHGU_FIX_KERNING"))) g_config.fix_kerning = atoi(e) != 0;
     if ((e = getenv("MHGU_BOLD_TEXT"))) g_config.bold_text = atoi(e) != 0;
@@ -1406,11 +1570,11 @@ void config_load(void) {
     config_runtime_init(&g_config);
 
     static const char *const modes[] = {"windowed", "fullscreen", "borderless"};
-    LOG("[config] %s: %s %dx%d, 3D %dx%d (shape %.3f, FOV x%.2f, HUD %.3f wide), %d fps, vsync %s, MSAA %dx, FXAA %s, "
+    LOG("[config] %s: %s %dx%d, 3D %dx%d (shape %.3f, FOV x%.2f, HUD %.3f wide), %d fps, vsync %s, MSAA %dx, FXAA %s, AF %dx, "
         "face buttons by %s, controller %s in the background\n", path, modes[g_config.display_mode], g_config.width,
         g_config.height, g_config.render_w, g_config.render_h, g_render_aspect, g_fov_scale, g_ui_anchor_aspect,
         g_config.fps, g_config.vsync ? "on" : "off",
-        g_config.msaa, g_config.fxaa ? "on" : "off", g_config.face_buttons == FACE_LABEL ? "label" : "position",
+        g_config.msaa, g_config.fxaa ? "on" : "off", g_config.aniso, g_config.face_buttons == FACE_LABEL ? "label" : "position",
         g_config.background_input ? "on" : "off");
     const HpScale *hp = &g_config.hp;
     LOG("[config] monster HP in Hub quests: x%.2f / %.2f / %.2f / %.2f for 1-4 hunters, %d quest(s) set apart\n",

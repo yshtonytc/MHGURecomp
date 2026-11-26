@@ -107,6 +107,9 @@ bool fnhook_room(uint32_t addr, bool tramp);  // a hook at addr (with a trampoli
 // pc, if pc is one of them.
 void fnhook_keep_entry(uint32_t addr, uint32_t w0, uint32_t w1);
 bool fnhook_entry_word(uint32_t pc, uint32_t *w);
+// A mod's jump into its subsdk, where the loader moved the subsdk (runtime/mods.c): *w, the word at pc in memory (as
+// the mod wrote it), becomes the one that jumps to where the subsdk is. False: not one (*w as it was).
+bool mods_code_word(uint32_t pc, uint32_t *w);
 void rt_fatal_trace(void) __attribute__((noreturn));
 void crash_handler_install(void);
 
@@ -157,6 +160,7 @@ void guest_call(Cpu *c, uint32_t addr);   // call a guest function (saves / rest
 uint32_t guest_sym(const char *name);     // cached loader_find_symbol, fatal if missing
 uint32_t hle_alloc(uint32_t size);        // zeroed guest memory owned by the host (never freed): guest address
 extern const char *g_game_dir;            // folder holding exefs/ and romfs/
+extern const char *g_backup_dir;          // host folder for save backups, NULL: <g_save_dir>/backups (services/fs.c)
 extern const char *g_save_dir;            // host folder for save data (services/fs.c; MHGU_SAVE_DIR overrides)
 void rt_unwind_point(void);
 extern volatile int g_rt_unwind;

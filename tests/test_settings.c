@@ -44,7 +44,7 @@ int main(int argc, char **argv) {
     assert(c.width == 0 && c.height == 0 && c.render_w == 0 && c.render_h == 0);
     assert(fabsf(c.fov - 1.1f) < 0.001f);
     assert(g_config.width == 900 && fabsf(g_config.fov - 1.6f) < 0.001f);
-    assert(c.hp.quests == 2 && c.language == 2 && c.button_icons == 0);
+    assert(c.hp.quests == 2 && c.language == 0 && c.button_icons == 0);
     assert(!config_restart_required(&c)); // Raw Auto/Desktop survives environment resolution.
     assert(fabsf(config_live_fov()-1.6f)<0.001f && fabsf(config_live_fps()-144.5f)<0.001f);
     Config volume_only=c; volume_only.volume=35;
@@ -113,7 +113,7 @@ int main(int argc, char **argv) {
     bad.menu_scale=201;assert(!config_save(&bad,error,sizeof error));
     bad = c; bad.button_icons = 3;
     assert(!config_save(&bad, error, sizeof error));
-    bad = c; bad.language = 3;
+    bad = c; bad.language = 4;  // (0-3: English, Spanish, Chinese, Korean)
     assert(!config_save(&bad, error, sizeof error));
     bad = c; bad.fov = NAN;
     assert(!config_save(&bad, error, sizeof error));
@@ -161,10 +161,6 @@ int main(int argc, char **argv) {
     assert(config_save(&loaded, error, sizeof error) && config_language() == 0);
     g_config = initial; config_load();
     assert(config_editable().language == 0 && config_language() == 0 && config_editable().button_icons == 1);
-    loaded.language = 2;
-    assert(config_save(&loaded,error,sizeof error) && config_language()==2);
-    text=read_file(path); assert(strstr(text,"Language = Chinese")); free(text);
-    loaded.language = 0; assert(config_save(&loaded,error,sizeof error));
     bool waiting=true;
     assert(menu_release_buttons(0x41,0xf,&waiting)==0x40 && waiting);
     assert(menu_release_buttons(0x42,0xf,&waiting)==0x40 && waiting);
@@ -183,6 +179,19 @@ int main(int argc, char **argv) {
     assert(config_defaults().shader_prewarm==1);
     assert(config_defaults().loading_indicator==1);
     assert(config_defaults().draw_distance==1.0f);
+    {  // [Graphics] AnisotropicFiltering: Off..16x, other spellings, nothing in between; live, no restart
+        assert(config_defaults().aniso==1);
+        const ConfigSetting *af=config_setting("AnisotropicFiltering");
+        Config t=config_defaults(); char v[32];
+        assert(af && config_setting("AF")==af && !af->restart);
+        assert(config_parse(af,"8x",&t) && t.aniso==8 && config_parse(af,"16",&t) && t.aniso==16);
+        config_format(af,&t,v,sizeof v); assert(!strcmp(v,"16x"));
+        assert(config_parse(af,"Off",&t) && t.aniso==1); config_format(af,&t,v,sizeof v); assert(!strcmp(v,"Off"));
+        assert(!config_parse(af,"3x",&t) && !config_parse(af,"32x",&t));
+        Config live=config_editable(); live.aniso=4; assert(config_save(&live,error,sizeof error) && config_live_aniso()==4);
+        assert(!config_restart_required(&live));
+        live.aniso=1; assert(config_save(&live,error,sizeof error) && config_live_aniso()==1);
+    }
     assert(config_defaults().mute_in_background==0);
     assert(config_defaults().combo_window==COMBO_LENIENT);
     assert(config_defaults().fxaa_mode==FXAA_ORIGINAL);
@@ -268,6 +277,21 @@ int main(int argc, char **argv) {
     assert(config_editable().binds[BIND_B][0] == SDL_SCANCODE_F && !config_editable().binds[BIND_B][1]);
     assert(config_editable().binds[BIND_RSTICK][1] == SDL_SCANCODE_RALT);
     remove(path);
-    puts("PASS: INI round trip, Auto/Desktop, environment overrides, comments/unknown keys, duplicate aliases, quest removal, invalid input, atomic write failure, live volume and English/Spanish, icons, hot settings, keybinds and restart classification.");
+    // A new player (no file yet): the menu in the system's language, when the menu has it, written to the new file;
+    // a file that is there keeps its own (English above, with no Language line)
+    const char *const locales[][2] = {{"ko-KR", "\nLanguage = 한국어"}, {"zh_TW", "\nLanguage = 中文"},
+                                      {"es", "\nLanguage = Spanish"}, {"fr-FR", "\nLanguage = English"}};
+    for (int i = 0; i < 4; i++) {
+        set_env("MHGU_LOCALE", locales[i][0]);
+        g_config = initial; config_load();
+        text = read_file(path);
+        const char *at = strstr(text, locales[i][1]);  // (the platform's line ends)
+        assert(g_config.language == (i == 3 ? 0 : 3 - i) && at && strchr("\r\n", at[strlen(locales[i][1])]));
+        free(text);
+        g_config = initial; config_load();  // (the file now there: what it says)
+        assert(g_config.language == (i == 3 ? 0 : 3 - i));
+        remove(path);
+    }
+    puts("PASS: INI round trip, Auto/Desktop, environment overrides, comments/unknown keys, duplicate aliases, quest removal, invalid input, atomic write failure, live volume and English/Spanish, icons, hot settings, keybinds and restart classification, a new player's menu language.");
     return 0;
 }

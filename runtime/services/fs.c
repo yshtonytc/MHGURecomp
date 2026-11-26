@@ -5,10 +5,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
+#include "../config.h"
 #include "../hle.h"
+#include "../forge.h"
 #include "../ipc.h"
+#include "../kernel.h"
 #include "../mods.h"
 #include "../romfs.h"
 
@@ -17,6 +21,7 @@
 #define FS_NOT_EMPTY MAKE_RESULT(2, 8)
 
 const char *g_save_dir = "save";
+const char *g_backup_dir;  // ([Save Backups] BackupLocation, ui.c; MHGU_BACKUP_DIR overrides)
 
 // ------------------------------------------------------------------ IStorage (the RomFS image)
 static void storage(Service *s, IpcReq *req, IpcResp *resp) {
@@ -67,7 +72,170 @@ static Service *open_romfs_storage(void) {
 #define MAX_PENDING 16
 typedef struct { char path[1100]; bool deleted, created; } Pending;  // created: the new content is in path + TMP_EXT
 typedef struct { char root[1024]; bool journal; int npending; Pending pending[MAX_PENDING]; } HostFs;
-typedef struct { int fd; char path[1100]; } HostFile;
+typedef struct HostFile {
+    int fd;
+    bool writes, save;       // save: on a save mount (one with commits)
+    char path[1100];
+    struct HostFile *wnext;  // (g_wfiles: open for writing)
+    double opened, closed;   // (ms, now_ms)
+    uint64_t thread;         // the guest thread that opened it
+    char callers[160];       // the game's calls that opened it (kernel_game_callers)
+    char plugins[200];       // and Forge plugins' (forge_stack_plugins)
+} HostFile;
+
+// Writing now (Pause/Suspend waits for it: runtime/pause.h): files open for writing, save mounts with changes not
+// committed yet (a save deletes, creates and writes its files, then commits), a commit with its backup
+static int g_writing;
+static void writing(int d) { __atomic_add_fetch(&g_writing, d, __ATOMIC_ACQ_REL); }
+bool fs_writing(void) { return __atomic_load_n(&g_writing, __ATOMIC_ACQUIRE) > 0; }
+
+static double now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
+}
+
+static uint64_t cur_thread(void) {
+    KThread *t = kernel_current_thread();
+    return t ? t->id : 0;
+}
+
+static void wait_ms(pthread_cond_t *cv, pthread_mutex_t *mu, long ms) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += ms * 1000000;
+    while (ts.tv_nsec >= 1000000000) ts.tv_sec++, ts.tv_nsec -= 1000000000;
+    pthread_cond_timedwait(cv, mu, &ts);
+}
+
+// The files open for writing now, and the last few closed: nn::fs aborts a save's commit while one is still open
+// (2002-6457, WriteModeFileNotClosed, checked in the game's own SDK before the commit reaches here), its own message
+// names no file, and the thread that has it open goes on while the abort is logged (often closing it). Each one keeps
+// who opened it and when (fs_log_open_writes, runtime/hle/abort.c). g_wfiles_cond: a file closed, a commit done.
+static pthread_mutex_t g_wfiles_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_wfiles_cond = PTHREAD_COND_INITIALIZER;
+static HostFile *g_wfiles;
+#define RECENT_CLOSED 4
+static HostFile g_closed[RECENT_CLOSED];  // (copies; the newest at (g_nclosed - 1) % RECENT_CLOSED)
+static unsigned g_nclosed;
+static uint64_t g_committer;  // the guest thread committing a save now (commit_guard), 0: none
+
+static void wfile_add(HostFile *f) {
+    Cpu *c = kernel_current_cpu();
+    f->thread = cur_thread();
+    if (c) {
+        kernel_game_callers(c->r[13], f->callers, sizeof f->callers);
+        forge_stack_plugins(c->r[13], f->plugins, sizeof f->plugins);
+    }
+    pthread_mutex_lock(&g_wfiles_lock);
+    // Opened for writing on a save while another thread commits it: wait for the commit (commit_guard checked that
+    // nothing was open for writing, and nn::fs checks it again after)
+    for (double t0 = now_ms(); f->save && g_committer && g_committer != f->thread && now_ms() - t0 < 10000;)
+        wait_ms(&g_wfiles_cond, &g_wfiles_lock, 5);
+    f->opened = now_ms();
+    f->wnext = g_wfiles;
+    g_wfiles = f;
+    pthread_mutex_unlock(&g_wfiles_lock);
+}
+
+static void wfile_remove(HostFile *f) {
+    pthread_mutex_lock(&g_wfiles_lock);
+    for (HostFile **p = &g_wfiles; *p; p = &(*p)->wnext)
+        if (*p == f) { *p = f->wnext; break; }
+    f->closed = now_ms();
+    g_closed[g_nclosed++ % RECENT_CLOSED] = *f;
+    pthread_cond_broadcast(&g_wfiles_cond);
+    pthread_mutex_unlock(&g_wfiles_lock);
+}
+
+static void log_wfile(const char *tag, const HostFile *f, double now) {
+    char closed[48] = "";
+    if (f->closed) snprintf(closed, sizeof closed, ", closed %.0f ms ago", now - f->closed);
+    LOG("%s: %s, opened %.0f ms ago%s by guest thread %llu, the game's calls:%s%s%s\n", tag, f->path, now - f->opened,
+        closed, (unsigned long long)f->thread, f->callers[0] ? f->callers : " (none found)",
+        f->plugins[0] ? ", Forge plugins' calls:" : "", f->plugins);
+}
+
+int fs_log_open_writes(const char *tag) {
+    int n = 0;
+    double now = now_ms();
+    char ctag[160];
+    snprintf(ctag, sizeof ctag, "%s (closed since)", tag);
+    pthread_mutex_lock(&g_wfiles_lock);  // (an abort: the lock is never held long, and never across a guest call)
+    for (HostFile *f = g_wfiles; f; f = f->wnext, n++) log_wfile(tag, f, now);
+    for (unsigned i = 0; i < RECENT_CLOSED && i < g_nclosed; i++) {  // (the newest first, the last 5 s)
+        const HostFile *f = &g_closed[(g_nclosed - 1 - i) % RECENT_CLOSED];
+        if (now - f->closed < 5000) log_wfile(ctag, f, now), n++;
+    }
+    if (n) LOG("%s: (this thread is guest thread %llu)\n", tag, (unsigned long long)cur_thread());
+    pthread_mutex_unlock(&g_wfiles_lock);
+    return n;
+}
+
+// ------------------------------------------------------------------ commits wait for other threads' writes
+// nn::fs's FileSystemAccessor::Commit aborts (2002-6457) when any file of the mount is open for writing. On the console
+// the game commits its save from the thread that writes it. Forge plugins commit it too, from the main thread
+// (forge_fs_unmountSaveData always commits; a plugin re-reading its settings every few seconds commits every few
+// seconds), while the game's save writes `system` on another thread: the game closed at the end of a hunt (2026-11-24,
+// a player with 15 plugins; reproduced with a plugin committing every frame and the game saving). So a commit waits
+// (COMMIT_WAIT_MS at most, then nn::fs decides) until no other thread has a file of the mount open for writing, by the
+// SDK's own list (the one it checks: a file closed here is in it a moment longer) and by the host's (a file still
+// being opened is not in the SDK's yet); while it runs, other threads' save files opened for writing wait
+// (wfile_add). This thread's own open file is not waited for (it would never close): nn::fs aborts as on the console.
+#define COMMIT_WAIT_MS 10000
+#define ACC_COMMIT_SYM "_ZN2nn2fs6detail18FileSystemAccessor6CommitEv"
+#define ACC_FILES      0x20  // FileSystemAccessor: its open files, an intrusive list (the sentinel here; next at +4)
+#define FILE_OPEN_MODE 0x18  // FileAccessor: its nn::fs::OpenMode (2: write; the bit Commit checks)
+static uint32_t g_acc_commit;
+
+static bool sdk_writes_open(uint32_t acc) {  // (read without the SDK's lock: the walk is bounded, and checked again)
+    uint32_t head = acc + ACC_FILES, f = LD32(head + 4);
+    for (int n = 0; f != head && n < 256 && kernel_mapped(f, FILE_OPEN_MODE + 4); n++, f = LD32(f + 4))
+        if (LD32(f + FILE_OPEN_MODE) & 2) return true;
+    return false;
+}
+
+static int save_writers(uint64_t me, bool mine) {  // (g_wfiles_lock held)
+    int n = 0;
+    for (HostFile *f = g_wfiles; f; f = f->wnext) n += f->save && (f->thread == me) == mine;
+    return n;
+}
+
+static void commit_guard(Cpu *c) {
+    uint32_t acc = c->r[0];
+    uint64_t me = cur_thread();
+    double t0 = now_ms();
+    bool waited = false;
+    pthread_mutex_lock(&g_wfiles_lock);
+    for (;;) {
+        bool busy = g_committer && g_committer != me;
+        if (!busy && (save_writers(me, true) || (!save_writers(me, false) && !sdk_writes_open(acc)))) break;
+        if (now_ms() - t0 >= COMMIT_WAIT_MS) {
+            LOG("[fs] a save commit waited %d ms for other threads' files open for writing: going ahead\n",
+                COMMIT_WAIT_MS);
+            break;
+        }
+        waited = true;
+        wait_ms(&g_wfiles_cond, &g_wfiles_lock, 2);  // (the SDK's list changes without a signal here)
+    }
+    if (waited) LOG("[fs] a save commit (guest thread %llu) waited %.0f ms for another thread's save file to close\n",
+                    (unsigned long long)me, now_ms() - t0);
+    uint64_t outer = g_committer;  // (this thread's own commit inside its commit: none known, kept anyway)
+    g_committer = me;
+    pthread_mutex_unlock(&g_wfiles_lock);
+    fnhook_call_next(c, g_acc_commit);
+    pthread_mutex_lock(&g_wfiles_lock);
+    g_committer = outer;
+    pthread_cond_broadcast(&g_wfiles_cond);
+    pthread_mutex_unlock(&g_wfiles_lock);
+}
+
+void fs_commit_guard_init(void) {
+    if (getenv("MHGU_NO_COMMIT_GUARD")) return;  // (A/B: commits as on the console)
+    g_acc_commit = loader_find_symbol(ACC_COMMIT_SYM);
+    if (!g_acc_commit || !fnhook_set_outer(g_acc_commit, hle_register("fs:commit_guard", commit_guard)))
+        LOG("[fs] %s not hooked: save commits do not wait for other threads' writes\n", ACC_COMMIT_SYM);
+}
 typedef struct { DIR *d; char path[1024]; int mode; } HostDir;
 
 static const char *in_path(IpcReq *req, int i) {
@@ -145,6 +313,7 @@ static Pending *pending(HostFs *fs, const char *p) {
 static Pending *pending_add(HostFs *fs, const char *p) {
     Pending *q = pending(fs, p);
     if (q || fs->npending == MAX_PENDING) return q;
+    if (!fs->npending) writing(1);
     q = &fs->pending[fs->npending++];
     memset(q, 0, sizeof *q);
     snprintf(q->path, sizeof q->path, "%s", p);
@@ -173,6 +342,7 @@ static bool fs_commit(HostFs *fs) {
             LOG("[fs] commit: deleting %s: %s\n", q->path, strerror(errno));
         }
     }
+    if (fs->npending) writing(-1);
     fs->npending = 0;
     return ok;
 }
@@ -184,7 +354,164 @@ static void fs_discard(HostFs *fs) {
         tmp_path(fs->pending[i].path, TMP_EXT, tmp, sizeof tmp);
         if (fs->pending[i].created) unlink(tmp);
     }
+    if (fs->npending) writing(-1);
     fs->npending = 0;
+}
+
+// ------------------------------------------------------------------ save backups
+// [Save Backups] Backups: after each commit of save_0, its save files (system, system_backup) are copied to
+// <backups>/<YYYY-MM-DD_HH-MM-SS>/, <backups> being BackupLocation or <save folder>/backups. A copy is made in
+// <name>.partial and renamed when complete, so a backup's folder always holds a whole save. The game saves in two
+// commits a second or so apart (system, then system_backup): the first one's backup is half a save, and the second
+// one's replaces it. Past BackupsKept, the oldest go. Only a folder named like a backup that holds nothing but save
+// files is ever counted or deleted, and it is deleted file by file, never recursively: other folders and files in
+// BackupLocation (which can be any folder) are not touched. A failure only logs: the game's save has already succeeded.
+#define BACKUP_EXT ".partial"
+#define MAX_BACKUPS 512
+#define SAVE_STEPS_SECONDS 5  // (a commit this soon after the last backup was made: the same save's next step)
+static void mkdirs(const char *path);
+static const char *const save_files[] = {"system", "system_backup"};
+#define NSAVE_FILES (int)(sizeof save_files / sizeof *save_files)
+
+static void backup_root(char *out, size_t n) {
+    if (getenv("MHGU_BACKUP_DIR")) snprintf(out, n, "%s", getenv("MHGU_BACKUP_DIR"));
+    else if (g_backup_dir) snprintf(out, n, "%s", g_backup_dir);
+    else snprintf(out, n, "%s/backups", g_save_dir);
+}
+
+// A backup's folder name: YYYY-MM-DD_HH-MM-SS (the game can't save twice in one second), with BACKUP_EXT while made.
+static bool is_backup_name(const char *s, bool partial) {
+    static const char form[] = "dddd-dd-dd_dd-dd-dd";
+    for (int i = 0; form[i]; i++)
+        if (form[i] == 'd' ? (s[i] < '0' || s[i] > '9') : s[i] != form[i]) return false;
+    return !strcmp(s + sizeof form - 1, partial ? BACKUP_EXT : "");
+}
+
+static bool is_save_file_name(const char *name) {
+    for (int i = 0; i < NSAVE_FILES; i++) if (!strcmp(name, save_files[i])) return true;
+    return false;
+}
+
+// Whether the folder holds nothing but save files (regular files named as one), at least min of them. The folder and
+// its files must be themselves, not links: a link named like a backup can lead to a real save (a symlink, a junction).
+static bool only_save_files(const char *dir, int min) {
+    if (!plat_plain_entry(dir, true)) return false;
+    DIR *d = opendir(dir);
+    if (!d) return false;
+    int n = 0;
+    bool only = true;
+    struct dirent *e;
+    while (only && (e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char p[2048];
+        snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
+        only = is_save_file_name(e->d_name) && plat_plain_entry(p, false);
+        n++;
+    }
+    closedir(d);
+    return only && n >= min;
+}
+
+// Deletes a backup's folder: only if it holds nothing but save files, and only those files and the folder itself.
+static bool delete_backup(const char *dir, int min) {
+    if (!only_save_files(dir, min)) {
+        LOG("[fs] %s is not only a save backup (other files, a link, or not readable): left as it is\n", dir);
+        return false;
+    }
+    for (int i = 0; i < NSAVE_FILES; i++) {
+        char p[2048];
+        snprintf(p, sizeof p, "%s/%s", dir, save_files[i]);
+        if (unlink(p) && errno != ENOENT) { LOG("[fs] deleting %s: %s\n", p, strerror(errno)); return false; }
+    }
+    if (rmdir(dir)) { LOG("[fs] deleting %s: %s\n", dir, strerror(errno)); return false; }
+    return true;
+}
+
+static int cmp_names(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+
+// The backups' folder names, oldest first (the names sort by time). Partial ones a stop left are deleted.
+static int list_backups(const char *root, char **names, int max) {
+    DIR *d = opendir(root);
+    if (!d) return 0;
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        bool partial = is_backup_name(e->d_name, true);
+        if (!partial && !is_backup_name(e->d_name, false)) continue;
+        char p[2048];
+        snprintf(p, sizeof p, "%s/%s", root, e->d_name);
+        if (partial) delete_backup(p, 0);
+        else if (n < max && only_save_files(p, 1)) names[n++] = strdup(e->d_name);
+    }
+    closedir(d);
+    qsort(names, (size_t)n, sizeof *names, cmp_names);
+    return n;
+}
+
+static void save_backup(const char *save) {
+    int keep = config_live_save_backups();
+    char path[1300];
+    struct stat st;
+    snprintf(path, sizeof path, "%s/%s", save, save_files[0]);
+    if (keep <= 0 || stat(path, &st)) return;  // (off, or no save yet)
+    char root[1100];
+    backup_root(root, sizeof root);
+    mkdirs(root);
+    char *names[MAX_BACKUPS + 1];
+    int n = list_backups(root, names, MAX_BACKUPS);
+
+    time_t now = time(NULL);
+    char name[64];
+    strftime(name, sizeof name, "%Y-%m-%d_%H-%M-%S", localtime(&now));
+    snprintf(path, sizeof path, "%s/%s", root, name);
+    char part[1400];
+    snprintf(part, sizeof part, "%s" BACKUP_EXT, path);
+    mkdirs(part);
+    bool ok = true;
+    for (int i = 0; ok && i < NSAVE_FILES; i++) {
+        char src[2048], dst[2048];
+        snprintf(src, sizeof src, "%s/%s", save, save_files[i]);
+        snprintf(dst, sizeof dst, "%s/%s", part, save_files[i]);
+        if (stat(src, &st)) continue;
+        if (!(ok = copy_over(src, dst))) LOG("[fs] save backup: copying %s: %s\n", src, strerror(errno));
+    }
+    // (the same save's first step: this run's last backup, made a moment ago, and still the newest)
+    static char step[64];
+    static time_t step_at;
+    bool replace = ok && step[0] && n && !strcmp(names[n - 1], step) && time(NULL) - step_at <= SAVE_STEPS_SECONDS;
+    char old[1300] = "";
+    if (replace) snprintf(old, sizeof old, "%s/%s", root, names[n - 1]);
+    if (replace && !strcmp(name, names[n - 1]) && !delete_backup(old, 1)) ok = false;  // (in its second: its name)
+    if (ok && rename(part, path)) {
+        LOG("[fs] save backup: %s: %s\n", path, strerror(errno));
+        ok = false;
+    }
+    if (!ok) {
+        delete_backup(part, 0);
+        step[0] = 0;
+    } else {
+        LOG("[fs] save backup: %s\n", path);
+        if (replace) {
+            if (strcmp(name, names[n - 1])) delete_backup(old, 1);
+            LOG("[fs] (it replaces %s, the same save's first step)\n", names[n - 1]);
+            free(names[--n]);
+        }
+        names[n++] = NULL;  // (the new one: counts toward the kept ones, never deleted)
+        snprintf(step, sizeof step, "%s", replace ? "" : name);  // (a save is two steps: a whole one starts the next)
+        step_at = time(NULL);  // (after the copy: on a slow drive, it took a while)
+    }
+    for (int i = 0; i < n; i++) {
+        if (names[i] && i < n - keep) {
+            snprintf(path, sizeof path, "%s/%s", root, names[i]);
+            if (delete_backup(path, 1)) LOG("[fs] old save backup deleted: %s\n", path);
+        }
+        free(names[i]);
+    }
+}
+
+static bool is_main_save(const char *root) {
+    size_t n = strlen(root);
+    return n >= 7 && !strcmp(root + n - 7, "/save_0");
 }
 
 // First mount of a save folder this run: finish an interrupted commit, drop uncommitted files.
@@ -259,6 +586,7 @@ static void file(Service *s, IpcReq *req, IpcResp *resp) {
 static void file_close(Service *s) {
     HostFile *f = s->state;
     if (f->fd >= 0) close(f->fd);
+    if (f->writes) writing(-1), wfile_remove(f);
     free(f);
 }
 
@@ -391,6 +719,8 @@ static void filesystem(Service *s, IpcReq *req, IpcResp *resp) {
         HostFile *f = calloc(1, sizeof *f);
         f->fd = fd;
         strlcpy(f->path, p, sizeof f->path);
+        f->save = fs->journal;
+        if ((f->writes = (mode & 6) != 0)) writing(1), wfile_add(f);  // (Write, Append)
         Service *fsvc = service_new("IFile", file, f);
         fsvc->on_close = file_close;
         ipc_return_object(resp, fsvc);
@@ -407,7 +737,13 @@ static void filesystem(Service *s, IpcReq *req, IpcResp *resp) {
         break;
     }
     case 10:  // Commit
-        if (fs->journal && !fs_commit(fs)) resp->result = MAKE_RESULT(2, 4000);
+        if (fs->journal) {
+            bool changed = fs->npending > 0;
+            writing(1);
+            if (!fs_commit(fs)) resp->result = MAKE_RESULT(2, 4000);
+            else if (changed && is_main_save(fs->root)) save_backup(fs->root);
+            writing(-1);
+        }
         break;
     case 11: case 12: OUT(int64_t, 0) = 0x40000000; resp_size(resp, 8); break;  // free / total space
     case 13: rm_rf(p, true); break;

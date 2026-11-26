@@ -210,6 +210,19 @@ bool plat_use_folder(const char *utf8, char *buf, size_t size) {
     return len > 0 && !lossy;
 }
 
+const char *plat_utf8_path(const char *path, char *buf, size_t size) {
+    wchar_t w[1024];
+    int n = MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, path, -1, w, 1024);
+    if (!n || !WideCharToMultiByte(CP_UTF8, 0, w, -1, buf, (int)size, NULL, NULL)) snprintf(buf, size, "%s", path);
+    return buf;
+}
+
+bool plat_plain_entry(const char *path, bool dir) {
+    DWORD a = GetFileAttributesA(path);  // (a symlink or junction is a reparse point; GetFileAttributes doesn't follow it)
+    if (a == INVALID_FILE_ATTRIBUTES || (a & FILE_ATTRIBUTE_REPARSE_POINT)) return false;
+    return dir ? (a & FILE_ATTRIBUTE_DIRECTORY) != 0 : !(a & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_DEVICE));
+}
+
 static int count_files(const char *dir, int depth) {
     char pat[MAX_PATH * 2];
     if (depth > 32 || snprintf(pat, sizeof pat, "%s\\*", dir) >= (int)sizeof pat) return 0;
@@ -234,6 +247,8 @@ void plat_fatal_notice(void) {
     if (g_own_log)
         plat_error_box("The game stopped because of an error. The details are in log.txt, next to mhgurecomp.exe.");
 }
+
+void plat_x11_display(void *display) { (void)display; }  // (no X11 here)
 
 // ---- diagnostics
 const char *plat_symbol(uint64_t pc, uint64_t *offset) {

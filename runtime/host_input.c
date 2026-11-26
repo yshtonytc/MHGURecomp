@@ -8,6 +8,7 @@
 //   hunt, one item per press or notch without holding L, runtime/hle/itembar.c). While the
 //   game shows a text entry (names, chat) the keyboard types instead
 //   (runtime/textinput.c). / ([Controls] ChatKey) opens a line of chat, Enter sends it, also in a quest (runtime/hle/chat.c).
+//   Pause ([Controls] PauseKey) pauses the game offline and resumes it, as Esc and Enter do then (runtime/pause.h).
 //   F11 switches windowed <-> full screen, F12 saves a screenshot, Shift+F12 the next 8
 //   frames (exact rendered pixels, run\shots\), F10 dumps every render pass of the next 2 frames (debug, slow), F9 toggles how colour clears are done (debug).
 // Gamepad (SDL): face buttons by position as on a Switch controller (the bottom one is B), or by their labels
@@ -36,8 +37,12 @@
 #include "hle/menuptr.h"
 #include "hle/mousecam.h"
 #include "keymap.h"
+#ifdef MHGU_DUAL_SCREEN
+#include "nvn/vulkan/bottom_hud.h"
+#endif
 #include "mods.h"
 #include "overlay.h"
+#include "pause.h"
 #include "settings_panel.h"
 #include "rt.h"
 #include "textinput.h"
@@ -289,6 +294,7 @@ static void script_parse(void) {
 //   dump [n]               save colour target 0 (or the depth of a depth-only pass) of every render pass of the next
 //                          frame (shots/pass_*.png), or of the next n frames (shots/f<i>_pass_*.png for i >= 1)
 //   hudtrace               log every HUD quad of the next frame: its layer, place, and where 16:10 / ultrawide moved it
+//   bottomtouch <u> <v> | bottomtouch up   (dual screen) a finger on the bottom screen at picture pixel u, v, or lifted
 //   frame                  log the current frame number
 //   fps <n>                (debug) the frame rate target from now on, 30..240 (not saved)
 //   dummy <cm> <degrees>   (debug, MHGU_DUMMY) the held monster's distance and its heading from the hunter's
@@ -329,6 +335,13 @@ static void control_poll(void) {
             if (!strcmp(cmd, "gpuprof")) { extern volatile int g_gpuprof_request; g_gpuprof_request = 1; continue; }
             if (!strcmp(cmd, "hudtrace")) { g_hudtrace_request = 1; continue; }
             if (!strcmp(cmd, "pieces")) { void menulearn_request_log(void); menulearn_request_log(); continue; }
+#ifdef MHGU_DUAL_SCREEN
+            if (!strcmp(cmd, "bottomtouch")) {  // bottomtouch <u> <v> | up: a finger on the bottom screen (test)
+                bool down = strcmp(arg, "up") != 0;
+                bottom_hud_touch(down, down ? (uint32_t)atoi(arg) : 0, down ? (uint32_t)atoi(arg2) : 0);
+                continue;
+            }
+#endif
             if (!strcmp(cmd, "dump")) { g_dump_request = atoi(arg) > 0 ? atoi(arg) : 1; continue; }
             if (!strcmp(cmd, "memsave")) {  // memsave <guest hex address> <hex bytes> <file>: raw guest memory to a file
                 char path[200] = "";
@@ -343,9 +356,12 @@ static void control_poll(void) {
                 forge_test_hook((uint32_t)strtoul(arg, NULL, 16));
                 continue;
             }
-            if (!strcmp(cmd, "interpwatch")) {  // interpwatch <guest hex addr> <file of hex entries>: run those game
-                // functions (and all game code they call) in the interpreter, logging what changes the word at addr
+            if (!strcmp(cmd, "interpwatch")) {  // interpwatch <guest hex addr> <file of hex entries> [n]: run those game
+                // functions (and all game code they call) in the interpreter, logging the first n (default 40) changes
+                // of the word at addr
                 void interp_watch(uint32_t, int);
+                char arg3[16] = "";
+                sscanf(line, "%*s %*s %*s %15s", arg3);
                 void interp_add_range(uint32_t, uint32_t);
                 int dispatch_interpret(uint32_t, uint32_t);
                 FILE *fl = fopen(arg2, "r");
@@ -357,7 +373,7 @@ static void control_poll(void) {
                     if (e && dispatch_interpret(e, e + 4) > 0) n++;
                 }
                 if (fl) fclose(fl);
-                interp_watch((uint32_t)strtoul(arg, NULL, 16), 40);
+                interp_watch((uint32_t)strtoul(arg, NULL, 16), atoi(arg3) > 0 ? atoi(arg3) : 40);
                 LOG("[watch] %s: %d functions interpreted\n", arg, n);
                 continue;
             }
@@ -657,6 +673,10 @@ static void control_poll(void) {
             } else if (!strcmp(cmd, "fps")) {
                 config_set_live_fps(strtof(arg, NULL));
                 LOG("[control] frame rate target %.0f\n", (double)config_live_fps());
+            } else if (!strcmp(cmd, "af")) {  // af <0|1|2|4|8|16>: [Graphics] AnisotropicFiltering for now (not saved;
+                                              // 0: none, not even the game's own)
+                config_set_live_aniso(atoi(arg));
+                LOG("[control] anisotropic filtering %dx\n", config_live_aniso());
             } else if (!strcmp(cmd, "dummy")) {
                 dummy_set(strtof(arg, NULL), strtof(arg2, NULL));
             } else {
@@ -852,12 +872,14 @@ static void menu_ptr_click(int btn, float mx, float my, int clicks) {
     if (hit >= 0) menuptr_select_at(hit, true, menu_ptr_gx, menu_ptr_gy);
     else if (hit == MENUPTR_PAGE_LEFT) host_input_press("LEFT", 12);
     else if (hit == MENUPTR_PAGE_RIGHT) host_input_press("RIGHT", 12);
-    // (a screen of a hunt's menu with no known cells - an option being changed in Options, Quest Info...: the click is
-    // Confirm there, as a right click is Cancel; a click beside a known menu's rows still does nothing)
-    else if (!menuptr_open()) host_input_press("A", 12);
+    // (a screen of a hunt's menu with no known cells - an option being changed in Options, Quest Info..., a "how many?"
+    // count or a message waiting for Confirm: the click is Confirm there, as a right click is Cancel; a click beside a
+    // known menu's rows still does nothing)
+    else if (!menuptr_open() || menuptr_click_confirms()) host_input_press("A", 12);
 }
 static void menu_ptr_wheel(int n) {  // (n > 0 up: a menu of pages turns to the previous one; else the row above)
     if (menuptr_slider_open()) return menuptr_slider_step(n > 0 ? 1 : -1);  // (Skin Tone: a tone a notch)
+    if (menuptr_spinner_open()) return menuptr_spinner_step(n);  // (a "how many?": the count, up or down a notch)
     if (menuptr_pages() > 1) return menuptr_page_turn(n > 0 ? -1 : 1);
     int cell = menuptr_row(), cells = menuptr_rows(), cols = menuptr_cols();
     if (cell < 0 || cells <= 0) return;
@@ -892,6 +914,12 @@ void host_input_event(const SDL_Event *e) {
                 keys[e->key.scancode] = false;  // (Alt+Enter: windowed <-> full screen, not a button press)
                 keys[SDL_SCANCODE_LALT] = keys[SDL_SCANCODE_RALT] = false;
                 ui_toggle_fullscreen();
+            } else if ((int)e->key.scancode == config_live_pause_key() && config_live_pause_key()) {
+                keys[e->key.scancode] = false;
+                pause_toggle();  // (Pause/Suspend: runtime/pause.h)
+            } else if ((e->key.scancode == SDL_SCANCODE_ESCAPE || e->key.scancode == SDL_SCANCODE_RETURN ||
+                        e->key.scancode == SDL_SCANCODE_KP_ENTER) && pause_wanted() && pause_resume()) {
+                keys[e->key.scancode] = false;  // (Esc and Enter resume a pause, and do nothing else)
             } else if ((int)e->key.scancode == config_live_chat_key() && config_live_chat_key()) {
                 keys[e->key.scancode] = false;
                 chat_open();  // (a line to type, sent as chat: runtime/hle/chat.c)
@@ -1009,7 +1037,8 @@ static void mouse_update(int *rx, int *ry) {
     static bool menu_tree;
     if (menuptr_open()) menu_tree = true;
     else if (!input_view_hunt_menu_open()) menu_tree = false;
-    bool menu = menu_tree && !overlay_menu_open() && !chat_active() && !host_input_mouse_free();
+    // ([Mouse] MenuMouse = Off: never - the mouse stays the camera / right stick and its clicks the keybinds' buttons)
+    bool menu = menu_tree && config_live_menu_mouse() && !overlay_menu_open() && !chat_active() && !host_input_mouse_free();
     // (a mouse captured with a controller in use - MouseCapture = Hunt, or a click long ago - is not the one in use)
     if (menu && !menu_ptr) menu_ptr_idle(), menu_ptr_live = menu_ptr_warp = mouse_captured && host_input_last_device() == 1;
     if (!menu) menu_ptr_idle(), menu_ptr_warp = false;
@@ -1418,6 +1447,13 @@ void host_input_update(void) {
         else if (down & B(cancel)) textinput_key(TI_CANCEL);
         b &= ~(B(BTN_PLUS) | B(cancel));
     }
+#ifdef MHGU_DUAL_SCREEN
+    if (g_bottom_hud_on) {  // (the bottom screen's touch: bottom_hud.c)
+        uint64_t untouched = b;
+        bottom_hud_touch_input(&b, &rx, &ry);
+        script_b |= b & ~untouched;  // (its presses have no key behind them: the actions take them as scripted input)
+    }
+#endif
     act_update(b, script_b, menu || (typing && !chat_active()));
     input_set(b, clamp_axis(lx), clamp_axis(ly), clamp_axis(rx), clamp_axis(ry));
 }

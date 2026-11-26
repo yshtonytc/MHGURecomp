@@ -257,7 +257,7 @@ RT_CXX   := $(O)/rt/nvn/vulkan/vma.o $(FSR_OBJ)
 endif
 
 all: $(EXE) $(if $(GEN_SRC),$(GAMELIB)) $(UPDATER) $(if $(filter windows,$(PLATFORM)),bundle) \
-     $(if $(ANDROID),apk,data licenses pipelist)
+     $(if $(ANDROID),apk,data licenses pipelist cjkfont)
 
 # Host-only INI/settings regression test: no game dump or generated code required.
 .PHONY: test-settings
@@ -372,7 +372,9 @@ $(O)/fsr/%.c.o: $(FSR)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) -std=c11 $(FSRFLAGS) -c $< -o $@
 
-$(O)/fsr/%.cpp.o: $(FSR)/%.cpp
+# (no header dependencies are tracked: the -include'd headers go into every FSR C++ object)
+FSR_FORCED := $(addprefix $(FSR)/src/,ffx_1_1_4_portability.hpp ffx_mingw_portability.hpp ffx_error_site.hpp)
+$(O)/fsr/%.cpp.o: $(FSR)/%.cpp $(FSR_FORCED) $(FSR)/include/ffx_vk_portable.h
 	@mkdir -p $(dir $@)
 	$(CXX) -std=c++17 $(FSRFLAGS) -include $(FSR)/src/$(if $(filter windows,$(PLATFORM)),ffx_mingw_portability.hpp,ffx_1_1_4_portability.hpp) -c $< -o $@
 
@@ -506,6 +508,16 @@ $(B)/pipelines.list: extras/pipelines.list
 	@mkdir -p $(dir $@)
 	cp $< $@
 
+# The glyphs ImGui's font has not (the host menu's Chinese and Korean translations, kana, arrows and shapes), which
+# the overlay loads from beside the program (runtime/overlay.cpp): a subset of Noto Sans CJK SC
+# (tools/subset_cjk_font.py), SIL Open Font License 1.1 (THIRD_PARTY_NOTICES). Android has it in the APK's assets
+# (android/apk.mk): its own Noto Sans CJK is a variable font from Android 13 on, which ImGui can't read.
+CJK_FONTS := mhgurecomp-cjk.otf
+$(B)/mhgurecomp-%.otf: extras/mhgurecomp-%.otf
+	@mkdir -p $(dir $@)
+	cp $< $@
+cjkfont: $(addprefix $(B)/,$(CJK_FONTS))
+
 LICENSE_TXT = $(B)/licenses/LICENSE.txt $(B)/licenses/THIRD_PARTY_NOTICES.txt $(if $(AV_DEPS),$(B)/licenses/FFmpeg.txt) \
               $(if $(SDL_DEPS),$(B)/licenses/SDL3.txt) $(if $(SHADERC_DEPS),$(B)/licenses/shaderc.txt) \
               $(if $(ZSTD_DEPS),$(B)/licenses/zstd.txt)
@@ -606,7 +618,7 @@ dist: all
 	$(if $(ANDROID_DIST),$(MAKE) PLATFORM=android ABI=arm64-v8a dist $(if $(BONUS),BONUS="$(abspath $(BONUS))"),@echo "dist: no Android SDK: no APK")
 endif
 
-.PHONY: all gen test-lift runtime-objs clean bundle data licenses pipelist dist FORCE
+.PHONY: all gen test-lift runtime-objs clean bundle data licenses pipelist cjkfont dist FORCE
 
 ifeq ($(PLATFORM),android)
 include android/apk.mk

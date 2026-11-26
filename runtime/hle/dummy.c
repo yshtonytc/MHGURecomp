@@ -28,6 +28,13 @@ static uint32_t g_dummy;  // the monster held, 0 none
 static int g_slot = -1;
 static bool g_face;
 static float g_turn = 180.0f;  // (degrees added to the hunter's heading; the control file's "dummy <cm> <degrees>")
+// MHGU_DUMMY_SCALE=<x>: the held monster's model scale (object +0x60, x y z) set to x every update, so its size doesn't
+// depend on the quest's random size roll. The scale it had is logged once.
+static float g_scale;
+// MHGU_DUMMY_AIM=<pitch>: our hunter's aim pitch (player +0x14b8 and its copy +0x14bc, -100..100) set every update, so
+// shots fly along the same line in every run. The hits log the pitch either way.
+static bool g_aim_set;
+static float g_aim;
 
 static uint32_t local_player(void) {
     uint32_t gc = LD32(G_GAMECONTROL), sp = LD32(G_SPLAYER);
@@ -53,6 +60,13 @@ static void hold(Cpu *c) {
         if (info && LD16(info + 0x1b6) < 10000) en = e;
     }
     if (!en) return;
+    static uint32_t logged;
+    if (logged != en) {
+        logged = en;
+        LOG("[dummy] holding %08x: scale %.4f %.4f %.4f\n", en, (double)LDF(en + 0x60), (double)LDF(en + 0x64), (double)LDF(en + 0x68));
+    }
+    if (g_scale > 0) STF(en + 0x60, g_scale), STF(en + 0x64, g_scale), STF(en + 0x68, g_scale);
+    if (g_aim_set && pl == local_player()) STF(pl + 0x14b8, g_aim), STF(pl + 0x14bc, g_aim);
     // After a "dummy" control command our own hunter, when it is the one held for, stays where it was then (combos walk
     // it onto slopes, where blows meet another part) with its HP topped up.
     if (g_pin_state && pl == local_player()) {
@@ -113,18 +127,91 @@ static void summon_once(void) {
     STF(pos + 8, LDF(pl + OBJ_POS + 8) + fz * g_summon);
     ST8(en + OBJ_ZONE, LD8(pl + OBJ_ZONE));
     g_summoned = true;
-    LOG("[dummy] summoned the large monster %.0f cm in front of the hunter, zone %u\n", (double)g_summon, LD8(pl + OBJ_ZONE));
+    LOG("[dummy] summoned the large monster %.0f cm in front of the hunter, zone %u (hunter %08x)\n", (double)g_summon,
+        LD8(pl + OBJ_ZONE), pl);
 }
 
+// MHGU_SUMMON_KEEPHP=1 (with MHGU_SUMMON): the large monster's HP goes back to its maximum whenever it falls under half (on
+// the game that runs it), so a long run doesn't end in a kill and the monster never reaches its low-HP behaviour; and
+// every 2 s its HP and its attention scores for the 4 hunters (status +0x254) are logged.
+static bool g_keephp;
+static float g_stick;
+
+static void keep_hp(void) {
+    uint32_t sen = LD32(G_SENEMY);
+    if (!sen) return;
+    for (int k = 0; k < MAX_EN; k++) {
+        uint32_t e = LD32(sen + 0x1c + 4u * (uint32_t)k), info = e ? LD32(e + EN_INFO) : 0;
+        if (!info || LD16(info + 0x1b6) >= 10000) continue;
+        int hp = (int)LD32(info + 0x370), max = (int)LD32(info + 0x374);
+        if (LD8(e + 0x7420) && max > 0 && hp > 0 && hp < max / 2) {
+            ST32(info + 0x370, (uint32_t)max);
+            LOG("[dummy] keephp: monster HP %d -> %d\n", hp, max);
+        }
+        static uint64_t last;
+        uint64_t now = plat_now_ns();
+        if (now - last >= 2000000000ull) {
+            last = now;
+            LOG("[dummy] keephp: HP %d/%d, runs it %u, hate %d %d %d %d\n", hp, max, LD8(e + 0x7420), (int)LD32(info + 0x254),
+                (int)LD32(info + 0x258), (int)LD32(info + 0x25c), (int)LD32(info + 0x260));
+        }
+        return;
+    }
+}
+
+static uint32_t g_updates;  // collision updates so far (the hit log's clock)
+
 static void collision(Cpu *c) {
+    g_updates++;
     if (g_summon > 0) {
         uint32_t pl = local_player();
-        if (pl) ST16(pl + 0x13d6, 5000), ST16(pl + 0x13da, 5000);  // (the hunter's HP and its red part, above any one hit: it lasts as long as the test)
+        // (a hit since the last update: logged, for counting how often attacks land. The game now and then puts the HP back
+        // to its maximum, +0x13d8: that is no hit)
+        // MHGU_SUMMON_HP: 5000 (default) as below; "max": topped up to the hunter's own maximum instead (hits then show
+        // as HP lost below it; a single hit above the maximum still carts); 0: left alone
+        static int mode = -1;  // (0 alone, 1 5000, 2 max)
+        if (mode < 0) {
+            const char *m = getenv("MHGU_SUMMON_HP");
+            mode = !m || !*m ? 1 : *m == '0' ? 0 : *m == 'm' ? 2 : 1;
+        }
+        int hp = pl ? (int)LD16(pl + 0x13d6) : 5000, hp_max = pl ? (int)LD16(pl + 0x13d8) : 0;
+        int top = mode == 2 ? hp_max : 5000;
+        if (pl && mode == 1 && hp < 5000 && hp != hp_max)
+            LOG("[dummy] hunter hit: HP -%d at %.1f %.1f %.1f, update %u\n", hp > hp_max ? 5000 - hp : hp_max - hp,
+                (double)LDF(pl + 0x40), (double)LDF(pl + 0x44), (double)LDF(pl + 0x48), g_updates);
+        if (pl && mode == 2 && hp < hp_max)
+            LOG("[dummy] hunter hit: HP -%d at %.1f %.1f %.1f, update %u\n", hp_max - hp, (double)LDF(pl + 0x40),
+                (double)LDF(pl + 0x44), (double)LDF(pl + 0x48), g_updates);
+        if (pl && mode) ST16(pl + 0x13d6, top), ST16(pl + 0x13da, top);  // (the hunter's HP and its red part: it lasts as long as the test)
+        if (g_keephp) keep_hp();
         summon_once();
         // The hunter stays where the first summon found it: knocked out of the area it would be put back in the camp.
+        // MHGU_SUMMON_STICK=<cm>, on a game that doesn't run the monster: the hunter instead stays that far behind the
+        // monster along its own heading, so it faces the monster and its swings land (multiplayer: a joiner that hits all the time).
         static uint32_t pin_pl;
         static float pin[3];
-        if (pl && g_summoned) {
+        uint32_t sen = LD32(G_SENEMY), en = 0;
+        for (int k = 0; g_stick > 0 && sen && k < MAX_EN && !en; k++) {
+            uint32_t e = LD32(sen + 0x1c + 4u * (uint32_t)k), info = e ? LD32(e + EN_INFO) : 0;
+            if (info && LD16(info + 0x1b6) < 10000) en = e;
+        }
+        if (pl && en && !LD8(en + 0x7420) && LD8(en + OBJ_ZONE) == LD8(pl + OBJ_ZONE)) {
+            float qx = LDF(pl + OBJ_ROT), qy = LDF(pl + OBJ_ROT + 4), qz = LDF(pl + OBJ_ROT + 8), qw = LDF(pl + OBJ_ROT + 12);
+            float fx = 2 * (qx * qz + qw * qy), fz = 1 - 2 * (qx * qx + qy * qy), n = sqrtf(fx * fx + fz * fz);
+            if (pin_pl != pl) pin_pl = pl, pin[0] = LDF(pl + OBJ_POS), pin[1] = LDF(pl + OBJ_POS + 4), pin[2] = LDF(pl + OBJ_POS + 8);
+            if (n > 0.01f) {
+                // (no further than 1000 cm from where the hunter first stood in the monster's area: following the monster
+                // anywhere can put the hunter over an area's exit, back to the camp)
+                uint32_t pos = LD32(en + EN_INFO) + 0x40;
+                float x = LDF(pos) - fx / n * g_stick, z = LDF(pos + 8) - fz / n * g_stick;
+                float dx = x - pin[0], dz = z - pin[2], d = sqrtf(dx * dx + dz * dz);
+                bool far = d > 1000.0f;
+                if (far) x = pin[0] + dx * 1000.0f / d, z = pin[2] + dz * 1000.0f / d;
+                STF(pl + OBJ_POS, x);
+                STF(pl + OBJ_POS + 4, far ? pin[1] : LDF(pos + 4));
+                STF(pl + OBJ_POS + 8, z);
+            }
+        } else if (pl && g_summoned) {
             if (pin_pl != pl) pin_pl = pl, pin[0] = LDF(pl + OBJ_POS), pin[1] = LDF(pl + OBJ_POS + 4), pin[2] = LDF(pl + OBJ_POS + 8);
             STF(pl + OBJ_POS, pin[0]), STF(pl + OBJ_POS + 4, pin[1]), STF(pl + OBJ_POS + 8, pin[2]);
         }
@@ -136,10 +223,40 @@ static void collision(Cpu *c) {
 
 static void damage(Cpu *c) {
     if (c->r[0] == g_dummy) {
-        LOG("[dummy] hit: part %u, damage %d, kind %u\n", c->r[1], (int)c->r[2], c->r[3]);
+        uint32_t pl = local_player();
+        LOG("[dummy] hit: part %u, damage %d, kind %u, update %u, %.1f ms, aim %.2f, scale %.3f\n", c->r[1], (int)c->r[2], c->r[3],
+            g_updates, (double)(plat_now_ns() / 100000ull) / 10.0, pl ? (double)LDF(pl + 0x14b8) : 0.0, (double)LDF(g_dummy + 0x60));
         c->r[2] = 1;
     }
     fnhook_call_original(c, FN_EN_DAMAGE);
+}
+
+// (debug, temporary) MHGU_ATKTRACE=1: the generic attack update (0x36919c, r0 the attack): each new owner logged once with
+// the attack's kind (+0x6d), type (+0x3a) and windows (+0x5c, +0x60), and whether it is the zone's large monster
+#define FN_ATK_UPDATE 0x36919cu
+static void atk_update(Cpu *c) {
+    uint32_t at = c->r[0], owner = LD32(at + 0xc);
+    if (owner && LD32(owner) == 0x19f3104u) {  // (the monster's other attacks: every update, for their lifetime)
+        uint32_t sys = LD32(0x2326764u);
+        LOG("[atkobj] %08x %.1f ms step %.3f windows %.2f %.2f\n", owner, (double)(plat_now_ns() / 100000ull) / 10.0,
+            sys ? (double)LDF(sys + 0x68) : 0.0, (double)LDF(at + 0x5c), (double)LDF(at + 0x60));
+    }
+    static uint32_t seen[64];
+    static int n;
+    int k = 0;
+    while (k < n && seen[k] != owner) k++;
+    if (k == n && n < 64) {
+        seen[n++] = owner;
+        uint32_t sen = LD32(G_SENEMY), big = 0;
+        for (int i = 0; i < MAX_EN && sen; i++) {
+            uint32_t e = LD32(sen + 0x1c + 4u * (uint32_t)i), info = e ? LD32(e + EN_INFO) : 0;
+            if (info && LD16(info + 0x1b6) < 10000) big = big ? big : e;
+        }
+        LOG("[atk] attack %08x owner %08x (vt %08x)%s%s kind %u type 0x%x windows %.2f %.2f\n", at, owner, owner ? LD32(owner) : 0,
+            owner == big ? " = large monster" : "", owner == local_player() ? " = our hunter" : "", LD8(at + 0x6d), LD8(at + 0x3a),
+            (double)LDF(at + 0x5c), (double)LDF(at + 0x60));
+    }
+    fnhook_call_original(c, FN_ATK_UPDATE);
 }
 
 void dummy_set(float dist, float turn) {
@@ -150,9 +267,14 @@ void dummy_set(float dist, float turn) {
 }
 
 void dummy_init(void) {
+    if (getenv("MHGU_ATKTRACE")) fnhook_set(FN_ATK_UPDATE, hle_register("dummy:atk", atk_update));
     const char *e = getenv("MHGU_SUMMON");
     if (e && *e && atoi(e) > 0) {
         g_summon = (float)atoi(e);
+        e = getenv("MHGU_SUMMON_KEEPHP");
+        g_keephp = e && *e && atoi(e);
+        e = getenv("MHGU_SUMMON_STICK");
+        g_stick = e && *e ? (float)atoi(e) : 0;
         fnhook_set(FN_COLLISION, hle_register("dummy:collision", collision));
         return;
     }
@@ -163,6 +285,10 @@ void dummy_init(void) {
     if (s && *s) g_slot = atoi(s) & 3;
     s = getenv("MHGU_DUMMY_FACE");
     g_face = s && *s && atoi(s);
+    s = getenv("MHGU_DUMMY_SCALE");
+    g_scale = s && *s ? strtof(s, NULL) : 0;
+    s = getenv("MHGU_DUMMY_AIM");
+    g_aim_set = s && *s, g_aim = g_aim_set ? strtof(s, NULL) : 0;
     fnhook_set(FN_COLLISION, hle_register("dummy:collision", collision));
     fnhook_set(FN_EN_DAMAGE, hle_register("dummy:damage", damage));
     LOG("[dummy] the zone's large monster stands %.0f cm in front of the hunter, outside the camp\n", (double)g_dist);

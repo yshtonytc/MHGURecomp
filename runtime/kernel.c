@@ -8,6 +8,7 @@
 
 #include "hle.h"
 #include "kernel.h"
+#include "pause.h"
 
 // ------------------------------------------------------------------ results
 #define R_OK_ 0
@@ -76,7 +77,7 @@ void kernel_signal(KObject *o) {
 
 // ------------------------------------------------------------------ time
 uint64_t rt_ticks(void) {  // 19.2 MHz system tick
-    uint64_t ns = plat_now_ns();  // (ns * 12 / 625 without a 128-bit division: called all the time)
+    uint64_t ns = pause_clock_ns();  // (stopped while paused: runtime/pause.h. ns * 12 / 625 without a 128-bit division: called all the time)
     return ns / 625 * 12 + ns % 625 * 12 / 625;
 }
 
@@ -303,7 +304,10 @@ static uint32_t block_current(int64_t timeout_ns) {
     while (t->wait_kind != WAIT_NONE) {
         if (g_rt_unwind) { t->wait_kind = WAIT_NONE; t->wait_result = R_CANCELLED; break; }
         if (t->cancel) { t->cancel = false; t->wait_kind = WAIT_NONE; t->wait_result = R_CANCELLED; break; }
-        if (!kwait(timeout_ns, &ts)) { t->wait_kind = WAIT_NONE; t->wait_result = R_TIMEOUT; break; }
+        // A wake that lands as the deadline passes can still report a timeout: if a waker already ended the wait (a
+        // signalled condvar handing over its mutex, a mutex handoff), keep its result. Reporting a timeout there made
+        // nn::os re-take a mutex the thread had just been given: it waited on its own handle forever (hub hangs).
+        if (!kwait(timeout_ns, &ts) && t->wait_kind != WAIT_NONE) { t->wait_kind = WAIT_NONE; t->wait_result = R_TIMEOUT; break; }
     }
     waitlist_remove(t);
     return t->wait_result;
@@ -523,6 +527,24 @@ int kernel_stack_callers(uint32_t sp, char *line, size_t size) {
     for (uint32_t a = sp; a < sp + 0x600 && k < 10 && n < (int)size - 12; a += 4) {
         uint32_t v = LD32(a);
         if (v < MAIN_BASE + 4 || v >= SDK_BASE + 0x400000 || (v & 3)) continue;
+        uint32_t ins = LD32(v - 4);
+        if ((ins & 0x0F000000u) != 0x0B000000u && (ins & 0xFE000000u) != 0xFA000000u && (ins & 0x0FFFFFF0u) != 0x012FFF30u)
+            continue;
+        n += snprintf(line + n, size - n, " %x", v);
+        k++;
+    }
+    return k;
+}
+
+// The same, but only the game's own code (main), further up: below an IPC call the SDK's frames take the room
+// (fs.c, which game function opened a file)
+int kernel_game_callers(uint32_t sp, char *line, size_t size) {
+    int n = 0, k = 0;
+    line[0] = 0;
+    for (uint32_t a = sp; a < sp + 0x1000 && k < 8 && n < (int)size - 12; a += 4) {
+        if (!kernel_mapped(a, 4)) break;
+        uint32_t v = LD32(a);
+        if (v < MAIN_BASE + 4 || v >= SDK_BASE || (v & 3)) continue;
         uint32_t ins = LD32(v - 4);
         if ((ins & 0x0F000000u) != 0x0B000000u && (ins & 0xFE000000u) != 0xFA000000u && (ins & 0x0FFFFFF0u) != 0x012FFF30u)
             continue;
